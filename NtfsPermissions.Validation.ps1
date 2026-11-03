@@ -9,10 +9,10 @@
 # verified backups, and obtain required approvals before use.
 # This script is not an official Microsoft product or supported Microsoft service.
 
-# Read-only evidence workflow, version 0.1.0. No native mutation adapter exists.
+# Read-only evidence workflow. No native mutation adapter exists.
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Common.ps1')
-$script:NvVersion = '0.1.0'
+$script:NvVersion = Get-NtfsComponentVersion PermissionValidation
 $script:NvStages = @('Initialize','CaptureBefore','CaptureAfterApply','CaptureAfterRevert','Report')
 
 function Assert-NvWindows {
@@ -174,8 +174,8 @@ function Read-NvCase([string]$CasePath) {
         }
         if ((Get-NvFileHash $manifestPath) -cne $commit.ManifestSHA256) { throw 'Stage manifest hash mismatch.' }
         $manifest = Read-NvJson $manifestPath
-        Assert-NpProperties $manifest @('Schema','Stage','BindingSHA256','StartedUtc','CompletedUtc','Actor','Host','Files','Status','WhatIf','ManualActionAcknowledged')
-        if ($manifest.Schema -cne 'NtfsPermissionValidationStage/1' -or $manifest.Stage -cne $stage -or
+        Assert-NpProperties $manifest @('Schema','Version','Stage','BindingSHA256','StartedUtc','CompletedUtc','Actor','Host','Files','Status','WhatIf','ManualActionAcknowledged')
+        if ($manifest.Schema -cne 'NtfsPermissionValidationStage/1' -or $manifest.Version -cne $script:NvVersion -or $manifest.Stage -cne $stage -or
             $manifest.BindingSHA256 -cne $commit.BindingSHA256) { throw 'Invalid stage manifest binding.' }
         $names = @('manifest.json')
         foreach ($file in @($manifest.Files)) {
@@ -187,12 +187,12 @@ function Read-NvCase([string]$CasePath) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint -or $item.PSIsContainer -or
                 (Get-NvFileHash $path) -cne $file.SHA256) { throw 'Evidence hash mismatch or linked file.' }
         }
-        $required = switch ($stage) {
+        $required = @('validation-stage.log') + @(switch ($stage) {
             Initialize { @('case.json','manual-matrix.json') }
             Report { @('report.json') }
             CaptureBefore { @('inventory.json','comparison.json','environment.json','intent-review.json') }
             default { @('inventory.json','comparison.json','environment.json') }
-        }
+        })
         foreach ($name in $required) { if ($name -cnotin $names) { throw "Missing required evidence: $name" } }
         $actual = @(Get-ChildItem -LiteralPath $directory -Force)
         if ($actual.Count -ne $names.Count -or @($actual | Where-Object Name -cnotin $names).Count) { throw 'Unexpected/torn stage artifacts; preserve for review.' }
@@ -582,8 +582,9 @@ function Invoke-NvStage {
                 Export-NtfsCsvData $rows (Join-Path $directory 'snapshots.csv')
             }
         }
+        Write-NtfsLog (Join-Path $directory 'validation-stage.log') PermissionValidation INFO $Stage "Stage completed with status=$status."
         $manifest = [ordered]@{
-            Schema='NtfsPermissionValidationStage/1'; Stage=$Stage; BindingSHA256=$state.BindingHash
+            Schema='NtfsPermissionValidationStage/1'; Version=$script:NvVersion; Stage=$Stage; BindingSHA256=$state.BindingHash
             StartedUtc=$started; CompletedUtc=[DateTime]::UtcNow.ToString('o')
             Actor=$Binding.Actor; Host=$Binding.ExecutionHost
             Files=@(Get-ChildItem -LiteralPath $directory -File | Sort-Object Name | ForEach-Object {

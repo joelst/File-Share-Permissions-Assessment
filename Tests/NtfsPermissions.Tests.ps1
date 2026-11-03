@@ -471,7 +471,9 @@ Describe 'Read-only traversal coverage and local locking' {
 
 Describe 'Immutable plans and exact reconstruction' {
     It 'round trips approved bytes and rejects a different reviewed hash' {
-        $saved=Save-TestPlan (New-TestPlan)
+        $plan=New-TestPlan
+        $plan.Version | Should -Be (Get-NtfsComponentVersion Permissions)
+        $saved=Save-TestPlan $plan
         (Read-NpPlan $saved.Path $saved.Hash (Get-NpSourceHash)).Target | Should -Be '\\SERVER1\Share1\Folder'
         { Read-NpPlan $saved.Path ('0'*64) (Get-NpSourceHash) } | Should -Throw '*hash mismatch*'
     }
@@ -517,6 +519,7 @@ Describe 'Durable audit and offline-only coordinator' {
         $read.Status | Should -Be Verified
         $read.Events.Count | Should -Be 2
         $read.Events[0].Ticket | Should -Be CHG123
+        $read.Events[0].Version | Should -Be (Get-NtfsComponentVersion Permissions)
         $read.Events[0].Actor | Should -Not -BeNullOrEmpty
         $read.Events[0].Host | Should -Not -BeNullOrEmpty
         $read.Events[0].Utc | Should -Match 'Z$'

@@ -13,7 +13,7 @@
 .SYNOPSIS
   Consolidates directory ACL inventories into offline review reports.
 .NOTES
-  Version 2.8.4. Consolidates directory ACL inventories into offline review reports.
+  Release version is recorded in output metadata and merge-stage.log.
   
   Read-only against assessed systems. Requires NtfsAssessment.Common.ps1.
   Findings are indicators, not effective-access calculations or approved remediation.
@@ -157,9 +157,9 @@ function Add-SpoolRow($Spool) {
 }
 function Save-State([string]$Status,[string]$Stage,[string]$Message='') {
     if (-not $script:OutputReady) { return }
-    [ordered]@{ToolkitVersion='2.8.4';Status=$Status;CurrentStage=$Stage;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
+    [ordered]@{ToolkitVersion=(Get-NtfsComponentVersion Merge);Status=$Status;CurrentStage=$Stage;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputFolder 'merge-state.json') -Encoding UTF8
-    Add-Content -LiteralPath (Join-Path $OutputFolder 'merge-stage.log') -Value ("{0:o}`t{1}`t{2}`t{3}" -f [datetime]::UtcNow,$Status,$Stage,$Message) -Encoding UTF8
+    Write-NtfsLog (Join-Path $OutputFolder 'merge-stage.log') Merge $Status $Stage $Message
 }
 
 $script:OutputReady=$false;$TempDir=$null;$pool=$null;$jobs=[Collections.ArrayList]::new()
@@ -622,7 +622,7 @@ try {
     Export-NtfsCsvData @($summary.Values|Sort-Object Severity,FindingType) (Join-Path $OutputFolder 'NTFS_FindingsSummary.csv')
     $limitations=@('Directory ACL inventory only; individual file ACLs are not assessed.','Risk scores are heuristic prioritization indicators, not authorization decisions.','Risk averages and maxima include assessed folders only; failed or unverified ACLs have no score, and unreachable subtrees have unknown folder counts.','Effective access is not calculated.','Inheritance is never changed.','Reports are not an approved remediation or rollback plan.')
     $executive=[ordered]@{
-        Version='2.8.4';GeneratedUtc=[datetime]::UtcNow.ToString('o');Targets=$selectedRuns.Count;Shares=$Owners.Count
+        Version=(Get-NtfsComponentVersion Merge);GeneratedUtc=[datetime]::UtcNow.ToString('o');Targets=$selectedRuns.Count;Shares=$Owners.Count
         Folders=$totals.Folders;UniqueACEs=$totals.UniqueAces;CriticalFolders=$totals.Critical;HighFolders=$totals.High
         AssessedFolders=$totals.AssessedFolders;NotAssessedFolders=$totals.NotAssessedFolders;UnreportedAclFailures=$totals.UnreportedAclFailures
         DirectAssignments=$totals.Direct;UnresolvedIdentities=$totals.Unresolved;BroadAccessAces=$totals.Broad
@@ -632,7 +632,7 @@ try {
     $executive|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_ExecutiveSummary.json') -Encoding UTF8
     $inventory=@(Get-NtfsDatasetInventory $OutputFolder)
     [ordered]@{
-        ToolkitVersion='2.8.4';GeneratedUtc=[datetime]::UtcNow.ToString('o');InputRoot=$InputRoot;OutputFolder=$OutputFolder
+        ToolkitVersion=(Get-NtfsComponentVersion Merge);GeneratedUtc=[datetime]::UtcNow.ToString('o');InputRoot=$InputRoot;OutputFolder=$OutputFolder
         RunSelection=$RunSelection;SelectedRunFolders=@($selectedRuns.RunFolder);MaxCsvFileBytes=100000000
         MaxRowsPerShare=$MaxRowsPerShare
         Counts=$totals;Errors=$errorCount;Warnings=@($script:Warnings);Datasets=$inventory;Limitations=$limitations

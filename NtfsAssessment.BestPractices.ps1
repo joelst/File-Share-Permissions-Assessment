@@ -13,10 +13,10 @@
 .SYNOPSIS
 Read-only evidence-based best-practices evaluation and reporting helpers.
 .NOTES
-Version 1.0.0. Script versions are independent of policy and manifest schema versions.
+Script releases are independent of policy and manifest schema versions.
 #>
 Set-StrictMode -Version Latest
-$script:NtfsBestPracticesVersion = '1.0.0'
+$script:NtfsBestPracticesVersion = Get-NtfsComponentVersion BestPractices
 
 $script:NtfsBpCheckDefinitions = @{
     SMB1Enabled = @{ Reference='https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3'; Recommendation='Review whether SMB1 is required; disable it only through the server change process.'; Severity='High' }
@@ -361,6 +361,8 @@ function Invoke-NtfsBestPracticesOfflineReport([string]$InputRunFolder,[string]$
     if (Test-Path -LiteralPath $destination) {
         if (@(Get-ChildItem -LiteralPath $destination -Force).Count -gt 0) { throw 'Offline report OutputFolder must be new or empty.' }
     } else { [void](New-Item -ItemType Directory -Path $destination -Force) }
+    $logPath=Join-Path $destination 'best-practices.log'
+    Write-NtfsLog $logPath BestPractices INFO Start 'Offline report started.'
     $manifestPath=Join-Path $source 'manifest.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Source run is missing manifest.json.' }
     $manifest=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -386,5 +388,6 @@ function Invoke-NtfsBestPracticesOfflineReport([string]$InputRunFolder,[string]$
         ReadOnly=$true;SourceRunFolder=(Split-Path -Leaf $source);SourceManifestFile='manifest.json'
     }
     $offlineManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $destination 'BestPracticesManifest.json') -Encoding UTF8
+    Write-NtfsLog $logPath BestPractices INFO Complete 'Offline report completed.'
     return $result
 }

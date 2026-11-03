@@ -106,6 +106,9 @@ try {
     $sourceHash=(Get-FileHash -LiteralPath (Join-Path $run 'manifest.json') -Algorithm SHA256).Hash
     $output=Join-Path $testRoot 'report'
     $result=Invoke-NtfsBestPracticesOfflineReport $run $output $policyPath
+    $offlineManifest=Get-Content -LiteralPath (Join-Path $output 'BestPracticesManifest.json') -Raw|ConvertFrom-Json
+    Assert ($offlineManifest.Version -eq (Get-NtfsComponentVersion BestPractices)) 'Offline manifest uses the centralized release version'
+    Assert ((Get-Content -LiteralPath (Join-Path $output 'best-practices.log') -Raw) -match "`tBestPractices`t1\.0\.0`tINFO`tComplete`t") 'Offline log records component and release version'
     $rows=Get-CheckRows (Join-Path $output 'BestPracticeChecks.csv')
     Assert ($result.CheckCount -eq $rows.Count) 'Summary count reconciles with the CSV'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Server -eq 'local' -and $_.Status -eq 'MeetsConfiguredPolicy'}).Count -eq 1) 'False SMB1 setting compares to explicit policy'

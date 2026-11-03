@@ -13,12 +13,12 @@
 .SYNOPSIS
 Shared permission planning, evidence and guarded recovery helpers.
 .NOTES
-Version 0.2.1-unqualified. Live mutation is disabled.
+Live mutation is disabled.
 #>
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsAssessment.Common.ps1')
 
-$script:NtfsPermissionsVersion = '0.2.1-unqualified'
+$script:NtfsPermissionsVersion = Get-NtfsComponentVersion Permissions
 
 function ConvertTo-NpUnc([string]$Path) {
     if ($Path -notmatch '^\\\\[^\\]+\\[^\\]+(?:\\[^\\]+)*\\?$' -or

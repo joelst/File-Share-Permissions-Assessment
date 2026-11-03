@@ -11,6 +11,37 @@
 
 Set-StrictMode -Version Latest
 
+$script:NtfsComponentVersions = [ordered]@{
+    Assessment = '1.6.6'
+    Merge = '2.8.4'
+    Comparison = '1.0.2'
+    BestPractices = '1.0.0'
+    Permissions = '0.2.1-unqualified'
+    PermissionValidation = '0.1.0'
+}
+
+function Get-NtfsComponentVersion([string]$Component) {
+    if (-not $script:NtfsComponentVersions.Contains($Component)) {
+        throw "Unknown NTFS toolkit component: $Component"
+    }
+    return [string]$script:NtfsComponentVersions[$Component]
+}
+
+function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$Stage,[string]$Message) {
+    $version = Get-NtfsComponentVersion $Component
+    $singleLine = [regex]::Replace([string]$Message,'[\r\n\t]',{
+        param($match)
+        switch ($match.Value) {
+            "`r" { '\r' }
+            "`n" { '\n' }
+            "`t" { '\t' }
+        }
+    })
+    $line = "{0}`t{1}`t{2}`t{3}`t{4}`t{5}{6}" -f [DateTime]::UtcNow.ToString('o'),$Component,$version,$Level,$Stage,$singleLine,[Environment]::NewLine
+    [IO.File]::AppendAllText($Path,$line,[Text.UTF8Encoding]::new($false))
+    Write-Verbose $line.TrimEnd([Environment]::NewLine.ToCharArray())
+}
+
 if ($null -eq ('NtfsAssessment.CsvPartWriter' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

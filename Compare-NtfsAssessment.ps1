@@ -25,7 +25,7 @@
   Individual file ACLs, group memberships and effective access are not compared.
   Does not connect to servers or change any permissions or inheritance.
 .NOTES
-  Version 1.0.2.
+  Release version is recorded in comparison-state.json, comparison.log and the summary.
   Compares permission differences between two collected assessment snapshots, offline.
   
   Requires NtfsAssessment.Common.ps1 alongside this script.
@@ -75,9 +75,10 @@ function Add-Limitation([string]$Message) {
 function Save-ComparisonState([string]$Status,[string]$Stage,[string]$ErrorMessage='') {
     if(-not $script:OutputReady){return}
     [ordered]@{
-        Version='1.0.2';Status=$Status;Stage=$Stage;Error=$ErrorMessage
+        Version=(Get-NtfsComponentVersion Comparison);Status=$Status;Stage=$Stage;Error=$ErrorMessage
         Limitations=@($script:Limitations|Sort-Object);UpdatedUtc=[datetime]::UtcNow.ToString('o')
     }|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $OutputFolder 'comparison-state.json') -Encoding UTF8
+    Write-NtfsLog (Join-Path $OutputFolder 'comparison.log') Comparison $Status $Stage $ErrorMessage
 }
 function Read-Manifest([string]$Directory) {
     $path=(Resolve-Path -LiteralPath $Directory -ErrorAction Stop).ProviderPath
@@ -551,7 +552,7 @@ try{
     })
     Export-NtfsCsvData $sources (Join-Path $OutputFolder 'NTFS_ComparisonRuns.csv')
     $summary=[ordered]@{
-        Version='1.0.2';GeneratedUtc=[datetime]::UtcNow.ToString('o');Baseline=$sources[0];Comparison=$sources[1]
+        Version=(Get-NtfsComponentVersion Comparison);GeneratedUtc=[datetime]::UtcNow.ToString('o');Baseline=$sources[0];Comparison=$sources[1]
         DifferenceRows=$script:Changes.Rows;Counts=$summaryRows;Limitations=@($script:Limitations|Sort-Object)
         Scope='Directory permissions, collected share permissions and share metadata only.'
         Interpretation='Added/Removed refer to snapshot records, not proven creation/deletion, effective-access changes, or remediation approvals.'

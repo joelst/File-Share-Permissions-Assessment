@@ -16,7 +16,7 @@
   Read-only SMB and NTFS permissions collector for local Windows, remote Windows, NAS servers, and explicit UNC shares.
 
 .NOTES
-  Toolkit Version 1.6.6. 
+  Toolkit version is recorded in manifest.json and run.log.
   
   Collects read-only SMB and NTFS permission evidence.
 
@@ -72,7 +72,7 @@ if ($BestPractices) {
 }
 if ($FollowReparsePoints) { throw 'Following reparse points is not supported safely. Remove -FollowReparsePoints; excluded paths will be recorded.' }
 if ($OntapCredential) { throw 'Unstructured ONTAP SSH tables are not supported. Use -OntapSharePermissionsCsv with smb_server,smb_share,user_or_group,permission columns and optional vserver.' }
-$ToolkitVersion='1.6.6';$RunId=[guid]::NewGuid().Guid;$CollectorHost=$env:COMPUTERNAME;$CurrentTarget=$CollectorHost
+$ToolkitVersion=Get-NtfsComponentVersion Assessment;$RunId=[guid]::NewGuid().Guid;$CollectorHost=$env:COMPUTERNAME;$CurrentTarget=$CollectorHost
 if($ComputerName.Length -eq 0 -and $NasServer.Length -eq 0 -and $UncPath.Length -eq 0 -and [string]::IsNullOrWhiteSpace($NasShareListCsv)){$ComputerName=@($env:COMPUTERNAME)}
 $MandatoryExcludedShares=@('ADMIN$','C$','D$','IPC$','print$')
 # Auto-exclude share matching the runner's sAMAccountName (auto-created by net view)
@@ -120,7 +120,7 @@ $BpEvidenceErrors=New-Object Collections.ArrayList
 function Add-BestPracticeEvidenceError([string]$Server,[string]$Share,[string]$Stage,[string]$Detail){
  [void]$BpEvidenceErrors.Add([pscustomobject]@{RunId=$RunId;CollectorHost=$CollectorHost;Server=$Server;Share=$Share;Stage=$Stage;Detail=$Detail;Utc=[datetime]::UtcNow.ToString('o')})
 }
-function Write-RunLog([string]$Level,[string]$Stage,[string]$Message){$line="{0:o}`t{1}`t{2}`t{3}" -f (Get-Date),$Level,$Stage,$Message;Add-Content -LiteralPath $Log -Value $line -Encoding UTF8;Write-Verbose $line}
+function Write-RunLog([string]$Level,[string]$Stage,[string]$Message){Write-NtfsLog $Log Assessment $Level $Stage $Message}
 function Add-RunError([string]$Stage,[string]$Path,[Exception]$Exception){
  $utc=(Get-Date).ToUniversalTime().ToString('o')
  [void]$Errors.Add([pscustomobject]@{RunId=$RunId;Target=$CurrentTarget;Stage=$Stage;Path=$Path;Error=$Exception.Message;HResult=$Exception.HResult;Utc=$utc})

@@ -79,6 +79,11 @@ Describe 'Read-only validation evidence workflow' {
         $manifest=Read-NvJson (Join-Path $case 'CaptureBefore/manifest.json')
         $manifest.Files.Name | Should -Contain snapshots.csv
         $manifest.Files.Name | Should -Contain intent-review.json
+        $manifest.Version | Should -Be (Get-NtfsComponentVersion PermissionValidation)
+        $manifest.Files.Name | Should -Contain validation-stage.log
+        $logPath=Join-Path $case 'CaptureBefore/validation-stage.log'
+        ($manifest.Files | Where-Object Name -eq 'validation-stage.log').SHA256 | Should -Be (Get-NvFileHash $logPath)
+        (Get-Content -LiteralPath $logPath -Raw) | Should -Match "`tPermissionValidation`t0\.1\.0`tINFO`tCaptureBefore`t"
     }
     It 'records an already covered no-op without calling it a successful change' {
         $s=New-VSnapshot

@@ -13,7 +13,7 @@
 .SYNOPSIS
 Read-only permission validation and evidence walkthrough.
 .NOTES
-Version 0.1.0.
+Release version is recorded in sealed case metadata.
 
 .DESCRIPTION
 Stages: Initialize, CaptureBefore, CaptureAfterApply, CaptureAfterRevert, Report.

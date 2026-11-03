@@ -13,7 +13,7 @@
 .SYNOPSIS
 Read-only NTFS permission planning with audited, DISABLED live Apply/Revert.
 .DESCRIPTION
-Version 0.2.1-unqualified. 
+Release version is recorded in plan and audit evidence.
 
 Matches the shared permissions engine and evidence version.
 Plan validates all security groups and snapshots a local fixed Windows NTFS

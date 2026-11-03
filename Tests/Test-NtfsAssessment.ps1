@@ -97,13 +97,30 @@ function Write-RunManifest($Directory,$RunId,$Completed,$Scopes,$Status,$AceCoun
         Counts=@{Shares=@($Scopes).Count;Folders=$FolderCount;NtfsAces=$AceCount;Errors=0}
     }|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $Directory 'manifest.json') -Encoding UTF8
 }
+$registeredVersions=@(
+    (Get-NtfsComponentVersion Assessment),(Get-NtfsComponentVersion Merge),
+    (Get-NtfsComponentVersion Comparison),(Get-NtfsComponentVersion BestPractices),
+    (Get-NtfsComponentVersion Permissions),(Get-NtfsComponentVersion PermissionValidation)
+)
+Assert (($registeredVersions -join '|') -eq '1.6.6|2.8.4|1.0.2|1.0.0|0.2.1-unqualified|0.1.0') 'Central registry preserves all component release versions'
+$logPath=Join-Path $testRoot 'standard-log.log'
+Write-NtfsLog $logPath Assessment ERROR Test "first line`nsecond`tfield"
+$logFields=(Get-Content -LiteralPath $logPath -Raw).TrimEnd("`r","`n") -split "`t",6
+Assert ($logFields.Count -eq 6 -and $logFields[1] -eq 'Assessment' -and $logFields[2] -eq '1.6.6' -and
+    $logFields[3] -eq 'ERROR' -and $logFields[4] -eq 'Test' -and $logFields[5] -eq 'first line\nsecond\tfield') 'Standard text logs bind component versions and escape multiline fields'
 function Invoke-Merge($InputPath,$OutputName,[int]$Throttle=1,[string]$Selection='LatestSuccessful',[int]$ExpectedExit=0,[string[]]$Extra=@()) {
     $output=Join-Path $testRoot $OutputName
-    $log=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'Merge-NtfsAssessment_v2.8.1.ps1') -InputRoot $InputPath -OutputFolder $output -ThrottleLimit $Throttle -RunSelection $Selection @Extra 2>&1)
+    $log=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'Merge-NtfsAssessment.ps1') -InputRoot $InputPath -OutputFolder $output -ThrottleLimit $Throttle -RunSelection $Selection @Extra 2>&1)
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('merge-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Merge $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
+    if(Test-Path -LiteralPath (Join-Path $output 'merge-stage.log')){
+        Assert ((Get-Content -LiteralPath (Join-Path $output 'merge-stage.log') -Raw) -match "`tMerge`t2\.8\.4`t") 'Merge logs include component release metadata'
+    }
     if($code -lt 2){
+        $stateData=Get-Content -LiteralPath (Join-Path $output 'merge-state.json') -Raw|ConvertFrom-Json
+        $summaryData=Get-Content -LiteralPath (Join-Path $output 'NTFS_ExecutiveSummary.json') -Raw|ConvertFrom-Json
+        Assert ($stateData.ToolkitVersion -eq (Get-NtfsComponentVersion Merge) -and $summaryData.Version -eq (Get-NtfsComponentVersion Merge)) 'Merge state and summary use the centralized release version'
         Get-ChildItem -LiteralPath $output -File -Filter '*.csv'|ForEach-Object{
             Assert ($_.Length -le 100000000) "Output size: $($_.Name)"
             [void]@(Read-NtfsCsvFile $_.FullName)
@@ -125,9 +142,13 @@ function Invoke-Comparison([string]$OutputName,[int]$ExpectedExit,[string[]]$Arg
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('comparison-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Comparison $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
+    if(Test-Path -LiteralPath (Join-Path $output 'comparison.log')){
+        Assert ((Get-Content -LiteralPath (Join-Path $output 'comparison.log') -Raw) -match "`tComparison`t1\.0\.2`t") 'Comparison logs include component release metadata'
+    }
     if($code -lt 2){
         Assert ((Get-Content -LiteralPath $state -Raw|ConvertFrom-Json).Status -in @('Completed','CompletedWithWarnings')) 'Comparison completed state persisted'
         $summary=Get-Content -LiteralPath (Join-Path $output 'NTFS_ComparisonSummary.json') -Raw|ConvertFrom-Json
+        Assert ($summary.Version -eq (Get-NtfsComponentVersion Comparison)) 'Comparison summary uses the centralized release version'
         Assert ($summary.DifferenceRows -eq @(Rows $output 'NTFS_Changes.csv').Count) 'Comparison counts reconcile'
         Get-ChildItem -LiteralPath $output -File -Filter '*.csv'|ForEach-Object{
             Assert ($_.Length -le 100000000) "Comparison CSV capped: $($_.Name)"
@@ -237,7 +258,7 @@ try {
         Assert ($summary.UniqueACEs -eq $aces.Count) 'Unique counters returned from workers'
         Assert ((Get-Content -LiteralPath (Join-Path $out 'merge-state.json') -Raw|ConvertFrom-Json).Status -eq 'Completed') 'Successful merge persisted'
     }
-    Import-Functions (Join-Path $root 'Merge-NtfsAssessment_v2.8.1.ps1') @('Normalize-Rights','IsFullControl')
+    Import-Functions (Join-Path $root 'Merge-NtfsAssessment.ps1') @('Normalize-Rights','IsFullControl')
     Assert ((Normalize-Rights '262144') -eq 'ChangePermissions') 'ChangePermissions is not expanded to FullControl'
     Assert ((Normalize-Rights '1073741824') -eq 'GenericWrite') 'GenericWrite is not expanded to Modify'
     Assert ((Normalize-Rights '-2147483648') -eq 'GenericRead') 'Signed generic read decoded without broadening'
@@ -563,7 +584,7 @@ try {
     Write-FixtureDataset $duplicateShare 'SharePermissions.csv' @($shareRows[0],$shareRows[0])
     $duplicateShareOut=Invoke-Comparison 'share-duplicates-out' 0 @('-BaselineRunFolder',$historyOld,'-ComparisonRunFolder',$duplicateShare)
     Assert (@(Rows $duplicateShareOut 'NTFS_Changes.csv'|Where-Object EntityType -eq 'SharePermission').Count -eq 0) 'Historical repeated share ACE observations never fabricate new permissions'
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Get-UniqueSharePermissions','Get-AclPropertySafe')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Get-UniqueSharePermissions','Get-AclPropertySafe')
     $shareOne=[pscustomobject]@{Server='server';Share='one';AccountName='TEST\User';AccessControlType='Allow';AccessRight='Full';Source='WindowsSmbShare';Vserver=''}
     $shareTwo=$shareOne.PSObject.Copy();$shareTwo.Share='two'
     $shareDeny=$shareOne.PSObject.Copy();$shareDeny.AccessControlType='Deny'
@@ -576,6 +597,8 @@ try {
     Assert ($LASTEXITCODE -eq 1) "Duplicate-scope collector stays offline and reports depth limitations: $($duplicateLog -join "`n")"
     $duplicateRun=@(Get-ChildItem -LiteralPath $duplicateOutput -Directory)[0].FullName
     $duplicateManifest=Get-Content -LiteralPath (Join-Path $duplicateRun 'manifest.json') -Raw|ConvertFrom-Json
+    Assert ($duplicateManifest.ToolkitVersion -eq (Get-NtfsComponentVersion Assessment)) 'Assessment manifest uses the centralized release version'
+    Assert ((Get-Content -LiteralPath (Join-Path $duplicateRun 'run.log') -Raw) -match "`tAssessment`t1\.6\.6`t") 'Assessment log includes component release metadata'
     Assert ($duplicateManifest.Counts.Folders -eq 1 -and $duplicateManifest.Counts.NtfsAces -eq 1) 'Repeated UNC variants and overlapping parent/child roots never double-count physical evidence'
     Assert (@(Rows $duplicateRun 'ShareCoverage.csv').Count -eq 1 -and $duplicateManifest.Scopes.Count -eq 1) 'Duplicate scopes and covered children do not duplicate share metadata or coverage'
 
@@ -656,7 +679,7 @@ try {
     Assert ($cleanupProbe.Count -eq 2 -and $cleanupProbe[0] -match 'dispose failure' -and $cleanupProbe[1] -eq 'later cleanup ran') 'Disposal errors do not prevent subsequent cleanup actions'
 
     $script:TestArea='Validated collector import and output boundaries'
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Import-OntapPermissions','Add-ShareAndAclData','Invoke-UniqueScopeScan')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Import-OntapPermissions','Add-ShareAndAclData','Invoke-UniqueScopeScan')
     $RunId='ontap-test';$CollectorHost='mock';$Shares=[Collections.ArrayList]::new();$ShareAcl=[Collections.ArrayList]::new();$localPathMappings=@()
     [void]$Shares.Add([pscustomobject]@{Server='server';Share='data';ScanRoot='\\server\data';CollectionMode='GenericSMB_UNC';ShareMetadataStatus='ExplicitUNC'})
     function Write-RunLog($Level,$Stage,$Message){}
@@ -720,7 +743,7 @@ try {
 
     $script:TestArea='Collector traversal and identity'
     # Isolate collector functions; no AD, SMB, ACL or native command is executed.
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Get-FolderQueue','Add-SkippedPath','Scan-UncRoot','Get-AclPropertySafe','Get-AclRulesSafe','ConvertTo-ExtendedPath','ConvertTo-DisplayPath','Get-Hash','Flush-LargeBuffers','Append-Safe')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Get-FolderQueue','Add-SkippedPath','Scan-UncRoot','Get-AclPropertySafe','Get-AclRulesSafe','ConvertTo-ExtendedPath','ConvertTo-DisplayPath','Get-Hash','Flush-LargeBuffers','Append-Safe')
     $RunId='mock';$CollectorHost='mock';$CurrentTarget='mock';$AdReady=$false;$SplitOutputByShare=$false
     $RunFolder=Join-Path $testRoot 'collector';[void](New-Item -ItemType Directory -Path $RunFolder)
     $script:TotalFolders=0;$script:TotalAces=0;$script:LargeBufferFlushes=0;$script:CsvWriters=@{}
@@ -761,7 +784,7 @@ try {
     foreach($state in $script:CsvWriters.Values){$state.Writer.Dispose()}
     foreach($name in @('Test-Path','Get-ChildItem','Get-Item','Get-Acl','Get-FolderQueue')){Remove-Item -LiteralPath "function:$name"}
     $script:TestArea='Validated collector path failures'
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Add-RunError')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Add-RunError')
     $rootFile=Join-Path $testRoot 'root-is-file.txt'
     [IO.File]::WriteAllText($rootFile,'Not a directory.')
     $beforeFolders=$script:TotalFolders+$Folders.Count
@@ -789,7 +812,7 @@ try {
     Scan-UncRoot 'server' 'queued-file' $tree 'Mock'
     Assert (($script:TotalFolders+$Folders.Count) -eq $beforeFolders -and $Errors[$Errors.Count-1].Error -match 'Not a directory') 'File appearing in a directory queue is never exported as a folder'
     foreach($name in @('Get-FolderQueue','Get-Acl')){Remove-Item -LiteralPath "function:$name"}
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Expand-GroupRecursive')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Expand-GroupRecursive')
     function Add-RunError($Stage,$Path,$Exception){[void]$Errors.Add([pscustomobject]@{Stage=$Stage;Path=$Path;Error=$Exception.Message})}
     function Get-ADGroupMember {
         [CmdletBinding()]
@@ -827,7 +850,7 @@ try {
     $script:ExpandedCount=0;$script:ExpansionStatus='Complete'
     Expand-GroupRecursive 'TEST\Failed' 'CN=Failed' 'sid-failed' 'Failed' 'mock.domain' 0 @{}
     Assert ($script:ExpansionStatus -eq 'PartialLookupFailure') 'Group lookup failure is not empty success'
-    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment_v1.6.3.ps1') @('Resolve-Identity')
+    Import-Functions (Join-Path $root 'Invoke-NtfsAssessment.ps1') @('Resolve-Identity')
     function New-Object {
         [CmdletBinding()]
         param([Parameter(Position=0)][string]$TypeName,[Parameter(Position=1)][object[]]$ArgumentList)

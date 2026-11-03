@@ -19,7 +19,7 @@
 .EXAMPLE
   .\New-NtfsBestPracticesReport.ps1 -InputRunFolder D:\AssessmentRuns\ASSESS_FS01_... -OutputFolder D:\Reports\FS01-BP
 .NOTES
-  Version 1.0.0. Matches the shared best-practices engine and report evidence version.
+  Release version is recorded in the report metadata and best-practices log.
   Policy JSON schema (exact keys; values are booleans; check IDs are allowlisted):
   {"schemaVersion":1,"rules":[{"checkId":"SMBRequireSecuritySignature","expectedValue":true},{"checkId":"ShareEncryptionEnabled","expectedValue":true}]}
   A policy match applies only to that observed setting, not overall compliance.
@@ -43,6 +43,10 @@ try {
     Write-Host "Checks: $($result.CheckCount); source run: $($result.RunFolder)"
     exit 0
 } catch {
+    $logPath=Join-Path $OutputFolder 'best-practices.log'
+    if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+        try { Write-NtfsLog $logPath BestPractices ERROR OfflineReport "$($_.Exception.Message)`n$($_.ScriptStackTrace)" } catch {}
+    }
     Write-Error -Message $_.Exception.Message -ErrorAction Continue
     exit 2
 }
