@@ -16,7 +16,7 @@
   Read-only SMB and NTFS permissions collector for local Windows, remote Windows, NAS servers, and explicit UNC shares.
 
 .NOTES
-  Toolkit Version 1.6.6. 
+  Release version: NtfsAssessment.Common.ps1, Assessment entry in NtfsVersions.
   
   Collects read-only SMB and NTFS permission evidence.
 
@@ -72,7 +72,7 @@ if ($BestPractices) {
 }
 if ($FollowReparsePoints) { throw 'Following reparse points is not supported safely. Remove -FollowReparsePoints; excluded paths will be recorded.' }
 if ($OntapCredential) { throw 'Unstructured ONTAP SSH tables are not supported. Use -OntapSharePermissionsCsv with smb_server,smb_share,user_or_group,permission columns and optional vserver.' }
-$ToolkitVersion='1.6.6';$RunId=[guid]::NewGuid().Guid;$CollectorHost=$env:COMPUTERNAME;$CurrentTarget=$CollectorHost
+$RunId=[guid]::NewGuid().Guid;$CollectorHost=$env:COMPUTERNAME;$CurrentTarget=$CollectorHost
 if($ComputerName.Length -eq 0 -and $NasServer.Length -eq 0 -and $UncPath.Length -eq 0 -and [string]::IsNullOrWhiteSpace($NasShareListCsv)){$ComputerName=@($env:COMPUTERNAME)}
 $MandatoryExcludedShares=@('ADMIN$','C$','D$','IPC$','print$')
 # Auto-exclude share matching the runner's sAMAccountName (auto-created by net view)
@@ -120,7 +120,7 @@ $BpEvidenceErrors=New-Object Collections.ArrayList
 function Add-BestPracticeEvidenceError([string]$Server,[string]$Share,[string]$Stage,[string]$Detail){
  [void]$BpEvidenceErrors.Add([pscustomobject]@{RunId=$RunId;CollectorHost=$CollectorHost;Server=$Server;Share=$Share;Stage=$Stage;Detail=$Detail;Utc=[datetime]::UtcNow.ToString('o')})
 }
-function Write-RunLog([string]$Level,[string]$Stage,[string]$Message){$line="{0:o}`t{1}`t{2}`t{3}" -f (Get-Date),$Level,$Stage,$Message;Add-Content -LiteralPath $Log -Value $line -Encoding UTF8;Write-Verbose $line}
+function Write-RunLog([string]$Level,[string]$Stage,[string]$Message){Write-NtfsLog $Log Assessment $Level $Stage $Message}
 function Add-RunError([string]$Stage,[string]$Path,[Exception]$Exception){
  $utc=(Get-Date).ToUniversalTime().ToString('o')
  [void]$Errors.Add([pscustomobject]@{RunId=$RunId;Target=$CurrentTarget;Stage=$Stage;Path=$Path;Error=$Exception.Message;HResult=$Exception.HResult;Utc=$utc})
@@ -431,7 +431,8 @@ function Discover-NasShares([string]$Server){
  try{$raw=@(& net.exe view "\\$Server" /all 2>&1);$exit=$LASTEXITCODE;if($exit -ne 0){throw "net view exited with code $exit. Output: $($raw -join ' ')"};$inData=$false;foreach($line in $raw){$text=[string]$line;if($text -match '^-{3,}'){$inData=$true;continue};if(-not$inData){continue};if([string]::IsNullOrWhiteSpace($text)){continue};if($text -match 'completed successfully|command completed|se complet|commande.*termin'){break};$cols=@($text.Trim() -split '\s{2,}');if($cols.Length -lt 1){continue};$name=$cols[0].Trim();if($name -and (Test-ShareSelection $name)){[void]$found.Add($name)}}}catch{Add-RunError NasDiscovery $Server $_.Exception}
  return @($found|Sort-Object -Unique)
 }
-Write-RunLog INFO Start "Toolkit $ToolkitVersion read-only collection started"
+Write-RunLog INFO Start 'Read-only collection started'
+if($BestPractices){Write-NtfsLog $Log BestPractices INFO Start 'Best-practices evidence enabled'}
 if(($UseIcaclsVerify -or $CaptureAclBackup) -and ($NasServer.Count -gt 0 -or $UncPath.Count -gt 0 -or $NasShareListCsv)){
  Add-RunError IcaclsScope '' ([NotSupportedException]::new('UseIcaclsVerify and CaptureAclBackup apply only to local Windows shares, not NAS/explicit UNC scopes. Collection will continue without those operations for unsupported scopes.'))
 }
@@ -612,7 +613,7 @@ finally{
  if(Get-Variable GroupExpansion -ErrorAction SilentlyContinue){$partial=$partial -or @($GroupExpansion|Where-Object Status -ne 'Complete').Count -gt 0}
  Write-RunLog INFO Finalize "Targets=$($Servers.Count); Shares=$($Shares.Count); Folders=$($script:TotalFolders); ACEs=$($script:TotalAces); Errors=$($Errors.Count); Partial=$partial; Scope=DirectoriesOnly"
  $manifest=[ordered]@{
-  SchemaVersion='1.3';ToolkitVersion=$ToolkitVersion;RunId=$RunId;ReadOnly=$true;CollectorHost=$CollectorHost
+  SchemaVersion='1.3';ToolkitVersion=$script:NtfsVersions.Assessment;RunId=$RunId;ReadOnly=$true;CollectorHost=$CollectorHost
   Parameters=$safeParameters;EffectiveExcludeShare=$EffectiveExcludeShare;CompletedUtc=[datetime]::UtcNow.ToString('o');FatalError=$Fatal
   CollectionScope='DirectoriesOnly';CoverageStatus=$(if($partial){'Partial'}else{'CompleteDirectoriesOnly'});MaxCsvFileBytes=100000000
   Scopes=@($Shares|Select-Object Server,Share,ScanRoot);Datasets=@(Get-NtfsDatasetInventory $RunFolder)
@@ -621,7 +622,7 @@ finally{
  if($BestPractices){
   $policyCopy=Join-Path $RunFolder 'BestPracticesPolicy.json';$summaryFile=Join-Path $RunFolder 'BestPracticeSummary.json'
   $manifest.BestPractices=[ordered]@{
-   Version=$script:NtfsBestPracticesVersion
+   Version=$script:NtfsVersions.BestPractices
    Enabled=$true;AuditEvidenceCollected=[bool]$CollectAuditEvidence
    PolicySHA256=$(if($null -ne $BpPolicy){$BpPolicy.SHA256}else{''})
    PolicyFile=$(if($null -ne $BpPolicy){[ordered]@{Name='BestPracticesPolicy.json';Bytes=(Get-Item -LiteralPath $policyCopy).Length;SHA256=(Get-FileHash -LiteralPath $policyCopy -Algorithm SHA256).Hash}}else{$null})

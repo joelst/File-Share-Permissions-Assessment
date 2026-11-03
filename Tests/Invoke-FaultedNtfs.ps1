@@ -22,7 +22,7 @@ if($FailAnalysis){$arguments.MaxRowsPerShare=1}
 if($Tool -eq 'Merge'){
     $arguments.InputRoot=Split-Path $InputPath -Parent
     $arguments.RunSelection='Explicit';$arguments.RunFolder=@($InputPath)
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Merge-NtfsAssessment_v2.8.1.ps1') @arguments
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Merge-NtfsAssessment.ps1') @arguments
 }else{
     $arguments.BaselineRunFolder=$Baseline;$arguments.ComparisonRunFolder=$Comparison
     & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Compare-NtfsAssessment.ps1') @arguments

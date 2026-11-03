@@ -131,6 +131,15 @@ try {
     Assert ((Get-FileHash -LiteralPath (Join-Path $output 'BestPracticesPolicy.json') -Algorithm SHA256).Hash -eq $policy.SHA256) 'Policy copy matches provenance hash'
     Assert ((Get-Item (Join-Path $output 'BestPracticeChecks.csv')).Length -le 100000000) 'Report CSV uses existing capped writer'
     Assert ((Get-Content -LiteralPath (Join-Path $output 'BestPracticesManifest.json') -Raw|ConvertFrom-Json).SourceManifestSHA256 -eq $sourceHash) 'Offline manifest anchors source run hash'
+    Assert ((Get-Content -LiteralPath (Join-Path $output 'BestPracticesManifest.json') -Raw|ConvertFrom-Json).Version -eq $script:NtfsVersions.BestPractices) 'Offline manifest uses registered best-practices version'
+    Assert ((Get-Content -LiteralPath (Join-Path $output 'BestPracticeSummary.json') -Raw|ConvertFrom-Json).Version -eq $script:NtfsVersions.BestPractices) 'Offline summary uses registered best-practices version'
+    $reportLog=@(Get-Content -LiteralPath (Join-Path $output 'report.log'))
+    Assert ($reportLog.Count -eq 2 -and @($reportLog|Where-Object { -not $_.Contains("Version=$($script:NtfsVersions.BestPractices)") }).Count -eq 0) 'Offline report logs its version without a versioned filename'
+    $failedOutput=Join-Path $testRoot 'failed-report'
+    $failed=$false;try{Invoke-NtfsBestPracticesOfflineReport (Join-Path $testRoot 'missing-run') $failedOutput ''|Out-Null}catch{$failed=$_.Exception.Message -like '*missing manifest*'}
+    Assert $failed 'Invalid source report fails explicitly'
+    $failureLog=Get-Content -LiteralPath (Join-Path $failedOutput 'report.log') -Raw
+    Assert ($failureLog.Contains("Version=$($script:NtfsVersions.BestPractices)") -and $failureLog.Contains("ERROR`tFailed")) 'Failed report retains versioned log evidence'
     $outside=$false;try{Invoke-NtfsBestPracticesOfflineReport $run (Join-Path $run 'nested-output') ''|Out-Null}catch{$outside=$_.Exception.Message -like '*outside*'}
     Assert $outside 'Offline report refuses output nested within source'
 
@@ -144,6 +153,9 @@ try {
     $collectorRun=Get-ChildItem -LiteralPath $collectorOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
     $collectorManifest=Get-Content -LiteralPath (Join-Path $collectorRun.FullName 'manifest.json') -Raw|ConvertFrom-Json
     Assert ($collectorManifest.BestPractices.Enabled -eq $true) 'Collector manifest records best-practices opt-in'
+    Assert ($collectorManifest.BestPractices.Version -eq $script:NtfsVersions.BestPractices) 'Collector uses the same registered best-practices version'
+    $collectorLog=Get-Content -LiteralPath (Join-Path $collectorRun.FullName 'run.log') -Raw
+    Assert ($collectorLog.Contains("Component=Assessment`tVersion=$($script:NtfsVersions.Assessment)") -and $collectorLog.Contains("Component=BestPractices`tVersion=$($script:NtfsVersions.BestPractices)")) 'Collector logs both enabled component versions'
     Assert ($collectorManifest.BestPractices.AuditEvidenceCollected -eq $true) 'Collector manifest records explicit audit-evidence opt-in'
     Assert (@($collectorManifest.Datasets|Where-Object Name -eq 'BestPracticeChecks.csv').Count -eq 1) 'Collector inventories best-practice checks'
     Assert (@($collectorManifest.Datasets|Where-Object Name -eq 'AuditEvidence.csv').Count -eq 1) 'Collector inventories optional audit evidence'

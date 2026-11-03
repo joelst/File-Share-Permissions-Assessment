@@ -11,6 +11,26 @@
 
 Set-StrictMode -Version Latest
 
+# Release versions are defined only here; schema versions and compatibility floors
+# remain at their call sites. Shared engines and their entry points use the same key.
+$script:NtfsVersions = @{
+    Assessment = '1.6.6'
+    Comparison = '1.0.2'
+    Merge = '2.8.4'
+    BestPractices = '1.0.0'
+    Permissions = '0.2.1-unqualified'
+    PermissionValidation = '0.1.0'
+}
+
+function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$Stage,[string]$Message='') {
+    if (-not $script:NtfsVersions.ContainsKey($Component)) { throw "Unknown version component: $Component" }
+    foreach ($messageLine in [regex]::Split($Message, '\r\n|\r|\n')) {
+        $line = "{0:o}`t{1}`t{2}`tComponent={3}`tVersion={4}`t{5}" -f [datetime]::UtcNow,$Level,$Stage,$Component,$script:NtfsVersions[$Component],$messageLine
+        Add-Content -LiteralPath $Path -Value $line -Encoding UTF8 -ErrorAction Stop
+        Write-Verbose $line
+    }
+}
+
 if ($null -eq ('NtfsAssessment.CsvPartWriter' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;

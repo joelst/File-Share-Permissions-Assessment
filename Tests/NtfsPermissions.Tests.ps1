@@ -517,6 +517,8 @@ Describe 'Durable audit and offline-only coordinator' {
         $read.Status | Should -Be Verified
         $read.Events.Count | Should -Be 2
         $read.Events[0].Ticket | Should -Be CHG123
+        $read.Events[0].Version | Should -Be $script:NtfsVersions.Permissions
+        [IO.Path]::GetFileName($journal.Path) | Should -Be 'events.jsonl'
         $read.Events[0].Actor | Should -Not -BeNullOrEmpty
         $read.Events[0].Host | Should -Not -BeNullOrEmpty
         $read.Events[0].Utc | Should -Match 'Z$'

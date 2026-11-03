@@ -9,10 +9,10 @@
 # verified backups, and obtain required approvals before use.
 # This script is not an official Microsoft product or supported Microsoft service.
 
-# Read-only evidence workflow, version 0.1.0. No native mutation adapter exists.
+# Read-only evidence workflow. No native mutation adapter exists.
+# Release version: NtfsAssessment.Common.ps1, PermissionValidation entry in NtfsVersions.
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Common.ps1')
-$script:NvVersion = '0.1.0'
 $script:NvStages = @('Initialize','CaptureBefore','CaptureAfterApply','CaptureAfterRevert','Report')
 
 function Assert-NvWindows {
@@ -33,7 +33,7 @@ function New-NvBinding($Descriptor, $Grants, [string]$Scope, [int]$MaxPaths, [st
     Assert-NpTargetDescriptor $Descriptor $Descriptor.CanonicalPath
     Assert-NpNormalizedGrants $Grants
     return [pscustomobject][ordered]@{
-        Schema='NtfsPermissionValidation/1'; Version=$script:NvVersion
+        Schema='NtfsPermissionValidation/1'; Version=$script:NtfsVersions.PermissionValidation
         CaseId=[guid]::NewGuid().ToString('N'); CreatedUtc=[DateTime]::UtcNow.ToString('o')
         ExecutionHost=[Environment]::MachineName; Actor=([Environment]::UserDomainName + '\' + [Environment]::UserName)
         ChangeTicket=$Ticket; DisposableAcknowledged=$true; TargetDescriptor=$Descriptor
@@ -109,7 +109,7 @@ function Assert-NvLocalCase([string]$CasePath) {
 }
 
 function Assert-NvBinding($Binding) {
-    if ($Binding.Schema -cne 'NtfsPermissionValidation/1' -or $Binding.Version -cne $script:NvVersion -or
+    if ($Binding.Schema -cne 'NtfsPermissionValidation/1' -or $Binding.Version -cne $script:NtfsVersions.PermissionValidation -or
         $Binding.WriterQualification -cne 'NotQualified' -or $Binding.DisposableAcknowledged -ne $true -or
         $Binding.ExecutionHost -cne [Environment]::MachineName -or
         $Binding.Actor -cne ([Environment]::UserDomainName + '\' + [Environment]::UserName) -or
@@ -536,6 +536,8 @@ function Invoke-NvStage {
         # Reserving a stage is irreversible: exceptions leave evidence and lock for review.
         if (Test-Path -LiteralPath $directory) { throw 'Immutable stage already exists.' }
         [void][IO.Directory]::CreateDirectory($directory)
+        $logPath = Join-Path $directory 'stage.log'
+        Write-NtfsLog $logPath PermissionValidation INFO $Stage 'Read-only evidence stage started'
         $status = 'Observed'
         if ($Stage -ceq 'Initialize') {
             Write-NvNewJson (Join-Path $directory 'case.json') $Binding
@@ -582,6 +584,7 @@ function Invoke-NvStage {
                 Export-NtfsCsvData $rows (Join-Path $directory 'snapshots.csv')
             }
         }
+        Write-NtfsLog $logPath PermissionValidation $status $Stage 'Read-only evidence stage completed'
         $manifest = [ordered]@{
             Schema='NtfsPermissionValidationStage/1'; Stage=$Stage; BindingSHA256=$state.BindingHash
             StartedUtc=$started; CompletedUtc=[DateTime]::UtcNow.ToString('o')
@@ -610,7 +613,7 @@ function Invoke-NvStage {
         if ($status -ceq 'Incomplete') { $next='INCOMPLETE: stop external actions, preserve evidence and review. Report may close this case; no safe apply/revert is implied.' }
         elseif ($status -ceq 'Failed') { $next='FAILED evidence checks: stop external actions; preserve this case for independent drift/recovery review. Report may close it; no automatic recovery is available.' }
         return [pscustomobject]@{
-            Version=$script:NvVersion; CasePath=$CasePath; Stage=$Stage; Status=$status
+            Version=$script:NtfsVersions.PermissionValidation; CasePath=$CasePath; Stage=$Stage; Status=$status
             CommitSHA256=(Get-NvFileHash $commitPath); TargetWrites=0; WriterQualification='NotQualified'; NextStep=$next
         }
     } finally {
