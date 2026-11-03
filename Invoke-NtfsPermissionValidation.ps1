@@ -13,7 +13,7 @@
 .SYNOPSIS
 Read-only permission validation and evidence walkthrough.
 .NOTES
-Version 0.1.0.
+Release version: NtfsAssessment.Common.ps1, PermissionValidation entry in NtfsVersions.
 
 .DESCRIPTION
 Stages: Initialize, CaptureBefore, CaptureAfterApply, CaptureAfterRevert, Report.

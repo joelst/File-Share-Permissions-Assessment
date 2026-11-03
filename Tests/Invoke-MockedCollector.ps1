@@ -71,7 +71,7 @@ function Get-SmbShareAccess {
     @([pscustomobject]@{AccountName='Everyone';SID='S-1-1-0';AccessControlType='Allow';AccessRight='Change'})
 }
 if($LocalContainment -or $ExcludedOnly){
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment_v1.6.3.ps1') -OutputRoot $OutputRoot -ComputerName 'MOCK'
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -ComputerName 'MOCK'
     exit $LASTEXITCODE
 }
 if($ExplicitContainment){
@@ -79,7 +79,7 @@ if($ExplicitContainment){
         [CmdletBinding()]param([string]$ItemType,[string]$Path,[switch]$Force)
         throw 'Synthetic forbidden directory creation was attempted.'
     }
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment_v1.6.3.ps1') -OutputRoot $OutputRoot -UncPath '\\server\data'
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -UncPath '\\server\data'
     exit $LASTEXITCODE
 }
 if($BestPractices){
@@ -88,11 +88,11 @@ if($BestPractices){
     $arguments=@{OutputRoot=$OutputRoot;ComputerName='MOCK';MaxDepth=1;BestPractices=$true}
     if($PolicyPath){$arguments.BestPracticesPolicyPath=$PolicyPath}
     if($Audit){$arguments.CollectAuditEvidence=$true}
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment_v1.6.3.ps1') @arguments
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') @arguments
     exit $LASTEXITCODE
 }
 $paths=@('\\server\data')
 if($LocalExplicitContainment){$paths=@('\\mock\data')}
 if($DuplicateScopes){$paths=@('\\server\data','\\SERVER\DATA','\\server\data\','\\server\data\child')}
-& (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment_v1.6.3.ps1') -OutputRoot $OutputRoot -UncPath $paths -OntapSharePermissionsCsv $OntapCsv -MaxDepth 0 -SplitOutputByShare -HashOutputs
+& (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -UncPath $paths -OntapSharePermissionsCsv $OntapCsv -MaxDepth 0 -SplitOutputByShare -HashOutputs
 exit $LASTEXITCODE

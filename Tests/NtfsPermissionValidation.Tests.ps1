@@ -69,6 +69,15 @@ Describe 'Read-only validation evidence workflow' {
         $result.TargetWrites | Should -Be 0
         $state=Read-NvCase $case
         $state.Count | Should -Be 5
+        foreach ($stage in $script:NvStages) {
+            $lines=@(Get-Content -LiteralPath (Join-Path $case "$stage/stage.log"))
+            $lines.Count | Should -Be 2
+            foreach ($line in $lines) {
+                $line | Should -Match ([regex]::Escape("Version=$($script:NtfsVersions.PermissionValidation)"))
+            }
+            $state.Stages[$stage].Files.Name | Should -Contain 'stage.log'
+        }
+        $result.Version | Should -Be $script:NtfsVersions.PermissionValidation
         $report=Read-NvJson (Join-Path $case 'Report/report.json')
         $report.IndependentComparison.Revert.DescriptorResult | Should -Be ExactCapturedDescriptorsObservedOnly
         $report.IndependentComparison.Apply.DescriptorResult | Should -Be NoChangeObserved

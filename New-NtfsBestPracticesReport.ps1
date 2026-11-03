@@ -19,7 +19,8 @@
 .EXAMPLE
   .\New-NtfsBestPracticesReport.ps1 -InputRunFolder D:\AssessmentRuns\ASSESS_FS01_... -OutputFolder D:\Reports\FS01-BP
 .NOTES
-  Version 1.0.0. Matches the shared best-practices engine and report evidence version.
+  Release version: NtfsAssessment.Common.ps1, BestPractices entry in NtfsVersions.
+  Matches the shared best-practices engine and report evidence version.
   Policy JSON schema (exact keys; values are booleans; check IDs are allowlisted):
   {"schemaVersion":1,"rules":[{"checkId":"SMBRequireSecuritySignature","expectedValue":true},{"checkId":"ShareEncryptionEnabled","expectedValue":true}]}
   A policy match applies only to that observed setting, not overall compliance.

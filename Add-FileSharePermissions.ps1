@@ -13,7 +13,7 @@
 .SYNOPSIS
 Read-only NTFS permission planning with audited, DISABLED live Apply/Revert.
 .DESCRIPTION
-Version 0.2.1-unqualified. 
+Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
 
 Matches the shared permissions engine and evidence version.
 Plan validates all security groups and snapshots a local fixed Windows NTFS
@@ -210,7 +210,7 @@ try {
 }
 Write-Host "$status : $reason"
 [pscustomobject]@{
-    Version=$script:NtfsPermissionsVersion
+    Version=$script:NtfsVersions.Permissions
     Status=$status; PlanningStatus='PlanningSupported'; MutationStatus='MutationNotQualified'
     Qualification='NotQualified'; TargetDescriptor=$targetDescriptor
     Mode=$Mode; RunDirectory=$run; PlanSHA256=$journal.PlanHash; Reason=$reason; TargetWrites=0

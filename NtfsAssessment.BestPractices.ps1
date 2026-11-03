@@ -13,10 +13,11 @@
 .SYNOPSIS
 Read-only evidence-based best-practices evaluation and reporting helpers.
 .NOTES
-Version 1.0.0. Script versions are independent of policy and manifest schema versions.
+Release version: NtfsAssessment.Common.ps1, BestPractices entry in NtfsVersions.
+Script versions are independent of policy and manifest schema versions.
 #>
 Set-StrictMode -Version Latest
-$script:NtfsBestPracticesVersion = '1.0.0'
+. (Join-Path $PSScriptRoot 'NtfsAssessment.Common.ps1')
 
 $script:NtfsBpCheckDefinitions = @{
     SMB1Enabled = @{ Reference='https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3'; Recommendation='Review whether SMB1 is required; disable it only through the server change process.'; Severity='High' }
@@ -331,7 +332,7 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
     $checkCount=0
     foreach($statusName in @('Review','MeetsConfiguredPolicy','DoesNotMeetConfiguredPolicy','NotAssessed','NotApplicable')){if($counts.ContainsKey($statusName)){$checkCount+=[int]$counts[$statusName]}}
     $summary=[ordered]@{
-        Version=$script:NtfsBestPracticesVersion
+        Version=$script:NtfsVersions.BestPractices
         SchemaVersion=1;GeneratedUtc=[datetime]::UtcNow.ToString('o');ReadOnly=$true
         RunFolder=(Split-Path -Leaf $RunFolder);CheckCount=$checkCount
         StatusInterpretation='MeetsConfiguredPolicy means only that the directly observed value matched that individual JSON rule. It is not system or share compliance; zero findings do not establish compliance.'
@@ -361,30 +362,38 @@ function Invoke-NtfsBestPracticesOfflineReport([string]$InputRunFolder,[string]$
     if (Test-Path -LiteralPath $destination) {
         if (@(Get-ChildItem -LiteralPath $destination -Force).Count -gt 0) { throw 'Offline report OutputFolder must be new or empty.' }
     } else { [void](New-Item -ItemType Directory -Path $destination -Force) }
-    $manifestPath=Join-Path $source 'manifest.json'
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Source run is missing manifest.json.' }
-    $manifest=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($manifest.ReadOnly -ne $true -or $manifest.FatalError) { throw 'Source run is not a successful read-only assessment.' }
-    if ($manifest.PSObject.Properties.Name -notcontains 'Datasets' -or @($manifest.Datasets).Count -eq 0) {
-        throw 'Source run does not contain a verified dataset inventory.'
+    $logPath=Join-Path $destination 'report.log'
+    Write-NtfsLog $logPath BestPractices INFO Start 'Read-only offline report started'
+    try {
+        $manifestPath=Join-Path $source 'manifest.json'
+        if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Source run is missing manifest.json.' }
+        $manifest=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        if ($manifest.ReadOnly -ne $true -or $manifest.FatalError) { throw 'Source run is not a successful read-only assessment.' }
+        if ($manifest.PSObject.Properties.Name -notcontains 'Datasets' -or @($manifest.Datasets).Count -eq 0) {
+            throw 'Source run does not contain a verified dataset inventory.'
+        }
+        foreach ($dataset in @('Shares.csv','SharePermissions.csv','NtfsAcls.csv','Folders.csv','Identities.csv','ShareCoverage.csv','ScanErrors.csv','SkippedPaths.csv')) {
+            $parts=@(Get-NtfsCsvFiles $source $dataset)
+            if ($parts.Count -eq 0) { throw "Source run is missing required dataset $dataset." }
+        }
+        $policy=if ($PolicyPath) {Read-NtfsBestPracticesPolicy $PolicyPath} else {$null}
+        $result=Write-NtfsBestPracticesReport $source $destination $policy -PolicyAlreadyParsed
+        $outputInventory=@(Get-NtfsDatasetInventory $destination)
+        $offlineManifest=[ordered]@{
+            Version=$script:NtfsVersions.BestPractices
+            SchemaVersion=1;GeneratedUtc=[datetime]::UtcNow.ToString('o');SourceRunId=$manifest.RunId
+            SourceManifestSHA256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            PolicySHA256=$(if($null -ne $policy){$policy.SHA256}else{''})
+            Datasets=$outputInventory;SummaryFile='BestPracticeSummary.json'
+            SummarySHA256=(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticeSummary.json') -Algorithm SHA256).Hash
+            PolicyCopySHA256=$(if($policy){(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticesPolicy.json') -Algorithm SHA256).Hash}else{''})
+            ReadOnly=$true;SourceRunFolder=(Split-Path -Leaf $source);SourceManifestFile='manifest.json'
+        }
+        $offlineManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $destination 'BestPracticesManifest.json') -Encoding UTF8
+        Write-NtfsLog $logPath BestPractices INFO Complete 'Read-only offline report completed'
+        return $result
+    } catch {
+        Write-NtfsLog $logPath BestPractices ERROR Failed $_.Exception.Message
+        throw
     }
-    foreach ($dataset in @('Shares.csv','SharePermissions.csv','NtfsAcls.csv','Folders.csv','Identities.csv','ShareCoverage.csv','ScanErrors.csv','SkippedPaths.csv')) {
-        $parts=@(Get-NtfsCsvFiles $source $dataset)
-        if ($parts.Count -eq 0) { throw "Source run is missing required dataset $dataset." }
-    }
-    $policy=if ($PolicyPath) {Read-NtfsBestPracticesPolicy $PolicyPath} else {$null}
-    $result=Write-NtfsBestPracticesReport $source $destination $policy -PolicyAlreadyParsed
-    $outputInventory=@(Get-NtfsDatasetInventory $destination)
-    $offlineManifest=[ordered]@{
-        Version=$script:NtfsBestPracticesVersion
-        SchemaVersion=1;GeneratedUtc=[datetime]::UtcNow.ToString('o');SourceRunId=$manifest.RunId
-        SourceManifestSHA256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
-        PolicySHA256=$(if($null -ne $policy){$policy.SHA256}else{''})
-        Datasets=$outputInventory;SummaryFile='BestPracticeSummary.json'
-        SummarySHA256=(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticeSummary.json') -Algorithm SHA256).Hash
-        PolicyCopySHA256=$(if($policy){(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticesPolicy.json') -Algorithm SHA256).Hash}else{''})
-        ReadOnly=$true;SourceRunFolder=(Split-Path -Leaf $source);SourceManifestFile='manifest.json'
-    }
-    $offlineManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $destination 'BestPracticesManifest.json') -Encoding UTF8
-    return $result
 }

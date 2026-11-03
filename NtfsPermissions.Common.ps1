@@ -13,12 +13,11 @@
 .SYNOPSIS
 Shared permission planning, evidence and guarded recovery helpers.
 .NOTES
-Version 0.2.1-unqualified. Live mutation is disabled.
+Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
+Live mutation is disabled.
 #>
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsAssessment.Common.ps1')
-
-$script:NtfsPermissionsVersion = '0.2.1-unqualified'
 
 function ConvertTo-NpUnc([string]$Path) {
     if ($Path -notmatch '^\\\\[^\\]+\\[^\\]+(?:\\[^\\]+)*\\?$' -or
@@ -485,7 +484,7 @@ function New-NpPlan([string]$Target, $Grants, [string]$Scope, $Inventory, [strin
     }
     $reasons += "MutationNotQualified/$($TargetDescriptor.QualificationScope): native writer absent; identity, namespace/backend and propagation are unproven. Windows local, Windows SMB, NetApp SMB and generic SMB require separate qualification."
     return [pscustomobject][ordered]@{
-        Schema = 'NtfsPermissionsPlan/2'; Version = $script:NtfsPermissionsVersion
+        Schema = 'NtfsPermissionsPlan/2'; Version = $script:NtfsVersions.Permissions
         CreatedUtc = [DateTime]::UtcNow.ToString('o'); SourceHash = $SourceHash
         Target = $Target; TargetDescriptor = $TargetDescriptor; Scope = $Scope; Grants = @($Grants); Entries = @($entries)
         InventoryEvidence = @($Inventory.Snapshots)
@@ -505,7 +504,7 @@ function Read-NpPlan([string]$Path, [string]$SHA256, [string]$SourceHash, [int]$
     $plan = [Text.UTF8Encoding]::new($false,$true).GetString($bytes) | ConvertFrom-NpJson
     if ($plan.Schema -cne 'NtfsPermissionsPlan/2') { throw 'Plan schema changed: legacy plans lack platform/namespace bindings; create and review a new plan.' }
     Assert-NpProperties $plan @('Schema','Version','CreatedUtc','SourceHash','Target','TargetDescriptor','Scope','Grants','Entries','InventoryEvidence','Boundaries','CoverageComplete','Recovery','Executable','Status','Reasons')
-    if ($plan.Version -cne $script:NtfsPermissionsVersion -or $plan.SourceHash -cne $SourceHash) { throw 'Plan schema/version/source binding mismatch.' }
+    if ($plan.Version -cne $script:NtfsVersions.Permissions -or $plan.SourceHash -cne $SourceHash) { throw 'Plan schema/version/source binding mismatch.' }
     Assert-NpTargetDescriptor $plan.TargetDescriptor $plan.Target
     $created = [DateTimeOffset]::Parse($plan.CreatedUtc,[Globalization.CultureInfo]::InvariantCulture)
     if ($created -gt [DateTimeOffset]::UtcNow.AddMinutes(5) -or $created -lt [DateTimeOffset]::UtcNow.AddHours(-$MaxAgeHours)) { throw 'Plan expired or future dated.' }
@@ -618,7 +617,7 @@ function Write-NpEvent($Journal, [string]$Stage, [string]$Result, $Changes = @()
     $event = [ordered]@{
         Sequence = $Journal.Sequence + 1; Previous = $Journal.Previous; OperationId = $Journal.OperationId
         Utc = [DateTime]::UtcNow.ToString('o'); Actor = $Journal.Actor; Host = $Journal.HostName
-        Ticket = $Journal.Ticket; PlanHash = $Journal.PlanHash; SourceHash = $Journal.SourceHash; Version = $script:NtfsPermissionsVersion
+        Ticket = $Journal.Ticket; PlanHash = $Journal.PlanHash; SourceHash = $Journal.SourceHash; Version = $script:NtfsVersions.Permissions
         Mode = $Journal.Mode; Stage = $Stage; Target = $Journal.Target; Changes = @($Changes); Result = $Result
     }
     $payload = Get-NpCanonicalJson $event
