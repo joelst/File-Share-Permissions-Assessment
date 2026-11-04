@@ -45,7 +45,8 @@ try {
     $reportDirectory=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFolder)
     $result=Invoke-NtfsBestPracticesOfflineReport $InputRunFolder $reportDirectory $BestPracticesPolicyPath
     $coverage=$result.SourceCoverage
-    $incomplete=$result.StatusCounts.NotAssessed -gt 0 -or $coverage.PartialRows -gt 0 -or
+    $noScopes=$coverage.CoverageRows -eq 0
+    $incomplete=$noScopes -or $result.StatusCounts.NotAssessed -gt 0 -or $coverage.PartialRows -gt 0 -or
         $coverage.ScanErrors -gt 0 -or $coverage.SkippedPathRows -gt 0 -or $coverage.BestPracticesEvidenceErrors -gt 0
     $sourceIssues=@(
         if($coverage.PartialRows -gt 0){"$($coverage.PartialRows) partial scopes"}
@@ -54,6 +55,7 @@ try {
         if($coverage.BestPracticesEvidenceErrors -gt 0){"$($coverage.BestPracticesEvidenceErrors) best-practices evidence error records"}
     )
     $actions=@(
+        if($noScopes){'Resolve 1 blocker: no assessment scopes are recorded in ShareCoverage.csv. Check target names and share filters.'}
         if($result.StatusCounts.NotAssessed -gt 0){"Resolve or document $($result.StatusCounts.NotAssessed) missing evidence checks."}
         if($result.StatusCounts.DoesNotMeetConfiguredPolicy -gt 0){"Review $($result.StatusCounts.DoesNotMeetConfiguredPolicy) policy mismatches."}
         if($result.StatusCounts.Review -gt 0){"Review $($result.StatusCounts.Review) contextual warnings."}
@@ -66,7 +68,9 @@ try {
         reviewPath=@((Join-Path $reportDirectory 'BestPracticeChecks.csv'),(Join-Path $reportDirectory 'BestPracticeSummary.json'))
         requirements=($actions -join ' ')
         reasonSummary=@($result.Diagnostics)
-        nextStep=$(if($incomplete){
+        nextStep=$(if($noScopes){
+            'No scopes were recorded. Run Invoke-NtfsAssessment.ps1 with corrected targets or share filters, then New-NtfsBestPracticesReport.ps1 on the new run. Do not treat this report as an assessment of access.'
+        }elseif($incomplete){
             'No next report script is required. To resolve collection gaps, next script: Invoke-NtfsAssessment.ps1 using a collection mode that supports the missing evidence, then New-NtfsBestPracticesReport.ps1 on the new run. Offline reporting cannot fill evidence gaps.'
         }else{
             'No next script is required: reporting is complete. Review BestPracticeChecks.csv; after approved policy exceptions, rerun New-NtfsBestPracticesReport.ps1 with -BestPracticesPolicyPath. Matches do not establish overall compliance.'

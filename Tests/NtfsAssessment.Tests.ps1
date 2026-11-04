@@ -59,15 +59,17 @@ Describe 'NTFS assessment offline regression coverage' {
             ($messages.MessageData -join "`n") | Should -Match 'Next:\r?\n  Review coverage\.'
         }
         It 'quotes actual command paths and parameters without interpreting their contents' {
-            $path="C:\Evidence\O'Brien `$case"
+            $quotes=(@([char]0x2018,[char]0x2019,[char]0x201A,[char]0x201B) -join '')
+            $path='C:\Evidence\O'+$quotes+'Brien''s $case'
+            $scriptPath='C:\Tools\O'+$quotes+'Brien''s\Merge-NtfsAssessment.ps1'
             $parameters=[ordered]@{RunSelection='Explicit';RunFolder=$path;OutputFolder="$($path)\reports"}
-            $records=@(Write-NtfsCompletion -component Assessment -status Completed -nextStep 'Merge this snapshot:' -nextScriptPath "C:\Tools\O'Brien\Merge-NtfsAssessment.ps1" -nextParameters $parameters 6>&1)
+            $records=@(Write-NtfsCompletion -component Assessment -status Completed -nextStep 'Merge this snapshot:' -nextScriptPath $scriptPath -nextParameters $parameters 6>&1)
             $command=[string]$records[-1].MessageData
             $tokens=$null;$errors=$null
             $ast=[Management.Automation.Language.Parser]::ParseInput($command,[ref]$tokens,[ref]$errors)
             $errors.Count | Should -Be 0
             $commandAst=$ast.EndBlock.Statements[0].PipelineElements[0]
-            $commandAst.CommandElements[0].Value | Should -Be "C:\Tools\O'Brien\Merge-NtfsAssessment.ps1"
+            $commandAst.CommandElements[0].Value | Should -BeExactly $scriptPath
             $commandAst.CommandElements[4].Value | Should -BeExactly $path
             $commandAst.CommandElements[6].Value | Should -BeExactly "$($path)\reports"
         }

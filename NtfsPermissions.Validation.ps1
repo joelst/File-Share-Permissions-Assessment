@@ -594,20 +594,24 @@ function Invoke-NvStage {
         if($Stage -eq 'Report'){
             $diagnostics.MissingEvidence=$report.MissingStages.Count+$report.EvidenceErrors.Count
             if($report.MissingStages.Count){
-                $diagnostics.Reasons+=@([pscustomobject]@{Count=$report.MissingStages.Count;Reason="Missing required captures: $($report.MissingStages -join ', '). Report is sealed; do not resume this case."})
+                $diagnostics.Reasons+=@([pscustomobject]@{Status='NotAssessed';Count=$report.MissingStages.Count;Reason="Missing required captures: $($report.MissingStages -join ', '). Report is sealed; do not resume this case."})
             }
-            $diagnostics.Reasons+=@($report.EvidenceErrors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+            $diagnostics.Reasons+=@($report.EvidenceErrors|Group-Object|ForEach-Object{[pscustomobject]@{Status='NotAssessed';Count=$_.Count;Reason=$_.Name}})
             $diagnostics.Warnings+=$report.IntentErrors.Count
             $diagnostics.Reasons+=@($report.IntentErrors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason="Intent review: $($_.Name)"}})
             foreach($item in $report.IndependentComparison.GetEnumerator()){
                 $diagnostics.MissingEvidence+=$item.Value.Missing.Count
                 if($item.Value.Missing.Count){
-                    $diagnostics.Reasons+=@([pscustomobject]@{Count=$item.Value.Missing.Count;Reason="$($item.Key): baseline paths missing from the current capture; review report.json and comparison.json."})
+                    $diagnostics.Reasons+=@([pscustomobject]@{Status='NotAssessed';Count=$item.Value.Missing.Count;Reason="$($item.Key): baseline paths missing from the current capture; review report.json and comparison.json."})
                 }
                 if($item.Value.Status -ne 'Observed'){
                     $diagnostics.Warnings++
-                    if($item.Value.Status -in @('NotAssessed','Incomplete')){$diagnostics.MissingEvidence++}
-                    $diagnostics.Reasons+=@([pscustomobject]@{Count=1;Reason="$($item.Key) comparison: $($item.Value.Status); namespace=$($item.Value.Namespace); descriptors=$($item.Value.DescriptorResult)."})
+                    $comparisonReason=@{Count=1;Reason="$($item.Key) comparison: $($item.Value.Status); namespace=$($item.Value.Namespace); descriptors=$($item.Value.DescriptorResult)."}
+                    if($item.Value.Status -in @('NotAssessed','Incomplete')){
+                        $diagnostics.MissingEvidence++
+                        $comparisonReason.Status='NotAssessed'
+                    }
+                    $diagnostics.Reasons+=@([pscustomobject]$comparisonReason)
                 }
             }
             if($report.ManualMatrixStatus -eq 'NotRun'){
@@ -620,19 +624,23 @@ function Invoke-NvStage {
             }
         }elseif($Stage -ne 'Initialize'){
             $diagnostics.MissingEvidence=$capture.Errors.Count
-            $diagnostics.Reasons+=@($capture.Errors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+            $diagnostics.Reasons+=@($capture.Errors|Group-Object|ForEach-Object{[pscustomobject]@{Status='NotAssessed';Count=$_.Count;Reason=$_.Name}})
             if($Stage -eq 'CaptureBefore'){
                 $failedIntents=@($intents|Where-Object Status -eq 'Failed')
                 $diagnostics.Warnings=$failedIntents.Count
-                $diagnostics.Reasons+=@($failedIntents|Group-Object Error|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason="Intent review: $($_.Name)"}})
+                $diagnostics.Reasons+=@($failedIntents|Group-Object {$_.Error}|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason="Intent review: $($_.Name)"}})
             }else{
                 $diagnostics.MissingEvidence+=$comparison.Missing.Count
-                if($comparison.Missing.Count){$diagnostics.Reasons+=@([pscustomobject]@{Count=$comparison.Missing.Count;Reason='Paths present in the baseline are missing from the current capture; namespace drift requires independent review.'})}
+                if($comparison.Missing.Count){$diagnostics.Reasons+=@([pscustomobject]@{Status='NotAssessed';Count=$comparison.Missing.Count;Reason='Paths present in the baseline are missing from the current capture; namespace drift requires independent review.'})}
                 if($comparison.Status -ne 'Observed'){
                     $diagnostics.Warnings++
-                    if($comparison.Status -in @('NotAssessed','Incomplete')){$diagnostics.MissingEvidence++}
                     $failedRows=@($comparison.Rows|Where-Object Status -eq 'Failed').Count
-                    $diagnostics.Reasons+=@([pscustomobject]@{Count=1;Reason="$($comparison.Mode) comparison: $($comparison.Status); namespace=$($comparison.Namespace); descriptors=$($comparison.DescriptorResult); failed path checks=$($failedRows); added paths=$($comparison.Added.Count). Review comparison.json for metadata, identity, grant, and unrelated-ACL results."})
+                    $comparisonReason=@{Count=1;Reason="$($comparison.Mode) comparison: $($comparison.Status); namespace=$($comparison.Namespace); descriptors=$($comparison.DescriptorResult); failed path checks=$($failedRows); added paths=$($comparison.Added.Count). Review comparison.json for metadata, identity, grant, and unrelated-ACL results."}
+                    if($comparison.Status -in @('NotAssessed','Incomplete')){
+                        $diagnostics.MissingEvidence++
+                        $comparisonReason.Status='NotAssessed'
+                    }
+                    $diagnostics.Reasons+=@([pscustomobject]$comparisonReason)
                 }
             }
         }

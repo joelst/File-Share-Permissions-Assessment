@@ -136,9 +136,11 @@ function Write-NtfsCompletion {
     Write-Information -MessageData 'Next:' -Tags 'NtfsCompletion' -InformationAction Continue
     Write-Information -MessageData (Format-NtfsCompletionText -text $nextStep) -Tags 'NtfsCompletion' -InformationAction Continue
     if ($nextScriptPath) {
-        $command = "& '{0}'" -f $nextScriptPath.Replace("'","''")
+        $escapedScript = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($nextScriptPath)
+        $command = "& '{0}'" -f $escapedScript
         foreach ($entry in $nextParameters.GetEnumerator()) {
-            $command += ' `'+ "`n" + ("    -{0} '{1}'" -f $entry.Key,([string]$entry.Value).Replace("'","''"))
+            $escapedValue = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$entry.Value)
+            $command += ' `'+ "`n" + ("    -{0} '{1}'" -f $entry.Key,$escapedValue)
         }
         Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
         Write-Information -MessageData "  $($command)" -Tags 'NtfsCompletion' -InformationAction Continue

@@ -71,7 +71,9 @@ function Get-SmbShareAccess {
     @([pscustomobject]@{AccountName='Everyone';SID='S-1-1-0';AccessControlType='Allow';AccessRight='Change'})
 }
 if($LocalContainment -or $ExcludedOnly){
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -ComputerName $env:COMPUTERNAME
+    $arguments=@{OutputRoot=$OutputRoot;ComputerName=$env:COMPUTERNAME}
+    if($BestPractices){$arguments.BestPractices=$true}
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') @arguments
     exit $LASTEXITCODE
 }
 if($ExplicitContainment){

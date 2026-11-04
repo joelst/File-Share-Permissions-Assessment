@@ -138,6 +138,7 @@ Describe 'Read-only validation evidence workflow' {
         $r.Diagnostics.MissingEvidence | Should -Be 3
         $r.Diagnostics.Warnings | Should -Be 1
         ($r.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'CaptureBefore, CaptureAfterApply, CaptureAfterRevert'
+        @($r.Diagnostics.Reasons | Where-Object Reason -like 'Missing required captures*')[0].Status | Should -Be 'NotAssessed'
         $report.WriterQualification | Should -Be NotQualified
     }
     It 'counts unresolved comparisons and prevents an external-action next step' {
@@ -155,6 +156,48 @@ Describe 'Read-only validation evidence workflow' {
         $result.Diagnostics.Warnings | Should -Be 1
         $result.NextStep | Should -BeLike '*stop external actions*'
         ($result.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'Apply comparison: NotAssessed'
+        @($result.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: NotAssessed*')[0].Status | Should -Be 'NotAssessed'
+        $reportResult=Invoke-NvStage $case Report
+        @($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: NotAssessed*')[0].Status | Should -Be 'NotAssessed'
+    }
+    It 'prioritizes capture and report evidence gaps ahead of more frequent intent warnings' {
+        $snapshots=@((New-VSnapshot))
+        foreach($group in 1..5){
+            foreach($item in 1..3){
+                $snapshots+=New-VSnapshot -Path "\\server\lab\case\group$($group)-item$($item)"
+            }
+        }
+        $script:fixture=New-VInventory -Snapshots $snapshots -Errors @('Synthetic capture evidence unavailable')
+        Mock New-NpProposal {
+            param($Before)
+            if($Before.Path -match 'group(\d+)'){throw "Intent warning group $($Matches[1])"}
+            throw 'Intent warning for root'
+        }
+        $case=New-VCase
+        $capture=Invoke-NvStage $case CaptureBefore
+        $captureMessages=@(Write-NtfsCompletion -component Validation -status Incomplete -reasonSummary $capture.Diagnostics.Reasons -nextStep 'Review evidence.' 6>&1)
+        $captureReasons=@($captureMessages.MessageData | Where-Object {$_ -like '  - (*'})
+        $captureReasons.Count | Should -Be 5
+        $captureReasons[0] | Should -Match 'NotAssessed: Synthetic capture evidence unavailable'
+        $reportResult=Invoke-NvStage $case Report
+        $reportMessages=@(Write-NtfsCompletion -component Validation -status Incomplete -reasonSummary $reportResult.Diagnostics.Reasons -nextStep 'Review evidence.' 6>&1)
+        $reportReasons=@($reportMessages.MessageData | Where-Object {$_ -like '  - (*'})
+        $reportReasons.Count | Should -Be 5
+        ($reportReasons[0..1] -join "`n") | Should -Match 'NotAssessed: CaptureBefore: Synthetic capture evidence unavailable'
+        ($reportReasons[0..1] -join "`n") | Should -Match 'NotAssessed: Missing required captures'
+    }
+    It 'prioritizes missing baseline paths without misclassifying failed comparisons' {
+        $case=New-VCase
+        $null=Invoke-NvStage $case CaptureBefore
+        $script:fixture=New-VInventory -Snapshots @((New-VSnapshot))
+        $capture=Invoke-NvStage $case CaptureAfterApply -ManualAcknowledged $true
+        @($capture.Diagnostics.Reasons | Where-Object Reason -like 'Paths present in the baseline*')[0].Status | Should -Be 'NotAssessed'
+        $failedCapture=@($capture.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Failed*')[0]
+        $failedCapture.PSObject.Properties.Name | Should -Not -Contain 'Status'
+        $reportResult=Invoke-NvStage $case Report
+        @($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply: baseline paths missing*')[0].Status | Should -Be 'NotAssessed'
+        $failedReport=@($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Failed*')[0]
+        $failedReport.PSObject.Properties.Name | Should -Not -Contain 'Status'
     }
     It 'detects exact-byte tampering of prior evidence' {
         $case=New-VCase
@@ -259,7 +302,10 @@ Describe 'Read-only validation evidence workflow' {
     It 'records capture errors and withholds every comparison claim' {
         $script:fixture=New-VInventory -Errors @('unreadable','reparse','limit')
         $case=New-VCase
-        Invoke-VThrough $case
+        $null=Invoke-NvStage $case CaptureBefore
+        $after=Invoke-NvStage $case CaptureAfterApply -ManualAcknowledged $true
+        @($after.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Incomplete*')[0].Status | Should -Be 'NotAssessed'
+        $null=Invoke-NvStage $case CaptureAfterRevert -ManualAcknowledged $true
         $r=Invoke-NvStage $case Report
         $r.Status | Should -Be Incomplete
         $report=Read-NvJson (Join-Path $case 'Report/report.json')
@@ -267,6 +313,7 @@ Describe 'Read-only validation evidence workflow' {
         $report.IndependentComparison.Revert.DescriptorResult | Should -Be NotAssessed
         $r.Diagnostics.MissingEvidence | Should -Be ($report.EvidenceErrors.Count+2)
         ($r.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'unreadable'
+        @($r.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Incomplete*')[0].Status | Should -Be 'NotAssessed'
         $r.NextStep | Should -Not -Match 'Report may close'
     }
     It 'records all manual tests as NotRun with explicit external evidence fields' {

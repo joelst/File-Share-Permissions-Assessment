@@ -379,7 +379,9 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
             $scanErrors=@(Get-NtfsCsvFiles $RunFolder 'ScanErrors.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName }).Count
             $skippedPaths=@(Get-NtfsCsvFiles $RunFolder 'SkippedPaths.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName }).Count
             $bpErrors=@(Get-NtfsCsvFiles $RunFolder 'BestPracticesErrors.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName }).Count
-            [ordered]@{CoverageRows=$coverage.Count;PartialRows=@($coverage|Where-Object Status -match 'Partial|Skipped').Count;Errors=(($coverage|Measure-Object -Property Errors -Sum).Sum);SkippedPaths=(($coverage|Measure-Object -Property SkippedPaths -Sum).Sum);ScanErrors=$scanErrors;SkippedPathRows=$skippedPaths;BestPracticesEvidenceErrors=$bpErrors;Dataset='ShareCoverage.csv'}
+            $coverageErrors=if($coverage.Count){($coverage|Measure-Object -Property Errors -Sum).Sum}else{0}
+            $coverageSkippedPaths=if($coverage.Count){($coverage|Measure-Object -Property SkippedPaths -Sum).Sum}else{0}
+            [ordered]@{CoverageRows=$coverage.Count;PartialRows=@($coverage|Where-Object Status -match 'Partial|Skipped').Count;Errors=$coverageErrors;SkippedPaths=$coverageSkippedPaths;ScanErrors=$scanErrors;SkippedPathRows=$skippedPaths;BestPracticesEvidenceErrors=$bpErrors;Dataset='ShareCoverage.csv'}
         }else{[ordered]@{CoverageRows=0;PartialRows=0;Errors=0;SkippedPaths=0;ScanErrors=0;SkippedPathRows=0;BestPracticesEvidenceErrors=0;Dataset='NotAvailable'}})
         Limitations=@('Recommendations are evidence-based review prompts, not compliance certification or effective-access calculations.','Only collected directory ACLs are assessed; individual file ACLs and complete coverage are not established.','Unknown, missing, ambiguous, unsupported, or failed evidence remains NotAssessed.','No result authorizes mutation or supports a compliance qualification.','No server, share, ACL, audit, or policy settings were modified.')
     }

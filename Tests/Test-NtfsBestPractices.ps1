@@ -222,6 +222,28 @@ try {
     Assert ($cliExit -eq 0 -and ($cliLog -join "`n").Contains('Best practices: CompletedWithWarnings.') -and ($cliLog -join "`n").Contains((Join-Path $cliOutput 'BestPracticeChecks.csv')) -and ($cliLog -join "`n").Contains('Offline reporting cannot fill evidence gaps')) 'Offline report CLI points to actual findings and unavailable-evidence guidance'
     Assert (($cliLog -join "`n").Contains("Resolve or document $($baselineResult.StatusCounts.NotAssessed) missing evidence checks") -and ($cliLog -join "`n").Contains('- (') -and ($cliLog -join "`n").Contains('Invoke-NtfsAssessment.ps1')) 'Offline report names the next collection script and quantifies missing evidence with reasons'
     Assert (($cliLog -join "`n") -notmatch '\b0 (missing evidence checks|policy mismatches|contextual warnings|partial scopes|error records|skipped-path records)\b') 'Offline report action guidance excludes zero-count categories'
+    $emptyCollectionOutput=Join-Path $testRoot 'collector-empty-scope'
+    $ErrorActionPreference='Continue'
+    try{
+        $emptyCollectionLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $emptyCollectionOutput -ExcludedOnly -BestPractices 2>&1)
+        $emptyCollectionExit=$LASTEXITCODE
+    }finally{$ErrorActionPreference='Stop'}
+    $emptyCollectionText=($emptyCollectionLog -join ' ') -replace '\s+',' '
+    Assert ($emptyCollectionExit -eq 0 -and $emptyCollectionText -match 'Assessment: CompletedWithWarnings\.' -and $emptyCollectionText -match 'zero selected assessment scopes') "Excluded-only collector completes with inline best-practices and identifies its empty scope: $($emptyCollectionLog -join "`n")"
+    $emptyRun=Get-ChildItem -LiteralPath $emptyCollectionOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
+    $emptyInlineSummary=Get-Content -LiteralPath (Join-Path $emptyRun.FullName 'BestPracticeSummary.json') -Raw|ConvertFrom-Json
+    Assert ($emptyInlineSummary.SourceCoverage.CoverageRows -eq 0 -and $emptyInlineSummary.CheckCount -eq 0) 'Inline best practices retain the empty-scope evidence without inventing checks'
+    $emptyReportOutput=Join-Path $testRoot 'empty-scope-report'
+    $ErrorActionPreference='Continue'
+    try{
+        $emptyReportLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $emptyRun.FullName -OutputFolder $emptyReportOutput 2>&1)
+        $emptyReportExit=$LASTEXITCODE
+    }finally{$ErrorActionPreference='Stop'}
+    Assert ($emptyReportExit -eq 0) "Empty-scope offline report completes: $($emptyReportLog -join "`n")"
+    $emptyReportText=($emptyReportLog -join ' ') -replace '\s+',' '
+    $emptyReportSummary=Get-Content -LiteralPath (Join-Path $emptyReportOutput 'BestPracticeSummary.json') -Raw|ConvertFrom-Json
+    Assert ($emptyReportSummary.SourceCoverage.CoverageRows -eq 0 -and $emptyReportSummary.SourceCoverage.Errors -eq 0 -and $emptyReportSummary.SourceCoverage.SkippedPaths -eq 0 -and $emptyReportSummary.CheckCount -eq 0) 'Offline reporting retains the empty-scope evidence without inventing checks'
+    Assert ($emptyReportText -match 'Best practices: CompletedWithWarnings\.' -and $emptyReportText -match 'Resolve 1 blocker: no assessment scopes' -and $emptyReportText -match 'Invoke-NtfsAssessment\.ps1' -and $emptyReportText -match 'New-NtfsBestPracticesReport\.ps1' -and $emptyReportText -notmatch 'No next (report )?script is required') 'Offline reporting identifies empty coverage and directs a new collection and report'
     $cliFailureOutput=Join-Path $testRoot 'cli-failed-report'
     $ErrorActionPreference='Continue'
     try{
