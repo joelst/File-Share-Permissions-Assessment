@@ -153,6 +153,27 @@ Risk indicators and recommendations require contextual review. They are not
 effective-access calculations or approved remediation instructions. Incomplete
 folder ACLs have no risk score and are excluded from risk averages.
 
+Each entry script finishes with its status, actual output location, reports or
+logs to review, and a specific next script/stage or an explicit statement that
+no further script is required. Published assessments include a quoted merge
+command selecting that exact snapshot, including supported partial snapshots.
+Missing optional server/audit evidence does not block offline merging.
+The terminal shows actual missing-evidence, error, and warning counts with
+recorded reasons (grouped and bounded to five displayed groups, with any
+remaining groups disclosed). Missing evidence is prioritized over contextual
+warnings; counts identify record types, not unique affected objects, and can
+overlap. The best-practices summary persists all diagnostic groups.
+Failed runs and zero-scope collections identify the blocking reason rather than
+offering a downstream command. Merge/comparison summaries include cleanup
+warnings before presenting the final status. No hinted command runs automatically.
+Planning never recommends executing the disabled Apply/Revert modes. Validation
+hints preserve external-action approval checkpoints and never bypass failed or
+incomplete/unassessed observations. After-action command examples intentionally
+omit acknowledgement switches so the operator must still confirm the external
+action. Sealed reports cannot be repaired by rerunning capture stages. Guidance
+uses the information stream; planning and
+validation still return their structured result objects and retain their exit behavior.
+
 ### 4. Optionally collect and report best-practices evidence
 
 Enable evidence at collection time when you need server configuration, signing,
@@ -185,23 +206,59 @@ The output must be new or empty and outside the source run. Outputs include
 `BestPracticeChecks.csv`, `BestPracticeSummary.json`,
 `BestPracticesManifest.json`, and `report.log`.
 
-An optional policy file has this shape:
+**Built-in baseline:** `-BestPractices` and offline reports automatically evaluate
+known evidence against these expectations. No policy file is required.
+
+| Check ID | Expected value |
+| --- | --- |
+| `SMB1Enabled` | `false` (SMB1 disabled) |
+| `SMBRequireSecuritySignature` | `true` (server requires signing) |
+| `ShareEncryptionEnabled` | `true` (share encryption enabled) |
+| `ShareABEEnabled` | `true` (access-based enumeration enabled) |
+| `DirectUserAllow` | `false` (prefer group-based grants) |
+| `BroadPrincipalWrite` | `false` (no broad-principal write-capable allow entries) |
+
+This is the toolkit's review baseline, not an official Microsoft compliance
+baseline or an automatic remediation plan. Signing, encryption, ABE, and
+group-based grants can need environment-specific exceptions. Audit policy and
+root SACL checks remain review-only unless supported audit expectations are
+configured; auditing scope and event volume require planning. Protected
+inheritance, null DACLs, and unresolved principals remain contextual findings.
+An unresolved name alone does not establish a stale account.
+
+Missing evidence remains `NotAssessed`, even when the baseline defines an
+expectation. In particular, explicit UNC and NAS scans do not collect Windows
+SMB server configuration or audit policy. Grant checks report matching entries;
+absence of a finding does not prove complete coverage or effective access.
+
+The summary and manifest record the baseline version, effective rules, and
+custom override IDs. Each check records its expectation and whether it came
+from the built-in baseline or a hash-identified custom policy.
+
+An optional policy file **overrides only the listed expectations**; omitted
+checks retain their built-in defaults. This is a behavior change from the
+previous review-only default. For example, an approved encryption exception:
 
 ```json
 {
   "schemaVersion": 1,
   "rules": [
-    { "checkId": "SMBRequireSecuritySignature", "expectedValue": true },
-    { "checkId": "ShareEncryptionEnabled", "expectedValue": true }
+    { "checkId": "ShareEncryptionEnabled", "expectedValue": false }
   ]
 }
 ```
 
 Pass its path using `-BestPracticesPolicyPath` to collection or the offline report.
 Keys are validated strictly, expected values must be booleans, and check IDs must
-be allowlisted by the shared engine. `MeetsConfiguredPolicy` means one observed
-setting matched one configured rule, not that the server/share is compliant.
-Offline reporting cannot collect evidence missing from the source run.
+be allowlisted by the shared engine. In addition to the six baseline checks,
+`AuditFileShareSuccess` and `AuditFileSystemSuccess` accept custom expectations.
+An empty `rules` array retains the built-in baseline. `MeetsConfiguredPolicy`
+means one observed setting matched one effective rule; `DoesNotMeetConfiguredPolicy`
+means it did not. Neither establishes overall compliance. Checks without a
+baseline or custom expectation remain `Review` when evidence is known.
+Offline reporting uses the current built-in baseline without changing the source
+run; it does not automatically reuse the source run's custom policy. Pass a custom
+policy explicitly when needed. It cannot collect evidence missing from the source run.
 
 ### 5. Collect again, then compare original snapshots
 

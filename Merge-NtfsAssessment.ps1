@@ -639,7 +639,6 @@ try {
     }|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_QA.json') -Encoding UTF8
     $exitCode=if($errorCount -gt 0 -or $script:Warnings.Count -gt 0){1}else{0}
     Save-State $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete
-    Write-Host ("Merge completed. Shares={0}; Folders={1}; UniqueACEs={2}; Findings={3}; Warnings={4}" -f $Owners.Count,$totals.Folders,$totals.UniqueAces,$totals.Findings,$script:Warnings.Count)
 }catch{
     $message="$($_.Exception.Message) $($_.ScriptStackTrace)"
     Save-State Failed Merge $message
@@ -669,4 +668,36 @@ try {
         }else{Save-State Failed Cleanup $message}
     }
 }
+$completion=@{component='Merge';outputPath=$OutputFolder}
+if($exitCode -eq 2){
+    $completion.status='Failed'
+    $completion.requirements='Resolve 1 merge failure before using these reports.'
+    $completion.reasonSummary=@([pscustomobject]@{Count=1;Reason=$message})
+    if($script:OutputReady){$completion.reviewPath=@((Join-Path $OutputFolder 'merge-state.json'),(Join-Path $OutputFolder 'merge-stage.log'))}
+    else{$completion.Remove('outputPath')}
+    $completion.nextStep='Next script: Merge-NtfsAssessment.ps1 after resolving the recorded failure. Preserve diagnostics. Do not consume partial reports as completed findings.'
+}else{
+    $completion.status=if($exitCode -eq 1){'CompletedWithWarnings'}else{'Completed'}
+    $completion.summary="Shares=$($Owners.Count); Folders=$($totals.Folders); Findings=$($totals.Findings); Warnings=$($script:Warnings.Count)."
+    $completion.reviewPath=@((Join-Path $OutputFolder 'NTFS_ExecutiveSummary.json'),(Join-Path $OutputFolder 'NTFS_QA.json'),(Join-Path $OutputFolder 'NTFS_Findings.csv'))
+    $evidenceIssues=@(
+        if($totals.NotAssessedFolders -gt 0){"$($totals.NotAssessedFolders) folders without assessed ACL evidence"}
+        if($totals.UnreportedAclFailures -gt 0){"$($totals.UnreportedAclFailures) unverified ACL failures"}
+        if($errorCount -gt 0){"$($errorCount) source error records"}
+    )
+    $completion.requirements=(@(
+        if($evidenceIssues.Count){"Resolve $($evidenceIssues -join ', ')."}
+        if($script:Warnings.Count -gt 0){"Review $($script:Warnings.Count) warnings."}
+        if($evidenceIssues.Count -gt 1){'Counts describe different evidence records and may overlap.'}
+    ) -join ' ')
+    $completion.reasonSummary=@($script:Warnings|Group-Object|ForEach-Object{
+        [pscustomobject]@{Count=$_.Count;Reason=$_.Name}
+    })
+    $completion.nextStep=if($exitCode -eq 1){
+        'Review QA warnings and coverage before prioritizing findings. Next script for collection gaps: Invoke-NtfsAssessment.ps1, then rerun Merge-NtfsAssessment.ps1 on the new snapshot. The current report remains usable for observed evidence only.'
+    }else{
+        'No next script is required for this report. Review NTFS_Findings.csv. For change tracking, next script: Invoke-NtfsAssessment.ps1 with the same targets/scope, then Compare-NtfsAssessment.ps1 on the two original snapshots, not merged reports.'
+    }
+}
+Write-NtfsCompletion @completion
 exit $exitCode

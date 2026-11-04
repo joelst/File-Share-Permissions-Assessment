@@ -35,6 +35,14 @@ $script:NtfsBpCheckDefinitions = @{
     RootSaclPresent = @{ Reference='https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/audit-file-system'; Recommendation='Review the root SACL with applicable audit policy; this sample does not establish SACL coverage below the share root.'; Severity='Informational' }
 }
 $script:NtfsBpWriteBits = @(2,4,16,64,256,65536,262144,524288,33554432,268435456,1073741824)
+$script:NtfsBpBaselineRules = @{
+    SMB1Enabled = $false
+    SMBRequireSecuritySignature = $true
+    ShareEncryptionEnabled = $true
+    ShareABEEnabled = $true
+    DirectUserAllow = $false
+    BroadPrincipalWrite = $false
+}
 
 function Read-NtfsBestPracticesPolicy([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
@@ -93,11 +101,14 @@ function Set-NtfsBpEvidenceContext([string]$SourceDataset,[string]$SourceRowKey,
 
 function Write-NtfsBestPracticesCheck($Writer,[hashtable]$Counts,[string]$Server,[string]$Share,[string]$Path,[string]$CheckId,[string]$Status,[string]$Observed,[string]$Evidence,[string]$Limitations,[string]$PolicyExpected='') {
     $definition = $script:NtfsBpCheckDefinitions[$CheckId]
+    $policySource = if ($script:NtfsBpPolicySources.ContainsKey($CheckId)) {
+        $script:NtfsBpPolicySources[$CheckId]
+    } else { 'Review only (no baseline or custom rule)' }
     $row = @(
         $script:NtfsBpContext.RunId,$script:NtfsBpContext.CollectorHost,$script:NtfsBpContext.CollectionMode,
         $Server,$script:NtfsBpContext.Vserver,$Share,$Path,$script:NtfsBpContext.EvidenceSource,
         $script:NtfsBpContext.EvidenceSourceKey,$script:NtfsBpContext.AssessmentCompletedUtc,$script:NtfsBpContext.ReportGeneratedUtc,
-        $CheckId,$Status,$definition.Severity,$Observed,$PolicyExpected,$script:NtfsBpPolicySource,$Evidence,
+        $CheckId,$Status,$definition.Severity,$Observed,$PolicyExpected,$policySource,$Evidence,
         $definition.Recommendation,$definition.Reference,'2026-10-30',$Limitations
     )
     $Writer.WriteLine((ConvertTo-NtfsCsvRecord $row))
@@ -105,6 +116,14 @@ function Write-NtfsBestPracticesCheck($Writer,[hashtable]$Counts,[string]$Server
     $Counts[$Status]++
     if (-not $Counts.ContainsKey("Severity:$($definition.Severity)")) { $Counts["Severity:$($definition.Severity)"]=0 }
     $Counts["Severity:$($definition.Severity)"]++
+    if ($Status -in @('NotAssessed','Review','DoesNotMeetConfiguredPolicy')) {
+        $detail=if($Status -eq 'NotAssessed'){$Evidence}else{$definition.Recommendation}
+        $reason="$($CheckId) [$($Status)]: $($detail)"
+        if (-not $script:NtfsBpDiagnostics.ContainsKey($reason)) {
+            $script:NtfsBpDiagnostics[$reason]=[pscustomobject]@{Status=$Status;CheckId=$CheckId;Count=0;Reason=$reason}
+        }
+        $script:NtfsBpDiagnostics[$reason].Count++
+    }
 }
 
 function Get-NtfsBpStatus([string]$CheckId,$Observed,$Applicable,$Policy,[string]$NoEvidenceReason='Evidence was unavailable or ambiguous.') {
@@ -154,6 +173,17 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
     $policy = if ($PolicyAlreadyParsed) {$PolicyPath} elseif ($PolicyPath) {Read-NtfsBestPracticesPolicy ([string]$PolicyPath)} else {$null}
     $policyFilePath = if ($null -ne $policy -and $policy -isnot [string]) {[string]$policy.Path} else {''}
     if ($policy -is [string]) { throw 'Internal policy argument must be a parsed policy object.' }
+    $effectivePolicy = [pscustomobject]@{Rules=$script:NtfsBpBaselineRules.Clone()}
+    $script:NtfsBpPolicySources = @{}
+    foreach ($id in $effectivePolicy.Rules.Keys) {
+        $script:NtfsBpPolicySources[$id] = "Built-in baseline v$($script:NtfsVersions.BestPractices)"
+    }
+    if ($null -ne $policy) {
+        foreach ($id in $policy.Rules.Keys) {
+            $effectivePolicy.Rules[$id] = $policy.Rules[$id]
+            $script:NtfsBpPolicySources[$id] = "BestPracticesPolicy.json (SHA256 $($policy.SHA256))"
+        }
+    }
     $shares = @(Get-NtfsCsvFiles $RunFolder 'Shares.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName })
     $identities = @(Get-NtfsCsvFiles $RunFolder 'Identities.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName })
     $auditRows = @(Get-NtfsCsvFiles $RunFolder 'AuditEvidence.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName })
@@ -173,11 +203,11 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
         try{$sourceMeta=Get-Content -LiteralPath $sourceManifest -Raw|ConvertFrom-Json;$script:NtfsBpAssessmentCompletedUtc=[string]$sourceMeta.CompletedUtc}catch{$script:NtfsBpAssessmentCompletedUtc='NotAvailable'}
     }
     $script:NtfsBpReportGeneratedUtc=[datetime]::UtcNow.ToString('o')
-    $script:NtfsBpPolicySource=if($null -ne $policy){"BestPracticesPolicy.json (SHA256 $($policy.SHA256))"}else{'No policy supplied'}
     Set-NtfsBpEvidenceContext '' '' $null
     $maxBytes = 100000000
     $writer = New-NtfsCsvWriter (Join-Path $OutputFolder 'BestPracticeChecks.csv') $maxBytes
     $counts = @{}
+    $script:NtfsBpDiagnostics=@{}
     $columns = @('RunId','CollectorHost','CollectionMode','Server','Vserver','Share','Path','EvidenceSource','EvidenceSourceKey','AssessmentCompletedUtc','ReportGeneratedUtc','CheckId','Status','Severity','ObservedValue','PolicyExpectedValue','PolicySource','Evidence','Recommendation','Reference','ReferenceRetrievedUtc','CollectionLimitations')
     $writer.WriteLine((ConvertTo-NtfsCsvRecord $columns))
     try {
@@ -204,11 +234,11 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
                     if ([string]$observed -in @('True','False')) {$observed=([string]$observed -eq 'True')}
                     elseif ([string]$observed -eq 'NotCollected') {$observed=$null}
                 }
-                $status=Get-NtfsBpStatus $check.Id $observed $check.Applicable $policy
+                $status=Get-NtfsBpStatus $check.Id $observed $check.Applicable $effectivePolicy
                 $knownValue=Get-NtfsBpObservedBoolean $observed
                 $observedText=if($null -eq $knownValue){''}else{[string]$knownValue}
                 $expect=''
-                if ($null -ne $policy -and $policy.Rules.ContainsKey($check.Id)) {$expect=[string]$policy.Rules[$check.Id]}
+                if ($effectivePolicy.Rules.ContainsKey($check.Id)) {$expect=[string]$effectivePolicy.Rules[$check.Id]}
                 if ($null -eq $knownValue) {
                     if ($check.Id -in @('SMB1Enabled','SMBRequireSecuritySignature') -and $share.PSObject.Properties.Name -contains 'SMBServerConfigurationDetail') {
                         $statusColumn=if($check.Id -eq 'SMB1Enabled'){'SMB1ConfigurationStatus'}else{'SMBSigningConfigurationStatus'}
@@ -234,8 +264,8 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
                     $observed=Get-NtfsObservedBoolean $audit.($check.Column)
                 }
                 $auditApplicable=if($share.CollectionMode -eq 'LocalWindows'){$true}elseif($share.CollectionMode -eq 'RemoteWindowsCIM'){$true}else{$null}
-                $status=Get-NtfsBpStatus $check.Id $observed $auditApplicable $policy
-                $expect='';if($null -ne $policy -and $policy.Rules.ContainsKey($check.Id)){$expect=[string]$policy.Rules[$check.Id]}
+                $status=Get-NtfsBpStatus $check.Id $observed $auditApplicable $effectivePolicy
+                $expect='';if($effectivePolicy.Rules.ContainsKey($check.Id)){$expect=[string]$effectivePolicy.Rules[$check.Id]}
                 $evidence=if($null -eq $observed){
                     if($share.CollectionMode -eq 'RemoteWindowsCIM'){'Remote audit policy was not queried; local auditpol does not apply.'}
                     elseif($null -ne (Get-NtfsBpProperty $audit 'AuditPolicyDetail')){"Audit policy unavailable: $(Get-NtfsBpProperty $audit 'AuditPolicyDetail')"}
@@ -248,7 +278,7 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
             $auditCount=Get-NtfsBpProperty $audit 'RootSaclAuditRuleCount'
             if ($null -ne $audit -and [string](Get-NtfsBpProperty $audit 'RootSaclStatus') -eq 'Collected' -and $null -ne $auditCount -and [string]$auditCount -match '^\d+$') { $saclObserved=([int]$auditCount -gt 0) }
             $saclApplicable=if($share.CollectionMode -eq 'LocalWindows'){$true}elseif($share.CollectionMode -eq 'RemoteWindowsCIM'){$true}else{$null}
-            $saclStatus=Get-NtfsBpStatus 'RootSaclPresent' $saclObserved $saclApplicable $policy
+            $saclStatus=Get-NtfsBpStatus 'RootSaclPresent' $saclObserved $saclApplicable $effectivePolicy
             $saclEvidence=if($null -eq $saclObserved){
                 if($null -ne (Get-NtfsBpProperty $audit 'RootSaclDetail')){"Root SACL unavailable: $(Get-NtfsBpProperty $audit 'RootSaclDetail')"}else{'Root SACL was not collected or read.'}
             }else{"Share-root SACL rule count=$auditCount; this is not descendant coverage and does not exclude global/backend audit controls."}
@@ -277,14 +307,14 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
                 $identity -match '(?i)(^|\\)(everyone|authenticated users|domain users|domain guests|users|guests)$'
             if ($broad -and $write) {
                 Set-NtfsBpEvidenceContext 'NtfsAcls.csv' $aceKey $shareMeta
-                $expect='';if($null -ne $policy -and $policy.Rules.ContainsKey('BroadPrincipalWrite')){$expect=[string]$policy.Rules['BroadPrincipalWrite']}
-                $observed=$true;$status=Get-NtfsBpStatus 'BroadPrincipalWrite' $observed $true $policy
+                $expect='';if($effectivePolicy.Rules.ContainsKey('BroadPrincipalWrite')){$expect=[string]$effectivePolicy.Rules['BroadPrincipalWrite']}
+                $observed=$true;$status=Get-NtfsBpStatus 'BroadPrincipalWrite' $observed $true $effectivePolicy
                 Write-NtfsBestPracticesCheck $writer $counts $server $name ([string]$ace.Path) 'BroadPrincipalWrite' $status 'True' "Allow ACE for broad principal $identity ($sid), rights=$rights." 'Directory-only ACL inventory; no effective-access calculation, deny evaluation, group expansion, or file ACL coverage.' $expect
             }
             if ($identityClasses.ContainsKey($identity)) {
                 Set-NtfsBpEvidenceContext 'NtfsAcls.csv' $aceKey $shareMeta
-                $expect='';if($null -ne $policy -and $policy.Rules.ContainsKey('DirectUserAllow')){$expect=[string]$policy.Rules['DirectUserAllow']}
-                $status=Get-NtfsBpStatus 'DirectUserAllow' $true $true $policy
+                $expect='';if($effectivePolicy.Rules.ContainsKey('DirectUserAllow')){$expect=[string]$effectivePolicy.Rules['DirectUserAllow']}
+                $status=Get-NtfsBpStatus 'DirectUserAllow' $true $true $effectivePolicy
                 Write-NtfsBestPracticesCheck $writer $counts $server $name ([string]$ace.Path) 'DirectUserAllow' $status 'True' "Confirmed user identity $identity has an Allow ACE; rights=$rights." 'Identity classification reflects collected lookup evidence only; not effective access or proof that a direct grant is inappropriate.' $expect
             }
         }
@@ -300,14 +330,14 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
                 $identity -match '(?i)(^|\\)(everyone|authenticated users|domain users|domain guests|users|guests)$'
             if($broad -and $write){
                 Set-NtfsBpEvidenceContext 'SharePermissions.csv' $shareAceKey $shareMeta ([string]$ace.Vserver)
-                $expect='';if($null -ne $policy -and $policy.Rules.ContainsKey('BroadPrincipalWrite')){$expect=[string]$policy.Rules['BroadPrincipalWrite']}
-                $status=Get-NtfsBpStatus 'BroadPrincipalWrite' $true $true $policy
+                $expect='';if($effectivePolicy.Rules.ContainsKey('BroadPrincipalWrite')){$expect=[string]$effectivePolicy.Rules['BroadPrincipalWrite']}
+                $status=Get-NtfsBpStatus 'BroadPrincipalWrite' $true $true $effectivePolicy
                 Write-NtfsBestPracticesCheck $writer $counts $server $name '' 'BroadPrincipalWrite' $status 'True' "Share Allow for broad principal $identity ($sid), rights=$rights." 'Share ACL evidence only; no effective-access calculation, deny evaluation, group expansion, or NTFS ACL evaluation.' $expect
             }
             if($identityClasses.ContainsKey($identity)){
                 Set-NtfsBpEvidenceContext 'SharePermissions.csv' $shareAceKey $shareMeta ([string]$ace.Vserver)
-                $expect='';if($null -ne $policy -and $policy.Rules.ContainsKey('DirectUserAllow')){$expect=[string]$policy.Rules['DirectUserAllow']}
-                $status=Get-NtfsBpStatus 'DirectUserAllow' $true $true $policy
+                $expect='';if($effectivePolicy.Rules.ContainsKey('DirectUserAllow')){$expect=[string]$effectivePolicy.Rules['DirectUserAllow']}
+                $status=Get-NtfsBpStatus 'DirectUserAllow' $true $true $effectivePolicy
                 Write-NtfsBestPracticesCheck $writer $counts $server $name '' 'DirectUserAllow' $status 'True' "Confirmed user $identity has a share Allow entry; rights=$rights." 'Identity classification reflects collected lookup evidence only; not effective access or proof that a direct grant is inappropriate.' $expect
             }
         }
@@ -335,8 +365,14 @@ function Write-NtfsBestPracticesReport([string]$RunFolder,[string]$OutputFolder,
         Version=$script:NtfsVersions.BestPractices
         SchemaVersion=1;GeneratedUtc=[datetime]::UtcNow.ToString('o');ReadOnly=$true
         RunFolder=(Split-Path -Leaf $RunFolder);CheckCount=$checkCount
-        StatusInterpretation='MeetsConfiguredPolicy means only that the directly observed value matched that individual JSON rule. It is not system or share compliance; zero findings do not establish compliance.'
+        StatusInterpretation='MeetsConfiguredPolicy means only that the directly observed value matched one built-in baseline or custom policy rule. Custom rules override individual baseline expectations. It is not system or share compliance; zero findings do not establish compliance.'
         StatusCounts=@{Review=$(if($counts.ContainsKey('Review')){$counts.Review}else{0});MeetsConfiguredPolicy=$(if($counts.ContainsKey('MeetsConfiguredPolicy')){$counts.MeetsConfiguredPolicy}else{0});DoesNotMeetConfiguredPolicy=$(if($counts.ContainsKey('DoesNotMeetConfiguredPolicy')){$counts.DoesNotMeetConfiguredPolicy}else{0});NotAssessed=$(if($counts.ContainsKey('NotAssessed')){$counts.NotAssessed}else{0});NotApplicable=$(if($counts.ContainsKey('NotApplicable')){$counts.NotApplicable}else{0})}
+        Diagnostics=@($script:NtfsBpDiagnostics.Values|Sort-Object Status,CheckId,Reason)
+        Baseline=[ordered]@{
+            Name='NTFS assessment baseline';Version=$script:NtfsVersions.BestPractices
+            Rules=$effectivePolicy.Rules
+            CustomOverrides=@(if($null -ne $policy){$policy.Rules.Keys|Sort-Object})
+        }
         Policy=$(if($null -ne $policy){[ordered]@{SchemaVersion=$policy.SchemaVersion;SHA256=$policy.SHA256;FileName='BestPracticesPolicy.json';SourceFileName=[IO.Path]::GetFileName($policy.Path);SourceLastWriteTimeUtc=(Get-Item -LiteralPath $policy.Path).LastWriteTimeUtc.ToString('o')} }else{$null})
         SourceCoverage=$(if (@(Get-NtfsCsvFiles $RunFolder 'ShareCoverage.csv').Count -gt 0) {
             $coverage=@(Get-NtfsCsvFiles $RunFolder 'ShareCoverage.csv' | ForEach-Object { Read-NtfsCsvFile $_.FullName })
@@ -384,6 +420,7 @@ function Invoke-NtfsBestPracticesOfflineReport([string]$InputRunFolder,[string]$
             SchemaVersion=1;GeneratedUtc=[datetime]::UtcNow.ToString('o');SourceRunId=$manifest.RunId
             SourceManifestSHA256=(Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
             PolicySHA256=$(if($null -ne $policy){$policy.SHA256}else{''})
+            Baseline=$result.Baseline
             Datasets=$outputInventory;SummaryFile='BestPracticeSummary.json'
             SummarySHA256=(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticeSummary.json') -Algorithm SHA256).Hash
             PolicyCopySHA256=$(if($policy){(Get-FileHash -LiteralPath (Join-Path $destination 'BestPracticesPolicy.json') -Algorithm SHA256).Hash}else{''})

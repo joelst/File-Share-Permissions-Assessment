@@ -741,13 +741,18 @@ Describe 'Public qualification gate' {
         $saved=Save-TestPlan (New-TestPlan)
         foreach($mode in @('Apply','Revert')){
             foreach($preview in @($false,$true)){
-                $result=& (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') -Mode $mode -PlanPath $saved.Path -PlanSHA256 $saved.Hash -ChangeTicket CHG123 -OutputDirectory $script:work -WhatIf:$preview
+                $result=& (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') -Mode $mode -PlanPath $saved.Path -PlanSHA256 $saved.Hash -ChangeTicket CHG123 -OutputDirectory $script:work -WhatIf:$preview -InformationVariable completionMessages
                 $result.Status | Should -Be Blocked
                 $result.TargetWrites | Should -Be 0
                 $result.Qualification | Should -Be NotQualified
                 $LASTEXITCODE | Should -Be 2
                 $read=Read-NpJournal (Join-Path $result.RunDirectory 'events.jsonl')
                 $read.Events.Result | Should -Contain 'Blocked/NotQualified'
+                $console=$completionMessages.MessageData -join "`n"
+                $console | Should -Match 'Permission planning: Blocked\.'
+                $console | Should -Match ([regex]::Escape((Join-Path $result.RunDirectory 'events.jsonl')))
+                $console | Should -Match 'Live Apply/Revert are disabled'
+                $console | Should -Not -Match '(?s)Next:.*-Mode (Apply|Revert)'
             }
         }
     }

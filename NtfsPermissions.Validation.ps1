@@ -459,16 +459,20 @@ function Compare-NvCapture($Before, $Current, $Binding, [string]$Mode) {
 
 function New-NvReport([string]$CasePath, $State, $Observations=$null) {
     $missing = @(@('CaptureBefore','CaptureAfterApply','CaptureAfterRevert') | Where-Object { -not $State.Stages.ContainsKey($_) })
+    $evidenceErrors=@()
+    $intentErrors=@()
     $comparisons = [ordered]@{}
     $status = if ($missing.Count) { 'Incomplete' } else { 'Observed' }
     foreach ($stage in @('CaptureBefore','CaptureAfterApply','CaptureAfterRevert')) {
         if ($State.Stages.ContainsKey($stage)) {
             $capture = Read-NvJson (Join-Path (Join-Path $CasePath $stage) 'inventory.json')
             if ($capture.Status -cne 'Observed') { $status='Incomplete' }
+            $evidenceErrors+=@($capture.Errors|ForEach-Object{"$($stage): $($_)"})
         }
     }
     if ($State.Stages.ContainsKey('CaptureBefore')) {
         $intentReview=Read-NvJson (Join-Path $CasePath 'CaptureBefore/intent-review.json')
+        $intentErrors=@($intentReview.Entries|Where-Object Status -ceq 'Failed'|ForEach-Object Error)
         if ($status -cne 'Incomplete' -and @($intentReview.Entries | Where-Object Status -ceq 'Failed').Count) { $status='Failed' }
         $before = Read-NvJson (Join-Path $CasePath 'CaptureBefore/inventory.json')
         foreach ($pair in @(@('CaptureAfterApply','Apply'),@('CaptureAfterRevert','Revert'))) {
@@ -492,6 +496,8 @@ function New-NvReport([string]$CasePath, $State, $Observations=$null) {
     }
     return [ordered]@{
         Schema='NtfsPermissionValidationReport/1'; Status=$status; MissingStages=$missing
+        EvidenceErrors=$evidenceErrors
+        IntentErrors=$intentErrors
         WriterQualification='NotQualified'; NativeWriter='Absent'; TargetWrites=0
         CaseBindingSHA256=$State.BindingHash; TargetDescriptor=$State.Binding.TargetDescriptor
         IndependentComparison=$comparisons; ManualMatrixStatus=$manualStatus; FunctionalAccess=$functional
@@ -584,6 +590,52 @@ function Invoke-NvStage {
                 Export-NtfsCsvData $rows (Join-Path $directory 'snapshots.csv')
             }
         }
+        $diagnostics=@{MissingEvidence=0;Warnings=0;Reasons=@()}
+        if($Stage -eq 'Report'){
+            $diagnostics.MissingEvidence=$report.MissingStages.Count+$report.EvidenceErrors.Count
+            if($report.MissingStages.Count){
+                $diagnostics.Reasons+=@([pscustomobject]@{Count=$report.MissingStages.Count;Reason="Missing required captures: $($report.MissingStages -join ', '). Report is sealed; do not resume this case."})
+            }
+            $diagnostics.Reasons+=@($report.EvidenceErrors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+            $diagnostics.Warnings+=$report.IntentErrors.Count
+            $diagnostics.Reasons+=@($report.IntentErrors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason="Intent review: $($_.Name)"}})
+            foreach($item in $report.IndependentComparison.GetEnumerator()){
+                $diagnostics.MissingEvidence+=$item.Value.Missing.Count
+                if($item.Value.Missing.Count){
+                    $diagnostics.Reasons+=@([pscustomobject]@{Count=$item.Value.Missing.Count;Reason="$($item.Key): baseline paths missing from the current capture; review report.json and comparison.json."})
+                }
+                if($item.Value.Status -ne 'Observed'){
+                    $diagnostics.Warnings++
+                    if($item.Value.Status -in @('NotAssessed','Incomplete')){$diagnostics.MissingEvidence++}
+                    $diagnostics.Reasons+=@([pscustomobject]@{Count=1;Reason="$($item.Key) comparison: $($item.Value.Status); namespace=$($item.Value.Namespace); descriptors=$($item.Value.DescriptorResult)."})
+                }
+            }
+            if($report.ManualMatrixStatus -eq 'NotRun'){
+                $diagnostics.Warnings++
+                $diagnostics.Reasons+=@([pscustomobject]@{Count=1;Reason='Manual observation matrix was not submitted; functional access remains unassessed.'})
+            }elseif($report.ManualMatrixStatus -eq 'Failed'){
+                $failedObservations=@($observations.Cases|Where-Object Status -ceq 'Failed')
+                $diagnostics.Warnings+=$failedObservations.Count
+                $diagnostics.Reasons+=@($failedObservations|ForEach-Object{[pscustomobject]@{Count=1;Reason="Manual observation failed: $($_.Test). Review manual-observations.json for the operator-recorded result."}})
+            }
+        }elseif($Stage -ne 'Initialize'){
+            $diagnostics.MissingEvidence=$capture.Errors.Count
+            $diagnostics.Reasons+=@($capture.Errors|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+            if($Stage -eq 'CaptureBefore'){
+                $failedIntents=@($intents|Where-Object Status -eq 'Failed')
+                $diagnostics.Warnings=$failedIntents.Count
+                $diagnostics.Reasons+=@($failedIntents|Group-Object Error|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason="Intent review: $($_.Name)"}})
+            }else{
+                $diagnostics.MissingEvidence+=$comparison.Missing.Count
+                if($comparison.Missing.Count){$diagnostics.Reasons+=@([pscustomobject]@{Count=$comparison.Missing.Count;Reason='Paths present in the baseline are missing from the current capture; namespace drift requires independent review.'})}
+                if($comparison.Status -ne 'Observed'){
+                    $diagnostics.Warnings++
+                    if($comparison.Status -in @('NotAssessed','Incomplete')){$diagnostics.MissingEvidence++}
+                    $failedRows=@($comparison.Rows|Where-Object Status -eq 'Failed').Count
+                    $diagnostics.Reasons+=@([pscustomobject]@{Count=1;Reason="$($comparison.Mode) comparison: $($comparison.Status); namespace=$($comparison.Namespace); descriptors=$($comparison.DescriptorResult); failed path checks=$($failedRows); added paths=$($comparison.Added.Count). Review comparison.json for metadata, identity, grant, and unrelated-ACL results."})
+                }
+            }
+        }
         Write-NtfsLog $logPath PermissionValidation $status $Stage 'Read-only evidence stage completed'
         $manifest = [ordered]@{
             Schema='NtfsPermissionValidationStage/1'; Stage=$Stage; BindingSHA256=$state.BindingHash
@@ -610,11 +662,14 @@ function Invoke-NvStage {
             CaptureAfterRevert { "Report -CasePath `"$CasePath`"" }
             Report { 'Archive case and commit hashes externally; review JSON manual matrix. Writer qualification remains unavailable.' }
         }
-        if ($status -ceq 'Incomplete') { $next='INCOMPLETE: stop external actions, preserve evidence and review. Report may close this case; no safe apply/revert is implied.' }
+        if ($Stage -ceq 'Report' -and $status -cne 'Observed') { $next='Sealed report: stop external actions and preserve this case for independent review. Do not resume or overwrite it; no safe apply/revert is implied.' }
+        elseif ($status -ceq 'Incomplete') { $next='INCOMPLETE: stop external actions, preserve evidence and review. Report may close this case; no safe apply/revert is implied.' }
         elseif ($status -ceq 'Failed') { $next='FAILED evidence checks: stop external actions; preserve this case for independent drift/recovery review. Report may close it; no automatic recovery is available.' }
+        elseif ($status -ceq 'NotAssessed') { $next='NOT ASSESSED: stop external actions and review unresolved comparisons. Report may close this case; no safe apply/revert is implied.' }
         return [pscustomobject]@{
             Version=$script:NtfsVersions.PermissionValidation; CasePath=$CasePath; Stage=$Stage; Status=$status
             CommitSHA256=(Get-NvFileHash $commitPath); TargetWrites=0; WriterQualification='NotQualified'; NextStep=$next
+            Diagnostics=$diagnostics
         }
     } finally {
         $lock.Dispose()

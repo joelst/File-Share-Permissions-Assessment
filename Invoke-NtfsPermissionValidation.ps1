@@ -99,39 +99,86 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Validation.ps1')
 
-Assert-NvWindows
-if ($Stage -eq 'Initialize') {
-    if ($CasePath -or $ManualActionAcknowledgement -or $ManualObservationsFile) { throw 'Initialize requires a NEW case, not CasePath, observations or a manual-action acknowledgement.' }
-    if (-not $DisposableAcknowledgement -and -not $NonInteractive) {
-        $DisposableAcknowledgement = (Read-Host 'Type DISPOSABLE to acknowledge independent approval and a disposable target') -ceq 'DISPOSABLE'
-    }
-    if (-not $DisposableAcknowledgement) { throw 'DisposableAcknowledgement is required; this is not approval to mutate.' }
-    if ([string]::IsNullOrWhiteSpace($ChangeTicket) -or $ChangeTicket -match '[\x00-\x1f]' -or -not $EvidenceDirectory) {
-        throw 'EvidenceDirectory and a nonempty ChangeTicket without control characters are required.'
-    }
-    $descriptor = Resolve-NpTarget $TargetPath $TargetPlatform
-    $grants = @(Get-NpGrants $GroupName $Permissions $GroupPermissionsJson $GroupPermissionsFile ${function:Resolve-NpWindowsGroup})
-    $binding = New-NvBinding $descriptor $grants $Scope $MaxPaths $ChangeTicket
-    if ($OperatorMetadataJson) { $binding.Metadata.OperatorDeclarations=ConvertTo-NvOperatorMetadata $OperatorMetadataJson }
-    # WhatIf is target-only by contract; evidence ACL creation must not be suppressed.
-    $CasePath = & { $WhatIfPreference=$false; $ConfirmPreference='None'; New-NpRun $EvidenceDirectory $descriptor.CanonicalPath }
-    $result = Invoke-NvStage $CasePath Initialize $binding -WhatIfRecorded ([bool]$WhatIfPreference)
-} else {
-    foreach ($name in @('EvidenceDirectory','TargetPath','TargetPlatform','GroupName','Permissions','GroupPermissionsJson',
-        'GroupPermissionsFile','Scope','MaxPaths','ChangeTicket','DisposableAcknowledgement','OperatorMetadataJson')) {
-        if ($PSBoundParameters.ContainsKey($name)) { throw "Resume accepts CasePath, Stage and checkpoint options only; cannot override $name." }
-    }
-    if (-not $CasePath) { throw 'CasePath is required to resume.' }
-    if ($ManualObservationsFile -and $Stage -cne 'Report') { throw 'ManualObservationsFile is accepted only by Report.' }
-    if ($Stage -in @('CaptureAfterApply','CaptureAfterRevert')) {
-        if (-not $ManualActionAcknowledgement -and -not $NonInteractive) {
-            $ManualActionAcknowledgement = (Read-Host 'Type EXTERNAL to acknowledge separately approved external action/recovery review; this tool made NO target changes') -ceq 'EXTERNAL'
+try {
+    Assert-NvWindows
+    if ($Stage -eq 'Initialize') {
+        if ($CasePath -or $ManualActionAcknowledgement -or $ManualObservationsFile) { throw 'Initialize requires a NEW case, not CasePath, observations or a manual-action acknowledgement.' }
+        if (-not $DisposableAcknowledgement -and -not $NonInteractive) {
+            $DisposableAcknowledgement = (Read-Host 'Type DISPOSABLE to acknowledge independent approval and a disposable target') -ceq 'DISPOSABLE'
         }
-        if (-not $ManualActionAcknowledgement) { throw 'ManualActionAcknowledgement is required for this external-action checkpoint.' }
-    } elseif ($ManualActionAcknowledgement) { throw 'ManualActionAcknowledgement is valid only for after-action captures.' }
-    $result = Invoke-NvStage $CasePath $Stage -ManualAcknowledged ([bool]$ManualActionAcknowledgement) -WhatIfRecorded ([bool]$WhatIfPreference) -ManualObservationsFile $ManualObservationsFile
+        if (-not $DisposableAcknowledgement) { throw 'DisposableAcknowledgement is required; this is not approval to mutate.' }
+        if ([string]::IsNullOrWhiteSpace($ChangeTicket) -or $ChangeTicket -match '[\x00-\x1f]' -or -not $EvidenceDirectory) {
+            throw 'EvidenceDirectory and a nonempty ChangeTicket without control characters are required.'
+        }
+        $descriptor = Resolve-NpTarget $TargetPath $TargetPlatform
+        $grants = @(Get-NpGrants $GroupName $Permissions $GroupPermissionsJson $GroupPermissionsFile ${function:Resolve-NpWindowsGroup})
+        $binding = New-NvBinding $descriptor $grants $Scope $MaxPaths $ChangeTicket
+        if ($OperatorMetadataJson) { $binding.Metadata.OperatorDeclarations=ConvertTo-NvOperatorMetadata $OperatorMetadataJson }
+        # WhatIf is target-only by contract; evidence ACL creation must not be suppressed.
+        $CasePath = & { $WhatIfPreference=$false; $ConfirmPreference='None'; New-NpRun $EvidenceDirectory $descriptor.CanonicalPath }
+        $result = Invoke-NvStage $CasePath Initialize $binding -WhatIfRecorded ([bool]$WhatIfPreference)
+    } else {
+        foreach ($name in @('EvidenceDirectory','TargetPath','TargetPlatform','GroupName','Permissions','GroupPermissionsJson',
+            'GroupPermissionsFile','Scope','MaxPaths','ChangeTicket','DisposableAcknowledgement','OperatorMetadataJson')) {
+            if ($PSBoundParameters.ContainsKey($name)) { throw "Resume accepts CasePath, Stage and checkpoint options only; cannot override $name." }
+        }
+        if (-not $CasePath) { throw 'CasePath is required to resume.' }
+        if ($ManualObservationsFile -and $Stage -cne 'Report') { throw 'ManualObservationsFile is accepted only by Report.' }
+        if ($Stage -in @('CaptureAfterApply','CaptureAfterRevert')) {
+            if (-not $ManualActionAcknowledgement -and -not $NonInteractive) {
+                $ManualActionAcknowledgement = (Read-Host 'Type EXTERNAL to acknowledge separately approved external action/recovery review; this tool made NO target changes') -ceq 'EXTERNAL'
+            }
+            if (-not $ManualActionAcknowledgement) { throw 'ManualActionAcknowledgement is required for this external-action checkpoint.' }
+        } elseif ($ManualActionAcknowledgement) { throw 'ManualActionAcknowledgement is valid only for after-action captures.' }
+        $result = Invoke-NvStage $CasePath $Stage -ManualAcknowledged ([bool]$ManualActionAcknowledgement) -WhatIfRecorded ([bool]$WhatIfPreference) -ManualObservationsFile $ManualObservationsFile
+    }
+    $actions=@(
+        if($result.Diagnostics.MissingEvidence -gt 0){"Resolve $($result.Diagnostics.MissingEvidence) missing evidence records."}
+        if($result.Diagnostics.Warnings -gt 0){"Review $($result.Diagnostics.Warnings) validation warnings."}
+    )
+    if($actions.Count){$actions+='Records may overlap across checks/stages and verification reads. Writer qualification has 1 non-bypassable restriction.'}
+    $completion=@{
+        component='Permission validation';status=$result.Status;outputPath=$result.CasePath
+        summary="Stage=$($result.Stage); TargetWrites=0; WriterQualification=NotQualified. Archive commit SHA256 $($result.CommitSHA256) externally."
+        reviewPath=@((Join-Path (Join-Path $result.CasePath $Stage) 'manifest.json'))
+        requirements=($actions -join ' ')
+        reasonSummary=$result.Diagnostics.Reasons
+        nextStep=$result.NextStep
+    }
+    if($Stage -eq 'Report'){
+        $completion.reviewPath+=@(Join-Path $result.CasePath 'Report\report.json')
+        $completion.nextStep='No next script is required for this sealed report. '+$result.NextStep
+    }elseif($Stage -ne 'Initialize'){
+        $stageDirectory=Join-Path $result.CasePath $Stage
+        $completion.reviewPath+=@((Join-Path $stageDirectory 'inventory.json'),(Join-Path $stageDirectory 'comparison.json'))
+        if($Stage -eq 'CaptureBefore'){$completion.reviewPath+=@(Join-Path $stageDirectory 'intent-review.json')}
+    }
+    if($result.Status -eq 'Observed'){
+        if($Stage -ne 'Report'){
+            $completion.nextScriptPath=Join-Path $PSScriptRoot 'Invoke-NtfsPermissionValidation.ps1'
+            $completion.nextParameters=[ordered]@{
+                Stage=$(switch($Stage){
+                    Initialize {'CaptureBefore'}
+                    CaptureBefore {'CaptureAfterApply'}
+                    CaptureAfterApply {'CaptureAfterRevert'}
+                    CaptureAfterRevert {'Report'}
+                })
+                CasePath=$result.CasePath
+            }
+        }
+    }else{
+        $completion.nextStep+=' Resolve the counted issues before any external action. Invoke-NtfsPermissionValidation.ps1 -Stage Report can only close an unfinished case; a sealed report requires a separately approved new case, never automatic retry.'
+    }
+    Write-NtfsCompletion @completion
+    $result
+} catch {
+    $completion=@{
+        component='Permission validation';status='Failed'
+        requirements='Resolve 1 failed validation invocation; preserved locks or immutable stages may require independent recovery review.'
+        reasonSummary=@([pscustomobject]@{Count=1;Reason=$_.Exception.Message})
+        nextStep='Stop external actions. Preserve any case, lock, and stage evidence for independent review; do not delete locks or automatically retry.'
+    }
+    if($CasePath){$completion.outputPath=$CasePath}
+    Write-NtfsCompletion @completion
+    throw
 }
-Write-Host "Case: $($result.CasePath)"
-Write-Host "NextStep: $($result.NextStep)"
-Write-Host 'TargetWrites=0; WriterQualification=NotQualified. Archive this commit hash externally.'
-$result

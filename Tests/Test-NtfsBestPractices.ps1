@@ -36,6 +36,7 @@ try {
         '{"schemaVersion":1,"rules":[{"checkId":"Arbitrary","expectedValue":true}]}',
         '{"schemaVersion":1,"rules":[{"checkId":"SMB1Enabled","expectedValue":"false"}]}',
         '{"schemaVersion":1,"rules":[{"checkId":"SMB1Enabled","expectedValue":false,"extra":1}]}',
+        '{"schemaVersion":1,"rules":[{"checkId":"InheritanceProtected","expectedValue":false}]}',
         '{"schemaVersion":2,"rules":[]}',
         '{"schemaVersion":1,"rules":[{"checkId":"SMB1Enabled","expectedValue":false},{"checkId":"SMB1Enabled","expectedValue":true}]}'
     )) {
@@ -108,6 +109,10 @@ try {
     $result=Invoke-NtfsBestPracticesOfflineReport $run $output $policyPath
     $rows=Get-CheckRows (Join-Path $output 'BestPracticeChecks.csv')
     Assert ($result.CheckCount -eq $rows.Count) 'Summary count reconciles with the CSV'
+    foreach($status in @('NotAssessed','Review','DoesNotMeetConfiguredPolicy')){
+        $diagnosticCount=($result.Diagnostics|Where-Object Status -eq $status|Measure-Object -Property Count -Sum).Sum
+        Assert ($diagnosticCount -eq $result.StatusCounts[$status]) "Diagnostic reason groups reconcile with $($status) counts"
+    }
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Server -eq 'local' -and $_.Status -eq 'MeetsConfiguredPolicy'}).Count -eq 1) 'False SMB1 setting compares to explicit policy'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Server -in @('remote','nas') -and $_.Status -eq 'NotAssessed'}).Count -eq 2) 'Remote and NAS unknown SMB settings remain NotAssessed'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'ShareEncryptionEnabled' -and $_.Server -eq 'local' -and $_.Status -eq 'MeetsConfiguredPolicy'}).Count -eq 1) 'Known false share encryption setting compares to policy'
@@ -121,7 +126,8 @@ try {
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.RunId -eq 'test' -and $_.CollectorHost -eq 'collector' -and $_.EvidenceSource -eq 'Shares.csv'}).Count -eq 3) 'Checks link source machine, run, and dataset'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.PolicySource -like 'BestPracticesPolicy.json (SHA256 *' -and $_.PolicyExpectedValue -eq 'False'}).Count -eq 3) 'Policy checks preserve policy hash provenance and configured expectation'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'BroadPrincipalWrite' -and $_.Vserver -eq 'svm01' -and $_.EvidenceSource -eq 'SharePermissions.csv'}).Count -eq 1) 'Share ACL finding preserves NetApp SVM and source linkage'
-    Assert (@($rows|Where-Object {$_.CheckId -eq 'SMBRequireSecuritySignature' -and $_.Server -eq 'local' -and $_.ObservedValue -eq 'True' -and $_.Status -eq 'Review'}).Count -eq 1) 'Captured server signing configuration is reviewed as an actual setting'
+    Assert (@($rows|Where-Object {$_.CheckId -eq 'SMBRequireSecuritySignature' -and $_.Server -eq 'local' -and $_.ObservedValue -eq 'True' -and $_.Status -eq 'MeetsConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'True' -and $_.PolicySource -like 'Built-in baseline v*'}).Count -eq 1) 'Custom policies retain the built-in signing expectation when omitted'
+    Assert (@($rows|Where-Object {$_.CheckId -eq 'DirectUserAllow' -and $_.Status -eq 'DoesNotMeetConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'False' -and $_.PolicySource -like 'Built-in baseline v*'}).Count -eq 1) 'Custom policies retain the baseline against direct user grants'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'RootSaclPresent' -and $_.Server -eq 'local' -and $_.ObservedValue -eq 'False' -and $_.Evidence -like '*global/backend*'}).Count -eq 1) 'Empty root SACL does not imply no global/backend audit'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'AuditFileSystemSuccess' -and $_.Server -eq 'local' -and $_.ObservedValue -eq 'True'}).Count -eq 1) 'Audit policy and SACL evidence remain separate checks'
     Assert (@($rows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Server -eq 'nas' -and $_.Status -eq 'NotAssessed' -and $_.Evidence -like '*inferred*'}).Count -eq 1) 'NAS configuration absence remains explicit unknown evidence'
@@ -143,6 +149,42 @@ try {
     $outside=$false;try{Invoke-NtfsBestPracticesOfflineReport $run (Join-Path $run 'nested-output') ''|Out-Null}catch{$outside=$_.Exception.Message -like '*outside*'}
     Assert $outside 'Offline report refuses output nested within source'
 
+    $script:TestArea='Built-in baseline and custom overrides'
+    $overridePath=Join-Path $testRoot 'overrides.json'
+    '{"schemaVersion":1,"rules":[{"checkId":"SMB1Enabled","expectedValue":true},{"checkId":"DirectUserAllow","expectedValue":true},{"checkId":"BroadPrincipalWrite","expectedValue":true},{"checkId":"AuditFileShareSuccess","expectedValue":false}]}' |
+        Set-Content -LiteralPath $overridePath -Encoding UTF8
+    $overrideOutput=Join-Path $testRoot 'override-report'
+    $overrideResult=Invoke-NtfsBestPracticesOfflineReport $run $overrideOutput $overridePath
+    $overrideRows=Get-CheckRows (Join-Path $overrideOutput 'BestPracticeChecks.csv')
+    Assert (@($overrideRows|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Server -eq 'local' -and $_.Status -eq 'DoesNotMeetConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'True'}).Count -eq 1) 'Explicit true replaces a false built-in expectation'
+    Assert (@($overrideRows|Where-Object {$_.CheckId -in @('DirectUserAllow','BroadPrincipalWrite') -and $_.Status -eq 'MeetsConfiguredPolicy' -and $_.PolicySource -like 'BestPracticesPolicy.json (SHA256 *'}).Count -eq 5) 'Custom exceptions override both directory and share grant expectations'
+    Assert (@($overrideRows|Where-Object {$_.CheckId -eq 'AuditFileShareSuccess' -and $_.Server -eq 'local' -and $_.Status -eq 'MeetsConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'False'}).Count -eq 1) 'Custom policies can add an audit expectation without a built-in default'
+    Assert (@($overrideRows|Where-Object {$_.CheckId -eq 'AuditFileShareSuccess' -and $_.Server -eq 'remote' -and $_.Status -eq 'NotAssessed'}).Count -eq 1) 'An audit override does not invent remote policy evidence'
+    Assert ($overrideResult.Baseline.Rules.SMBRequireSecuritySignature -eq $true -and $overrideResult.Baseline.Rules.SMB1Enabled -eq $true -and $overrideResult.Baseline.CustomOverrides.Count -eq 4) 'Summary records effective rules and which ones were overridden'
+    $overrideManifest=Get-Content -LiteralPath (Join-Path $overrideOutput 'BestPracticesManifest.json') -Raw|ConvertFrom-Json
+    Assert ($overrideManifest.Baseline.Rules.SMB1Enabled -eq $true -and $overrideManifest.Baseline.Version -eq $script:NtfsVersions.BestPractices) 'Offline manifest records baseline version and effective override'
+
+    $baselineOutput=Join-Path $testRoot 'baseline-report'
+    $baselineResult=Invoke-NtfsBestPracticesOfflineReport $run $baselineOutput ''
+    $baselineRows=Get-CheckRows (Join-Path $baselineOutput 'BestPracticeChecks.csv')
+    Assert (@($baselineRows|Where-Object {$_.Server -eq 'local' -and $_.CheckId -in @('SMB1Enabled','SMBRequireSecuritySignature','ShareABEEnabled') -and $_.Status -eq 'MeetsConfiguredPolicy'}).Count -eq 3) 'Default baseline evaluates captured SMB1, signing, and ABE settings'
+    Assert (@($baselineRows|Where-Object {$_.Server -eq 'local' -and $_.CheckId -eq 'ShareEncryptionEnabled' -and $_.Status -eq 'DoesNotMeetConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'True'}).Count -eq 1) 'Disabled encryption does not meet the built-in baseline'
+    Assert (@($baselineRows|Where-Object {$_.CheckId -in @('DirectUserAllow','BroadPrincipalWrite') -and $_.Status -eq 'DoesNotMeetConfiguredPolicy' -and $_.PolicyExpectedValue -eq 'False'}).Count -eq 5) 'Custom grant exceptions do not leak into later baseline reports'
+    Assert (@($baselineRows|Where-Object {$_.Server -in @('remote','nas') -and $_.CheckId -in @('SMB1Enabled','SMBRequireSecuritySignature','ShareEncryptionEnabled','ShareABEEnabled') -and $_.Status -eq 'NotAssessed' -and $_.PolicyExpectedValue -ne ''}).Count -eq 8) 'Built-in expectations never substitute for unavailable evidence'
+    Assert (@($baselineRows|Where-Object {$_.CheckId -in @('InheritanceProtected','NullDacl','UnresolvedPrincipal') -and $_.Status -eq 'Review' -and $_.PolicyExpectedValue -eq ''}).Count -eq 3) 'Context-dependent directory findings remain review-only'
+    Assert (@($baselineRows|Where-Object {$_.Server -eq 'local' -and $_.CheckId -in @('AuditFileShareSuccess','AuditFileSystemSuccess','RootSaclPresent') -and $_.Status -eq 'Review'}).Count -eq 3) 'Audit scope and root SACL presence require context rather than a blanket expectation'
+    $savedBaseline=Get-Content -LiteralPath (Join-Path $baselineOutput 'BestPracticeSummary.json') -Raw|ConvertFrom-Json
+    Assert ($savedBaseline.Baseline.Rules.SMB1Enabled -eq $false -and $savedBaseline.Baseline.CustomOverrides.Count -eq 0 -and $null -eq $savedBaseline.Policy) 'Default report persists its effective baseline separately from optional custom policy metadata'
+    Assert ($baselineResult.CheckCount -eq $baselineRows.Count -and $baselineResult.StatusCounts.MeetsConfiguredPolicy -eq 3 -and $baselineResult.StatusCounts.DoesNotMeetConfiguredPolicy -eq 6) 'Default summary reconciles baseline pass and mismatch counts'
+    $baselineManifest=Get-Content -LiteralPath (Join-Path $baselineOutput 'BestPracticesManifest.json') -Raw|ConvertFrom-Json
+    Assert ($baselineManifest.Baseline.Version -eq $script:NtfsVersions.BestPractices -and $baselineManifest.PolicyCopySHA256 -eq '' -and $baselineManifest.SummarySHA256 -eq (Get-FileHash -LiteralPath (Join-Path $baselineOutput 'BestPracticeSummary.json') -Algorithm SHA256).Hash) 'Offline manifest anchors the default baseline through its summary hash'
+    Assert ((Get-FileHash -LiteralPath (Join-Path $run 'manifest.json') -Algorithm SHA256).Hash -eq $sourceHash) 'Baseline and override reports preserve the source assessment'
+    $emptyPolicyPath=Join-Path $testRoot 'empty-policy.json'
+    '{"schemaVersion":1,"rules":[]}' | Set-Content -LiteralPath $emptyPolicyPath -Encoding UTF8
+    $emptyOutput=Join-Path $testRoot 'empty-policy-report'
+    $emptyResult=Invoke-NtfsBestPracticesOfflineReport $run $emptyOutput $emptyPolicyPath
+    Assert ($emptyResult.StatusCounts.DoesNotMeetConfiguredPolicy -eq $baselineResult.StatusCounts.DoesNotMeetConfiguredPolicy -and $emptyResult.Baseline.CustomOverrides.Count -eq 0) 'An empty override list retains the built-in baseline'
+
     $script:TestArea='Collector opt-in and default-off behavior'
     $engine=(Get-Process -Id $PID).Path
     $collectorHarness=Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1'
@@ -150,6 +192,7 @@ try {
     $log=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $collectorOutput -BestPractices -PolicyPath $policyPath -Audit 2>&1)
     $exitCode=$LASTEXITCODE
     Assert ($exitCode -eq 0) "Mocked collector opt-in succeeds: $($log -join "`n")"
+    Assert (($log -join "`n").Contains('Assessment: CompletedWithWarnings.') -and ($log -join "`n").Contains('BestPracticeChecks.csv') -and -not ($log -join "`n").Contains('StatusInterpretation')) 'Collector gives concise report guidance instead of dumping the summary object'
     $collectorRun=Get-ChildItem -LiteralPath $collectorOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
     $collectorManifest=Get-Content -LiteralPath (Join-Path $collectorRun.FullName 'manifest.json') -Raw|ConvertFrom-Json
     Assert ($collectorManifest.BestPractices.Enabled -eq $true) 'Collector manifest records best-practices opt-in'
@@ -163,6 +206,29 @@ try {
     Assert ((Get-FileHash -LiteralPath (Join-Path $collectorRun.FullName 'BestPracticesPolicy.json') -Algorithm SHA256).Hash -eq $policy.SHA256) 'Collector copies policy with matching hash'
     Assert ($collectorManifest.BestPractices.EvidenceStatus -eq 'PartialEvidence' -and $collectorManifest.BestPractices.EvidenceErrorCount -gt 0) 'Evidence failures are surfaced separately from ACL scan coverage'
     Assert (@(Read-NtfsCsvFile (Join-Path $collectorRun.FullName 'BestPracticeChecks.csv')).Count -gt 0) 'Collector produces populated checks'
+    Assert ($collectorManifest.BestPractices.Baseline.Rules.ShareEncryptionEnabled -eq $false -and $collectorManifest.BestPractices.Baseline.Rules.SMBRequireSecuritySignature -eq $true) 'Collector manifest records custom expectations merged with the built-in baseline'
+    $baselineCollectorOutput=Join-Path $testRoot 'collector-baseline'
+    $baselineLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $baselineCollectorOutput -BestPractices 2>&1)
+    $baselineExit=$LASTEXITCODE
+    Assert ($baselineExit -eq 0) "Collector uses baseline without a custom policy: $($baselineLog -join "`n")"
+    $baselineRun=Get-ChildItem -LiteralPath $baselineCollectorOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
+    $inlineChecks=Get-CheckRows (Join-Path $baselineRun.FullName 'BestPracticeChecks.csv')
+    Assert (@($inlineChecks|Where-Object {$_.CheckId -eq 'ShareEncryptionEnabled' -and $_.Status -eq 'DoesNotMeetConfiguredPolicy' -and $_.PolicySource -like 'Built-in baseline v*'}).Count -eq 1) 'Inline collection evaluates the built-in encryption baseline'
+    $inlineManifest=Get-Content -LiteralPath (Join-Path $baselineRun.FullName 'manifest.json') -Raw|ConvertFrom-Json
+    Assert ($inlineManifest.BestPractices.Baseline.Version -eq $script:NtfsVersions.BestPractices -and $inlineManifest.BestPractices.Baseline.Rules.ShareEncryptionEnabled -eq $true -and $null -eq $inlineManifest.BestPractices.PolicyFile) 'Collector persists baseline provenance without inventing a custom policy file'
+    $cliOutput=Join-Path $testRoot 'cli-offline-report'
+    $cliLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $run -OutputFolder $cliOutput 2>&1)
+    $cliExit=$LASTEXITCODE
+    Assert ($cliExit -eq 0 -and ($cliLog -join "`n").Contains('Best practices: CompletedWithWarnings.') -and ($cliLog -join "`n").Contains((Join-Path $cliOutput 'BestPracticeChecks.csv')) -and ($cliLog -join "`n").Contains('Offline reporting cannot fill evidence gaps')) 'Offline report CLI points to actual findings and unavailable-evidence guidance'
+    Assert (($cliLog -join "`n").Contains("Resolve or document $($baselineResult.StatusCounts.NotAssessed) missing evidence checks") -and ($cliLog -join "`n").Contains('- (') -and ($cliLog -join "`n").Contains('Invoke-NtfsAssessment.ps1')) 'Offline report names the next collection script and quantifies missing evidence with reasons'
+    Assert (($cliLog -join "`n") -notmatch '\b0 (missing evidence checks|policy mismatches|contextual warnings|partial scopes|error records|skipped-path records)\b') 'Offline report action guidance excludes zero-count categories'
+    $cliFailureOutput=Join-Path $testRoot 'cli-failed-report'
+    $ErrorActionPreference='Continue'
+    try{
+        $cliFailure=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder (Join-Path $testRoot 'absent-run') -OutputFolder $cliFailureOutput 2>&1)
+        $cliFailureExit=$LASTEXITCODE
+    }finally{$ErrorActionPreference='Stop'}
+    Assert ($cliFailureExit -eq 2 -and ($cliFailure -join "`n").Contains('Best practices: Failed.') -and ($cliFailure -join "`n").Contains((Join-Path $cliFailureOutput 'report.log'))) 'Offline report failure points to its diagnostic log'
     $failureOutput=Join-Path $testRoot 'collector-config-failure'
     $failureLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $failureOutput -BestPractices -PolicyPath $policyPath -FailServerConfiguration 2>&1)
     Assert ($LASTEXITCODE -eq 0) "Server-configuration failure remains a non-mutating partial-evidence result: $($failureLog -join "`n")"
@@ -170,6 +236,32 @@ try {
     $failureChecks=Get-CheckRows (Join-Path $failureRun.FullName 'BestPracticeChecks.csv')
     Assert (@($failureChecks|Where-Object {$_.CheckId -eq 'SMB1Enabled' -and $_.Status -eq 'NotAssessed' -and $_.Evidence -like '*Synthetic access denied*'}).Count -eq 1) 'Configuration read failure has explicit NotAssessed reason'
     Assert (@(Read-NtfsCsvFile (Join-Path $failureRun.FullName 'BestPracticesErrors.csv')|Where-Object Stage -eq 'SMBServerConfiguration').Count -eq 1) 'Configuration read failure is preserved as coverage evidence'
+    Assert (($failureLog -join "`n").Contains('Synthetic access denied') -and ($failureLog -join "`n").Contains("-RunSelection 'Explicit'")) 'Missing optional SMB configuration is explained but does not block the merge command'
+    Assert (($failureLog -join "`n") -notmatch '\b0 (collection error records|skipped-path records|incomplete group expansions|missing evidence checks|policy mismatches|contextual warnings)\b') 'Collector best-practices action guidance excludes zero-count categories'
+    foreach($withAudit in @($false,$true)){
+        $uncOutput=Join-Path $testRoot "collector-unc-$($withAudit)"
+        $auditArguments=@()
+        if($withAudit){$auditArguments=@('-Audit')}
+        $uncLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $uncOutput -BestPractices -ExplicitUnc @auditArguments 2>&1)
+        $uncExit=$LASTEXITCODE
+        Assert ($uncExit -eq 1) "Nonempty UNC collector finalizes best practices with Audit=$($withAudit): $($uncLog -join "`n")"
+        $uncRun=Get-ChildItem -LiteralPath $uncOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
+        $uncManifest=Get-Content -LiteralPath (Join-Path $uncRun.FullName 'manifest.json') -Raw|ConvertFrom-Json
+        Assert (-not $uncManifest.FatalError -and $uncManifest.Counts.NtfsAces -eq 1 -and $uncManifest.Counts.Folders -eq 1) 'UNC finalization retains collected rows and publishes a nonfatal manifest'
+        $uncChecks=Get-CheckRows (Join-Path $uncRun.FullName 'BestPracticeChecks.csv')
+        Assert (@($uncChecks|Where-Object {$_.CheckId -eq 'InheritanceProtected' -and $_.EvidenceSource -eq 'Folders.csv'}).Count -eq 1) 'Inline report sees buffered folder evidence'
+        Assert (@($uncChecks|Where-Object {$_.CheckId -eq 'UnresolvedPrincipal' -and $_.EvidenceSource -eq 'NtfsAcls.csv'}).Count -eq 1) 'Inline report sees buffered ACE evidence'
+        Assert ($uncManifest.BestPractices.AuditEvidenceCollected -eq $withAudit) 'UNC manifest preserves audit opt-in'
+        foreach($dataset in @($uncManifest.Datasets)){
+            foreach($part in @($dataset.Parts)){
+                $partPath=Join-Path $uncRun.FullName $part.Name
+                Assert ((Get-FileHash -LiteralPath $partPath -Algorithm SHA256).Hash -eq $part.SHA256) 'UNC manifest hashes finalized CSV data'
+            }
+        }
+        $uncHashes=@(Read-NtfsCsvFile (Join-Path $uncRun.FullName 'SHA256SUMS.csv'))
+        Assert (@($uncHashes|Where-Object { $_.Hash -ne (Get-FileHash -LiteralPath $_.Path -Algorithm SHA256).Hash }).Count -eq 0) 'UNC output hashes include the completed report and manifest'
+        Assert (@(Get-ChildItem -LiteralPath (Join-Path $uncRun.FullName 'PerShare') -File).Count -eq 2) 'UNC finalization preserves per-share copies'
+    }
     $defaultOutput=Join-Path $testRoot 'collector-default-off'
     $defaultLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $defaultOutput 2>&1)
     $defaultExit=$LASTEXITCODE
