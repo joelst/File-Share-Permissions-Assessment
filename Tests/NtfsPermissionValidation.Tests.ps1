@@ -83,6 +83,8 @@ Describe 'Read-only validation evidence workflow' {
         $report.IndependentComparison.Apply.DescriptorResult | Should -Be NoChangeObserved
         $report.IndependentComparison.Apply.Status | Should -Be Failed
         $report.Status | Should -Be Failed
+        $result.Diagnostics.Warnings | Should -BeGreaterThan 0
+        ($result.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'Apply comparison: Failed'
         $report.PhysicalIdentityProof | Should -Be Unqualified
         $report.ManualMatrixStatus | Should -Be NotRun
         $manifest=Read-NvJson (Join-Path $case 'CaptureBefore/manifest.json')
@@ -133,7 +135,69 @@ Describe 'Read-only validation evidence workflow' {
         $r.Status | Should -Be Incomplete
         $report=Read-NvJson (Join-Path $case 'Report/report.json')
         $report.MissingStages.Count | Should -Be 3
+        $r.Diagnostics.MissingEvidence | Should -Be 3
+        $r.Diagnostics.Warnings | Should -Be 1
+        ($r.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'CaptureBefore, CaptureAfterApply, CaptureAfterRevert'
+        @($r.Diagnostics.Reasons | Where-Object Reason -like 'Missing required captures*')[0].Status | Should -Be 'NotAssessed'
         $report.WriterQualification | Should -Be NotQualified
+    }
+    It 'counts unresolved comparisons and prevents an external-action next step' {
+        Mock Compare-NvCapture {
+            [pscustomobject]@{
+                Status='NotAssessed';Mode='Apply';Namespace='ObservedSameCapturedPaths'
+                DescriptorResult='ChangedDescriptorsObservedNotExpectedDescriptorVerified'
+                Missing=@();Added=@();Rows=@()
+            }
+        }
+        $case=New-VCase
+        $null=Invoke-NvStage $case CaptureBefore
+        $result=Invoke-NvStage $case CaptureAfterApply -ManualAcknowledged $true
+        $result.Diagnostics.MissingEvidence | Should -Be 1
+        $result.Diagnostics.Warnings | Should -Be 1
+        $result.NextStep | Should -BeLike '*stop external actions*'
+        ($result.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'Apply comparison: NotAssessed'
+        @($result.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: NotAssessed*')[0].Status | Should -Be 'NotAssessed'
+        $reportResult=Invoke-NvStage $case Report
+        @($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: NotAssessed*')[0].Status | Should -Be 'NotAssessed'
+    }
+    It 'prioritizes capture and report evidence gaps ahead of more frequent intent warnings' {
+        $snapshots=@((New-VSnapshot))
+        foreach($group in 1..5){
+            foreach($item in 1..3){
+                $snapshots+=New-VSnapshot -Path "\\server\lab\case\group$($group)-item$($item)"
+            }
+        }
+        $script:fixture=New-VInventory -Snapshots $snapshots -Errors @('Synthetic capture evidence unavailable')
+        Mock New-NpProposal {
+            param($Before)
+            if($Before.Path -match 'group(\d+)'){throw "Intent warning group $($Matches[1])"}
+            throw 'Intent warning for root'
+        }
+        $case=New-VCase
+        $capture=Invoke-NvStage $case CaptureBefore
+        $captureMessages=@(Write-NtfsCompletion -component Validation -status Incomplete -reasonSummary $capture.Diagnostics.Reasons -nextStep 'Review evidence.' 6>&1)
+        $captureReasons=@($captureMessages.MessageData | Where-Object {$_ -like '  - (*'})
+        $captureReasons.Count | Should -Be 5
+        $captureReasons[0] | Should -Match 'NotAssessed: Synthetic capture evidence unavailable'
+        $reportResult=Invoke-NvStage $case Report
+        $reportMessages=@(Write-NtfsCompletion -component Validation -status Incomplete -reasonSummary $reportResult.Diagnostics.Reasons -nextStep 'Review evidence.' 6>&1)
+        $reportReasons=@($reportMessages.MessageData | Where-Object {$_ -like '  - (*'})
+        $reportReasons.Count | Should -Be 5
+        ($reportReasons[0..1] -join "`n") | Should -Match 'NotAssessed: CaptureBefore: Synthetic capture evidence unavailable'
+        ($reportReasons[0..1] -join "`n") | Should -Match 'NotAssessed: Missing required captures'
+    }
+    It 'prioritizes missing baseline paths without misclassifying failed comparisons' {
+        $case=New-VCase
+        $null=Invoke-NvStage $case CaptureBefore
+        $script:fixture=New-VInventory -Snapshots @((New-VSnapshot))
+        $capture=Invoke-NvStage $case CaptureAfterApply -ManualAcknowledged $true
+        @($capture.Diagnostics.Reasons | Where-Object Reason -like 'Paths present in the baseline*')[0].Status | Should -Be 'NotAssessed'
+        $failedCapture=@($capture.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Failed*')[0]
+        $failedCapture.PSObject.Properties.Name | Should -Not -Contain 'Status'
+        $reportResult=Invoke-NvStage $case Report
+        @($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply: baseline paths missing*')[0].Status | Should -Be 'NotAssessed'
+        $failedReport=@($reportResult.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Failed*')[0]
+        $failedReport.PSObject.Properties.Name | Should -Not -Contain 'Status'
     }
     It 'detects exact-byte tampering of prior evidence' {
         $case=New-VCase
@@ -238,12 +302,19 @@ Describe 'Read-only validation evidence workflow' {
     It 'records capture errors and withholds every comparison claim' {
         $script:fixture=New-VInventory -Errors @('unreadable','reparse','limit')
         $case=New-VCase
-        Invoke-VThrough $case
+        $null=Invoke-NvStage $case CaptureBefore
+        $after=Invoke-NvStage $case CaptureAfterApply -ManualAcknowledged $true
+        @($after.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Incomplete*')[0].Status | Should -Be 'NotAssessed'
+        $null=Invoke-NvStage $case CaptureAfterRevert -ManualAcknowledged $true
         $r=Invoke-NvStage $case Report
         $r.Status | Should -Be Incomplete
         $report=Read-NvJson (Join-Path $case 'Report/report.json')
         $report.IndependentComparison.Revert.Status | Should -Be Incomplete
         $report.IndependentComparison.Revert.DescriptorResult | Should -Be NotAssessed
+        $r.Diagnostics.MissingEvidence | Should -Be ($report.EvidenceErrors.Count+2)
+        ($r.Diagnostics.Reasons.Reason -join "`n") | Should -Match 'unreadable'
+        @($r.Diagnostics.Reasons | Where-Object Reason -like 'Apply comparison: Incomplete*')[0].Status | Should -Be 'NotAssessed'
+        $r.NextStep | Should -Not -Match 'Report may close'
     }
     It 'records all manual tests as NotRun with explicit external evidence fields' {
         $matrix=Get-NvManualMatrix
@@ -289,6 +360,18 @@ Describe 'Read-only validation evidence workflow' {
         Write-NvNewJson $path $matrix
         { Read-NvManualObservations $path (Read-NvCase $case) } | Should -Throw
     }
+    It 'includes failed operator observations in report warning counts and reasons' {
+        $case=New-VCase
+        $matrix=Read-NvJson (Join-Path $case 'Initialize/manual-matrix.json')
+        $item=$matrix.Cases[0]
+        $item.Status='Failed';$item.Command='External approved test command';$item.ActualResult='External test failed'
+        $item.Account='test';$item.Utc=[DateTime]::UtcNow.ToString('o');$item.Reviewer='reviewer'
+        $path=Join-Path $script:work ('failed-observation-'+[guid]::NewGuid().ToString('N')+'.json')
+        Write-NvNewJson $path $matrix
+        $result=Invoke-NvStage $case Report -ManualObservationsFile $path
+        $result.Diagnostics.Warnings | Should -Be 1
+        ($result.Diagnostics.Reasons.Reason -join "`n") | Should -Match ([regex]::Escape("Manual observation failed: $($item.Test)"))
+    }
     It 'keeps user metadata strictly typed and unverified' {
         $json='{"Session":"operator session","Volume":"reported volume","Nas":"reported NAS","Backend":"NetApp","SecurityStyle":"ntfs","Namespace":"reviewed externally","EvidenceStorage":"trusted local"}'
         $value=ConvertTo-NvOperatorMetadata $json
@@ -311,6 +394,9 @@ Describe 'Read-only validation evidence workflow' {
         $r.NextStep | Should -BeLike '*stop external actions*'
         $intent=Read-NvJson (Join-Path $case 'CaptureBefore/intent-review.json')
         $intent.Entries[0].Error | Should -BeLike '*deny overlap*'
+        $report=Invoke-NvStage $case Report
+        $report.Diagnostics.Warnings | Should -Be 2
+        ($report.Diagnostics.Reasons.Reason -join "`n") | Should -BeLike '*Intent review:*deny overlap*'
     }
     It 'always asks the inventory adapter for folder AND file descendants for either intent scope' {
         $b=New-VBinding -Scope ThisFolderOnly
@@ -559,6 +645,62 @@ Describe 'Windows descriptor section fidelity (read-only, no target calls)' -Ski
 }
 
 Describe 'Public read-only Windows gate and CLI contract' {
+    It 'preserves result objects and only suggests a safe report command after complete observations' {
+        Mock Assert-NvWindows {}
+        Mock Invoke-NvStage {
+            param($CasePath,$Stage)
+            $observedStatus=Split-Path $CasePath -Leaf
+            [pscustomobject]@{
+                CasePath=$CasePath;Stage=$Stage;Status=$observedStatus
+                CommitSHA256=('a'*64);TargetWrites=0;WriterQualification='NotQualified'
+                NextStep=$(if($observedStatus -eq 'Observed'){'Review observations, then generate the report.'}else{'Stop external actions and preserve incomplete or failed evidence.'})
+                Diagnostics=@{
+                    MissingEvidence=$(if($observedStatus -eq 'Observed'){0}else{2})
+                    Warnings=0
+                    Reasons=@(if($observedStatus -ne 'Observed'){[pscustomobject]@{Count=2;Reason='Synthetic missing evidence.'}})
+                }
+            }
+        }
+        foreach($status in @('Observed','Incomplete','Failed','NotAssessed')){
+            $casePath=Join-Path $script:work $status
+            $result=& (Join-Path $PSScriptRoot '../Invoke-NtfsPermissionValidation.ps1') -Stage CaptureAfterRevert -CasePath $casePath -ManualActionAcknowledgement -NonInteractive -InformationVariable completionMessages
+            $result.Status | Should -Be $status
+            $result.TargetWrites | Should -Be 0
+            $result.WriterQualification | Should -Be NotQualified
+            $console=$completionMessages.MessageData -join "`n"
+            $console | Should -Match ([regex]::Escape("Output: $($casePath)"))
+            $console | Should -Match 'Archive commit SHA256'
+            if($status -eq 'Observed'){
+                $console | Should -Not -Match 'Resolve/review:'
+                $console | Should -Match "-Stage 'Report'"
+                $console | Should -Match ([regex]::Escape("-CasePath '$($casePath.Replace("'","''"))'"))
+            }else{
+                $console | Should -Match 'Stop external actions'
+                $console | Should -Match 'Resolve 2 missing evidence records'
+                $console | Should -Not -Match '\b0 validation warnings\b'
+                $console | Should -Match '- \(2 records\): Synthetic missing evidence'
+                $console | Should -Not -Match "-Stage 'Report'"
+            }
+        }
+        foreach($checkpoint in @(
+            @{Stage='CaptureBefore';Next='CaptureAfterApply'},
+            @{Stage='CaptureAfterApply';Next='CaptureAfterRevert'}
+        )){
+            $arguments=@{Stage=$checkpoint.Stage;CasePath=(Join-Path $script:work 'Observed');NonInteractive=$true}
+            if($checkpoint.Stage -eq 'CaptureAfterApply'){$arguments.ManualActionAcknowledgement=$true}
+            $null=& (Join-Path $PSScriptRoot '../Invoke-NtfsPermissionValidation.ps1') @arguments -InformationVariable checkpointMessages
+            $command=@($checkpointMessages.MessageData|Where-Object{$_ -like "  & '*'"})[-1]
+            $command | Should -Match ([regex]::Escape("-Stage '$($checkpoint.Next)'"))
+            $command | Should -Not -Match 'ManualActionAcknowledgement|NonInteractive'
+        }
+    }
+    It 'preserves validation errors and warns against retrying or deleting locks' {
+        Mock Assert-NvWindows {}
+        Mock Invoke-NvStage { throw 'Synthetic immutable-stage failure.' }
+        { & (Join-Path $PSScriptRoot '../Invoke-NtfsPermissionValidation.ps1') -Stage CaptureBefore -CasePath $script:work -InformationVariable script:failureMessages } | Should -Throw '*Synthetic immutable-stage failure*'
+        ($script:failureMessages.MessageData -join "`n") | Should -Match 'Permission validation: Failed\.'
+        (($script:failureMessages.MessageData -join "`n") -replace '\s+',' ') | Should -Match 'do not delete locks or automatically retry'
+    }
     It 'rejects real non-Windows execution before creating evidence' -Skip:([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         { & (Join-Path $PSScriptRoot '../Invoke-NtfsPermissionValidation.ps1') -Stage Initialize -NonInteractive } | Should -Throw '*Windows read-only*'
     }

@@ -14,12 +14,12 @@ Set-StrictMode -Version Latest
 # Release versions are defined only here; schema versions and compatibility floors
 # remain at their call sites. Shared engines and their entry points use the same key.
 $script:NtfsVersions = @{
-    Assessment = '1.6.6'
-    Comparison = '1.0.2'
-    Merge = '2.8.4'
-    BestPractices = '1.0.0'
-    Permissions = '0.2.1-unqualified'
-    PermissionValidation = '0.1.0'
+    Assessment = '1.7.2'
+    Comparison = '1.0.4'
+    Merge = '2.8.6'
+    BestPractices = '1.1.2'
+    Permissions = '0.2.3-unqualified'
+    PermissionValidation = '0.1.2'
 }
 
 function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$Stage,[string]$Message='') {
@@ -28,6 +28,122 @@ function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$
         $line = "{0:o}`t{1}`t{2}`tComponent={3}`tVersion={4}`t{5}" -f [datetime]::UtcNow,$Level,$Stage,$Component,$script:NtfsVersions[$Component],$messageLine
         Add-Content -LiteralPath $Path -Value $line -Encoding UTF8 -ErrorAction Stop
         Write-Verbose $line
+    }
+}
+
+function Format-NtfsCompletionText {
+    <#
+    .SYNOPSIS
+    Wraps completion prose without splitting words or long paths.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$text,
+        [string]$prefix='  ',
+        [string]$continuationPrefix='  '
+    )
+    $lines=New-Object 'Collections.Generic.List[string]'
+    $paragraphPrefix=$prefix
+    foreach($paragraph in [regex]::Split($text.Trim(),'(?<=[.!?])\s+(?=[A-Z])')){
+        $line=$paragraphPrefix
+        $hasWord=$false
+        foreach($word in [regex]::Split($paragraph,'\s+')){
+            $separator=if($hasWord){' '}else{''}
+            if($hasWord -and $line.Length+$separator.Length+$word.Length -gt 100){
+                $lines.Add($line)
+                $line=$continuationPrefix
+                $separator=''
+            }
+            $line+=$separator+$word
+            $hasWord=$true
+        }
+        $lines.Add($line)
+        $paragraphPrefix=$continuationPrefix
+    }
+    return $lines -join "`n"
+}
+
+function Write-NtfsCompletion {
+    <#
+    .SYNOPSIS
+    Displays workflow status and review guidance without adding success-stream data.
+    .DESCRIPTION
+    Sections are separated by blank lines and prose is wrapped at 100 columns.
+    Optional next-command arguments are quoted as literal strings for PowerShell
+    and displayed on separate lines using PowerShell continuation characters.
+    The command is displayed only; no next step is executed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$component,
+        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$status,
+        [string]$summary,
+        [string]$outputPath,
+        [string[]]$reviewPath=@(),
+        [string]$requirements,
+        [object[]]$reasonSummary=@(),
+        [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$nextStep,
+        [string]$nextScriptPath,
+        [Collections.IDictionary]$nextParameters=@{}
+    )
+    Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+    Write-Information -MessageData "$($component): $($status)." -Tags 'NtfsCompletion' -InformationAction Continue
+    if($summary){
+        Write-Information -MessageData (Format-NtfsCompletionText -text $summary) -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    if ($outputPath) {
+        Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData "Output: $($outputPath)" -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    if($reviewPath.Count){
+        Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData 'Review:' -Tags 'NtfsCompletion' -InformationAction Continue
+        foreach ($path in $reviewPath) {
+            Write-Information -MessageData "  $($path)" -Tags 'NtfsCompletion' -InformationAction Continue
+        }
+    }
+    if ($requirements) {
+        Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData 'Resolve/review:' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData (Format-NtfsCompletionText -text $requirements) -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    $reasons=@($reasonSummary | Sort-Object @{
+        Expression={if($_.PSObject.Properties.Name -contains 'Status' -and $_.Status -eq 'NotAssessed'){0}else{1}}
+    },@{Expression='Count';Descending=$true},Reason)
+    if($reasons.Count){
+        Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData 'Reasons:' -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    foreach ($reason in @($reasons | Select-Object -First 5)) {
+        $text=([string]$reason.Reason -replace '\r\n|\r|\n',' ').Trim()
+        if($reason.PSObject.Properties.Name -contains 'Status'){
+            if($reason.PSObject.Properties.Name -contains 'CheckId'){
+                $diagnosticPrefix="$($reason.CheckId) [$($reason.Status)]: "
+                if($text.StartsWith($diagnosticPrefix,[StringComparison]::Ordinal)){
+                    $text=$text.Substring($diagnosticPrefix.Length)
+                }
+            }
+            $text="$($reason.Status): $($text)"
+        }
+        $unit=if($reason.Count -eq 1){'record'}else{'records'}
+        $prefix="  - ($($reason.Count) $($unit)): "
+        Write-Information -MessageData (Format-NtfsCompletionText -text $text -prefix $prefix -continuationPrefix '    ') -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    if ($reasons.Count -gt 5) {
+        Write-Information -MessageData "  More reasons: $($reasons.Count-5) additional groups; see the listed reports/logs." -Tags 'NtfsCompletion' -InformationAction Continue
+    }
+    Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+    Write-Information -MessageData 'Next:' -Tags 'NtfsCompletion' -InformationAction Continue
+    Write-Information -MessageData (Format-NtfsCompletionText -text $nextStep) -Tags 'NtfsCompletion' -InformationAction Continue
+    if ($nextScriptPath) {
+        $escapedScript = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($nextScriptPath)
+        $command = "& '{0}'" -f $escapedScript
+        foreach ($entry in $nextParameters.GetEnumerator()) {
+            $escapedValue = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$entry.Value)
+            $command += ' `'+ "`n" + ("    -{0} '{1}'" -f $entry.Key,$escapedValue)
+        }
+        Write-Information -MessageData '' -Tags 'NtfsCompletion' -InformationAction Continue
+        Write-Information -MessageData "  $($command)" -Tags 'NtfsCompletion' -InformationAction Continue
     }
 }
 

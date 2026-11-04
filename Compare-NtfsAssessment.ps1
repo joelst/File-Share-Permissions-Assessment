@@ -506,6 +506,7 @@ try{
     $scopeWriter=New-NtfsCsvWriter (Join-Path $OutputFolder 'NTFS_ComparisonCoverage.csv')
     $scopeWriter.WriteLine((ConvertTo-NtfsCsvRecord @('Server','Share','BaselineRunId','ComparisonRunId','BaselineRoots','ComparisonRoots','BaselineComplete','ComparisonComplete','Status','Reason')))
     Save-ComparisonState Running Comparing
+    $scopeCounts=@{NotCompared=0;ComparedObservedPathsOnly=0;ComparedCompleteDirectories=0}
     foreach($key in @(@($Baseline.Scopes.Keys)+@($Comparison.Scopes.Keys)|Sort-Object -Unique)){
         $hasBefore=$Baseline.Scopes.ContainsKey($key);$hasAfter=$Comparison.Scopes.ContainsKey($key)
         $scope=if($hasAfter){$Comparison.Scopes[$key][0]}else{$Baseline.Scopes[$key][0]}
@@ -527,6 +528,7 @@ try{
             if(-not $completeBefore -or -not $completeAfter){Add-Limitation "$($scope.Server)\$($scope.Share): incomplete coverage; unobserved directories/ACEs are not treated as confirmed removals."}
             Compare-FoldersAndAces $key ($completeBefore -and $completeAfter)
         }
+        $scopeCounts[$status]++
         $scopeWriter.WriteLine((ConvertTo-NtfsCsvRecord @($scope.Server,$scope.Share,$Baseline.RunId,$Comparison.RunId,($beforeRoots -join ';'),($afterRoots -join ';'),$completeBefore,$completeAfter,$status,$reason)))
         if($hasBefore -and $hasAfter){
             Compare-SharePermissions $key
@@ -554,6 +556,7 @@ try{
     $summary=[ordered]@{
         Version=$script:NtfsVersions.Comparison;GeneratedUtc=[datetime]::UtcNow.ToString('o');Baseline=$sources[0];Comparison=$sources[1]
         DifferenceRows=$script:Changes.Rows;Counts=$summaryRows;Limitations=@($script:Limitations|Sort-Object)
+        ScopeCounts=$scopeCounts
         Scope='Directory permissions, collected share permissions and share metadata only.'
         Interpretation='Added/Removed refer to snapshot records, not proven creation/deletion, effective-access changes, or remediation approvals.'
         MaxCsvFileBytes=100000000;Datasets=@(Get-NtfsDatasetInventory $OutputFolder)
@@ -561,8 +564,6 @@ try{
     $summary|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_ComparisonSummary.json') -Encoding UTF8
     $exitCode=if($script:Limitations.Count -gt 0){1}else{0}
     Save-ComparisonState $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete
-    Write-Host "Comparison completed: $($script:Changes.Rows) difference rows; $($script:Limitations.Count) limitations. Reports: $OutputFolder"
-    if($summaryRows.Count -gt 0){$summaryRows|Format-Table -AutoSize|Out-Host}
 }catch{
     $message="$($_.Exception.Message) $($_.ScriptStackTrace)"
     Save-ComparisonState Failed Comparison $message
@@ -584,4 +585,34 @@ try{
         }else{Save-ComparisonState Failed Cleanup $message}
     }
 }
+$completion=@{component='Comparison';outputPath=$OutputFolder}
+if($exitCode -eq 2){
+    $completion.status='Failed'
+    $completion.requirements='Resolve 1 comparison failure before interpreting differences.'
+    $completion.reasonSummary=@([pscustomobject]@{Count=1;Reason=$message})
+    if($script:OutputReady){$completion.reviewPath=@((Join-Path $OutputFolder 'comparison-state.json'),(Join-Path $OutputFolder 'comparison-stage.log'))}
+    else{$completion.Remove('outputPath')}
+    $completion.nextStep='Next script: Compare-NtfsAssessment.ps1 after resolving the recorded input, scope, or integrity failure. Do not treat partial output as a completed comparison.'
+}else{
+    $completion.status=if($exitCode -eq 1){'CompletedWithWarnings'}else{'Completed'}
+    $completion.summary="Difference rows=$($script:Changes.Rows); Limitations=$($script:Limitations.Count)."
+    $completion.reviewPath=@((Join-Path $OutputFolder 'NTFS_ComparisonSummary.json'),(Join-Path $OutputFolder 'NTFS_ComparisonCoverage.csv'),(Join-Path $OutputFolder 'NTFS_Changes.csv'))
+    $scopeIssues=@(
+        if($scopeCounts.NotCompared -gt 0){"$($scopeCounts.NotCompared) uncomparable scopes"}
+        if($scopeCounts.ComparedObservedPathsOnly -gt 0){"$($scopeCounts.ComparedObservedPathsOnly) partial-coverage scopes"}
+    )
+    $completion.requirements=(@(
+        if($scopeIssues.Count){"Resolve $($scopeIssues -join ', ') before claiming a complete comparison."}
+        if($script:Limitations.Count -gt 0){"Review $($script:Limitations.Count) limitations."}
+    ) -join ' ')
+    $completion.reasonSummary=@($script:Limitations|Group-Object|ForEach-Object{
+        [pscustomobject]@{Count=$_.Count;Reason=$_.Name}
+    })
+    $completion.nextStep=if($exitCode -eq 1){
+        'Next script for missing or mismatched scope evidence: Invoke-NtfsAssessment.ps1 with matching targets and roots, then Compare-NtfsAssessment.ps1 using comparable original snapshots. Missing records are not proof of removed access.'
+    }else{
+        'No next script is required: comparison is complete. Review NTFS_Changes.csv against approved change records; this is not effective-access proof or remediation approval.'
+    }
+}
+Write-NtfsCompletion @completion
 exit $exitCode

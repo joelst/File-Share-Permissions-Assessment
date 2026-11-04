@@ -9,7 +9,7 @@
 # verified backups, and obtain required approvals before use.
 # This script is not an official Microsoft product or supported Microsoft service.
 
-param([Parameter(Mandatory=$true)][string]$OutputRoot,[switch]$FailChecksum,[switch]$DuplicateScopes,[switch]$LocalContainment,[switch]$LocalExplicitContainment,[switch]$ExplicitContainment,[switch]$ExcludedOnly,[string]$OntapCsv,[switch]$BestPractices,[string]$PolicyPath,[switch]$Audit,[switch]$FailServerConfiguration)
+param([Parameter(Mandatory=$true)][string]$OutputRoot,[switch]$FailChecksum,[switch]$DuplicateScopes,[switch]$LocalContainment,[switch]$LocalExplicitContainment,[switch]$ExplicitContainment,[switch]$ExcludedOnly,[string]$OntapCsv,[switch]$BestPractices,[string]$PolicyPath,[switch]$Audit,[switch]$FailServerConfiguration,[switch]$ExplicitUnc,[switch]$LocalScan)
 $ErrorActionPreference='Stop'
 $env:COMPUTERNAME='MOCK'
 $global:NtfsTestFailChecksum=[bool]$FailChecksum
@@ -55,7 +55,7 @@ function Get-FileHash {
 }
 function Get-SmbShare {
     [CmdletBinding()]param()
-    [pscustomobject]@{Name=$(if($ExcludedOnly){'C$'}else{'data'});Path=$(if($BestPractices){Join-Path (Split-Path $OutputRoot -Parent) 'mock-share'}else{Split-Path $OutputRoot -Parent});Description='synthetic';EncryptData=$false;ContinuouslyAvailable=$false;FolderEnumerationMode='AccessBased'}
+    [pscustomobject]@{Name=$(if($ExcludedOnly){'C$'}else{'data'});Path=$(if($BestPractices -or $LocalScan){Join-Path (Split-Path $OutputRoot -Parent) 'mock-share'}else{Split-Path $OutputRoot -Parent});Description='synthetic';EncryptData=$false;ContinuouslyAvailable=$false;FolderEnumerationMode='AccessBased'}
 }
 function Get-CimInstance {
     [CmdletBinding()]param([Parameter(Position=0)][string]$ClassName)
@@ -71,7 +71,9 @@ function Get-SmbShareAccess {
     @([pscustomobject]@{AccountName='Everyone';SID='S-1-1-0';AccessControlType='Allow';AccessRight='Change'})
 }
 if($LocalContainment -or $ExcludedOnly){
-    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -ComputerName 'MOCK'
+    $arguments=@{OutputRoot=$OutputRoot;ComputerName=$env:COMPUTERNAME}
+    if($BestPractices){$arguments.BestPractices=$true}
+    & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') @arguments
     exit $LASTEXITCODE
 }
 if($ExplicitContainment){
@@ -82,10 +84,17 @@ if($ExplicitContainment){
     & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') -OutputRoot $OutputRoot -UncPath '\\server\data'
     exit $LASTEXITCODE
 }
-if($BestPractices){
+if($BestPractices -or $LocalScan){
     $mockShare=Join-Path (Split-Path $OutputRoot -Parent) 'mock-share'
     [void](New-Item -ItemType Directory -Path $mockShare -Force)
-    $arguments=@{OutputRoot=$OutputRoot;ComputerName='MOCK';MaxDepth=1;BestPractices=$true}
+    $arguments=@{OutputRoot=$OutputRoot;ComputerName='MOCK';MaxDepth=1;BestPractices=[bool]$BestPractices}
+    if($ExplicitUnc){
+        $arguments.Remove('ComputerName')
+        $arguments.UncPath='\\server\data'
+        $arguments.MaxDepth=0
+        $arguments.SplitOutputByShare=$true
+        $arguments.HashOutputs=$true
+    }
     if($PolicyPath){$arguments.BestPracticesPolicyPath=$PolicyPath}
     if($Audit){$arguments.CollectAuditEvidence=$true}
     & (Join-Path (Split-Path $PSScriptRoot -Parent) 'Invoke-NtfsAssessment.ps1') @arguments

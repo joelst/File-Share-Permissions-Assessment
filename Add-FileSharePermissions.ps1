@@ -208,7 +208,33 @@ try {
     if ($null -ne $lock) { $lock.ReleaseMutex(); $lock.Dispose() }
     if ($null -ne $runLock) { $runLock.Dispose() }
 }
-Write-Host "$status : $reason"
+$completion=@{
+    component='Permission planning';status=$status;outputPath=$run
+    summary="Mode=$($Mode); TargetWrites=0; WriterQualification=NotQualified. $($reason)"
+    reviewPath=@((Join-Path $run 'events.jsonl'))
+    requirements=$(if($status -eq 'Blocked'){
+        'Resolve/review 1 blocked result using the reason below; live mutation has 1 non-bypassable qualification restriction, not a bypassable missing parameter.'
+    }else{
+        $planningActions=@(
+            if($plan.Reasons.Count -gt 0){"Review $($plan.Reasons.Count) planning/qualification warnings."}
+            if($plan.Boundaries.Count -gt 0){"Review $($plan.Boundaries.Count) protected boundaries."}
+            'Live mutation has 1 non-bypassable qualification blocker.'
+        )
+        $planningActions -join ' '
+    })
+    reasonSummary=@(
+        if($Mode -eq 'Plan' -and $null -ne $plan){
+            $plan.Reasons|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}}
+        }elseif($reason){[pscustomobject]@{Count=1;Reason=$reason}}
+    )
+    nextStep=$(if($status -eq 'Blocked'){
+        'Preserve the journal. If planning inputs/coverage were invalid, next script: Add-FileSharePermissions.ps1 -Mode Plan after resolving them. Live Apply/Revert are disabled; no next script in this toolkit can perform the change.'
+    }else{
+        'No next executable change script is available. Review plan.json and before-and-intent.csv. Invoke-NtfsPermissionValidation.ps1 is only for a separately approved disposable-lab evidence workflow, not production Apply/Revert.'
+    })
+}
+if($Mode -eq 'Plan' -and $status -ne 'Blocked'){$completion.reviewPath+=@((Join-Path $run 'plan.json'),(Join-Path $run 'before-and-intent.csv'))}
+Write-NtfsCompletion @completion
 [pscustomobject]@{
     Version=$script:NtfsVersions.Permissions
     Status=$status; PlanningStatus='PlanningSupported'; MutationStatus='MutationNotQualified'

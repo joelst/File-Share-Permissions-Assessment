@@ -32,6 +32,8 @@
   Imports never establish directory or complete share-ACL coverage.
   -BestPractices and -CollectAuditEvidence opt in to read-only best-practice evidence;
   results are review prompts, not compliance certification or effective-access calculations.
+  Best-practices checks use a built-in baseline; custom policy rules override
+  individual expectations. Missing evidence remains unassessed.
 #>
 [CmdletBinding()]
 param(
@@ -599,12 +601,12 @@ finally{
   Export-Safe @($Identities.Values) Identities.csv;Export-Safe $LocalMembers LocalGroupMemberships.csv
   Export-Safe $Errors ScanErrors.csv;Export-Safe $SkippedPaths SkippedPaths.csv;Export-Safe $ShareCoverage ShareCoverage.csv
   if(Get-Variable GroupExpansion -ErrorAction SilentlyContinue){Export-Safe $GroupExpansion GroupExpansion.csv}else{Export-Safe @() GroupExpansion.csv}
-  if($BestPractices){
-   if($CollectAuditEvidence){Export-Safe $BpAuditRows AuditEvidence.csv}
-   Export-Safe $BpEvidenceErrors BestPracticesErrors.csv
-   Write-NtfsBestPracticesReport $RunFolder $RunFolder $BpPolicy -PolicyAlreadyParsed
-  }
  }finally{foreach($state in $script:CsvWriters.Values){$state.Writer.Dispose()}}
+ if($BestPractices){
+  if($CollectAuditEvidence){Export-Safe $BpAuditRows AuditEvidence.csv}
+  Export-Safe $BpEvidenceErrors BestPracticesErrors.csv
+  $BpSummary=Write-NtfsBestPracticesReport $RunFolder $RunFolder $BpPolicy -PolicyAlreadyParsed
+ }
  $memberCount=if($script:CsvWriters.ContainsKey('GroupMemberships.csv')){$script:CsvWriters['GroupMemberships.csv'].Writer.Rows}else{0}
  $safeParameters=[ordered]@{}
  foreach($key in $PSBoundParameters.Keys){if($PSBoundParameters[$key] -isnot [pscredential]){$safeParameters[$key]=$PSBoundParameters[$key]}}
@@ -623,6 +625,7 @@ finally{
   $policyCopy=Join-Path $RunFolder 'BestPracticesPolicy.json';$summaryFile=Join-Path $RunFolder 'BestPracticeSummary.json'
   $manifest.BestPractices=[ordered]@{
    Version=$script:NtfsVersions.BestPractices
+   Baseline=$BpSummary.Baseline
    Enabled=$true;AuditEvidenceCollected=[bool]$CollectAuditEvidence
    PolicySHA256=$(if($null -ne $BpPolicy){$BpPolicy.SHA256}else{''})
    PolicyFile=$(if($null -ne $BpPolicy){[ordered]@{Name='BestPracticesPolicy.json';Bytes=(Get-Item -LiteralPath $policyCopy).Length;SHA256=(Get-FileHash -LiteralPath $policyCopy -Algorithm SHA256).Hash}}else{$null})
@@ -651,4 +654,73 @@ finally{
   try{Write-RunLog ERROR Finalization $Fatal}catch{Write-Error -Message "Unable to record finalization failure: $($_.Exception.Message)" -ErrorAction Continue}
  }
 }
+$completion=@{component='Assessment';outputPath=$RunFolder}
+if($Fatal){
+ $completion.status='Failed'
+ $completion.summary=$Fatal
+ $completion.requirements='Resolve 1 fatal collection/finalization failure before continuing.'
+ $completion.reasonSummary=@([pscustomobject]@{Count=1;Reason=$Fatal})
+ $completion.reviewPath=@($Log)
+ $completion.nextStep='Review the error log and preserve this run. Do not merge or compare it as a completed assessment. Next script: Invoke-NtfsAssessment.ps1, only after the recorded failure is resolved.'
+}else{
+ $completion.summary="Folders=$($script:TotalFolders); ACEs=$($script:TotalAces); Errors=$($Errors.Count); Skipped=$($SkippedPaths.Count). Directory ACLs only."
+ $completion.reviewPath=@((Join-Path $RunFolder 'ShareCoverage.csv'))
+ $incompleteGroups=0
+ if(Get-Variable GroupExpansion -ErrorAction SilentlyContinue){$incompleteGroups=@($GroupExpansion|Where-Object Status -ne 'Complete').Count}
+ $collectionIssues=@(
+  if($Errors.Count -gt 0){"$($Errors.Count) collection error records"}
+  if($SkippedPaths.Count -gt 0){"$($SkippedPaths.Count) skipped-path records"}
+  if($incompleteGroups -gt 0){"$($incompleteGroups) incomplete group expansions"}
+ )
+ $completion.requirements=if($collectionIssues.Count){"Resolve $($collectionIssues -join ', ') before claiming complete coverage (these records may overlap)."}else{''}
+ $completion.reasonSummary=@(
+  foreach($group in @($Errors|Group-Object Stage)){
+   [pscustomobject]@{Status='NotAssessed';Count=$group.Count;Reason="Collection $($group.Name), example: $($group.Group[0].Error)"}
+  }
+  foreach($group in @($SkippedPaths|Group-Object Reason)){
+   [pscustomobject]@{Status='NotAssessed';Count=$group.Count;Reason="Skipped paths: $($group.Name). Example: $($group.Group[0].Detail)"}
+  }
+  if(Get-Variable GroupExpansion -ErrorAction SilentlyContinue){
+   foreach($group in @($GroupExpansion|Where-Object Status -ne 'Complete'|Group-Object Status)){
+    [pscustomobject]@{Status='NotAssessed';Count=$group.Count;Reason="Group expansion: $($group.Name). Review GroupExpansion.csv; possible depth/member limits, cycles, unsupported members, or recorded lookup failures."}
+   }
+  }
+ )
+ $evidenceIncomplete=$BestPractices -and ($BpEvidenceErrors.Count -gt 0 -or $BpSummary.StatusCounts.NotAssessed -gt 0)
+ if($BestPractices){
+  $completion.summary+=" Baseline matches=$($BpSummary.StatusCounts.MeetsConfiguredPolicy); Mismatches=$($BpSummary.StatusCounts.DoesNotMeetConfiguredPolicy); Review=$($BpSummary.StatusCounts.Review); NotAssessed=$($BpSummary.StatusCounts.NotAssessed)."
+  $completion.reviewPath+=@((Join-Path $RunFolder 'BestPracticeChecks.csv'),(Join-Path $RunFolder 'BestPracticeSummary.json'))
+  $policyActions=@(
+   if($BpSummary.StatusCounts.NotAssessed -gt 0){"Resolve or document $($BpSummary.StatusCounts.NotAssessed) missing evidence checks."}
+   if($BpSummary.StatusCounts.DoesNotMeetConfiguredPolicy -gt 0){"Review $($BpSummary.StatusCounts.DoesNotMeetConfiguredPolicy) policy mismatches."}
+   if($BpSummary.StatusCounts.Review -gt 0){"Review $($BpSummary.StatusCounts.Review) contextual warnings."}
+   if($BpSummary.StatusCounts.NotAssessed -gt 0){'Missing optional evidence does not block offline merging.'}
+  )
+  $completion.requirements=(@($completion.requirements)+$policyActions -join ' ').Trim()
+  $completion.reasonSummary+=@($BpSummary.Diagnostics)
+  $completion.reasonSummary+=@($BpEvidenceErrors|Group-Object Stage|ForEach-Object{
+   [pscustomobject]@{Status='NotAssessed';Count=$_.Count;Reason=$_.Group[0].Detail}
+  })
+ }
+ if($Shares.Count -eq 0){
+  $completion.status='CompletedWithWarnings'
+  $completion.requirements='Resolve 1 blocker: zero selected assessment scopes. Check target names and include/exclude share filters.'
+  $completion.nextStep='No assessment scopes were selected. Next script: Invoke-NtfsAssessment.ps1 with corrected targets or filters, then Merge-NtfsAssessment.ps1.'
+ }else{
+  $completion.status=if($partial -or $evidenceIncomplete){'CompletedWithWarnings'}else{'Completed'}
+  if($partial){$completion.reviewPath+=@((Join-Path $RunFolder 'ScanErrors.csv'),(Join-Path $RunFolder 'SkippedPaths.csv'),(Join-Path $RunFolder 'GroupExpansion.csv'))}
+  if($evidenceIncomplete){$completion.reviewPath+=@(Join-Path $RunFolder 'BestPracticesErrors.csv')}
+  $completion.nextStep=if($partial){
+   'Run Merge-NtfsAssessment.ps1 to analyze observed evidence with its limitations. Resolve collection gaps with Invoke-NtfsAssessment.ps1 before treating coverage as complete:'
+  }else{
+   'Run Merge-NtfsAssessment.ps1 for consolidated findings from this exact snapshot:'
+  }
+  $completion.nextScriptPath=Join-Path $PSScriptRoot 'Merge-NtfsAssessment.ps1'
+  $completion.nextParameters=[ordered]@{
+   InputRoot=$OutputRoot;RunSelection='Explicit';RunFolder=$RunFolder
+   OutputFolder=(Join-Path $OutputRoot ('REPORT_'+(Split-Path $RunFolder -Leaf)))
+  }
+ }
+}
+Write-NtfsCompletion @completion
 if($Fatal){exit 2}elseif($partial){exit 1}else{exit 0}

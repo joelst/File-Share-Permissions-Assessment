@@ -103,6 +103,14 @@ function Invoke-Merge($InputPath,$OutputName,[int]$Throttle=1,[string]$Selection
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('merge-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Merge $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
+    $console=$log -join "`n"
+    if($code -eq 2){
+        Assert ($console.Contains('Merge: Failed.') -and $console.Contains('Do not consume partial reports')) 'Failed merge gives diagnostic guidance rather than a success hint'
+    }else{
+        Assert ($console -notmatch '\b0 (folders without assessed ACL evidence|unverified ACL failures|source error records|warnings)\b') 'Merge action guidance omits zero-count categories'
+        Assert ($console.Contains("Output: $($output)") -and $console.Contains((Join-Path $output 'NTFS_QA.json')) -and $console.Contains('Next:')) 'Merge completion points to actual reports and a next step'
+        if($code -eq 1){Assert ($console.Contains('Merge: CompletedWithWarnings.') -and $console.Contains('Review QA warnings and coverage')) 'Partial merge highlights limitations before using findings'}
+    }
     if($code -lt 2){
         Get-ChildItem -LiteralPath $output -File -Filter '*.csv'|ForEach-Object{
             Assert ($_.Length -le 100000000) "Output size: $($_.Name)"
@@ -129,11 +137,30 @@ function Invoke-Comparison([string]$OutputName,[int]$ExpectedExit,[string[]]$Arg
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('comparison-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Comparison $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
+    $console=$log -join "`n"
+    if($code -eq 2){
+        Assert ($console.Contains('Comparison: Failed.') -and $console.Contains('Do not treat partial output as a completed comparison')) 'Failed comparison gives diagnostic guidance rather than a success hint'
+    }else{
+        Assert ($console.Contains("Output: $($output)") -and $console.Contains((Join-Path $output 'NTFS_ComparisonCoverage.csv')) -and $console.Contains('Next:')) 'Comparison completion points to real coverage and change reports'
+        if($code -eq 1){Assert ($console.Contains('Comparison: CompletedWithWarnings.') -and $console.Contains('Missing records are not proof')) 'Partial comparison warns about interpretation before suggesting further work'}
+    }
     if($code -lt 2){
         Assert ((Get-Content -LiteralPath $state -Raw|ConvertFrom-Json).Status -in @('Completed','CompletedWithWarnings')) 'Comparison completed state persisted'
         $summary=Get-Content -LiteralPath (Join-Path $output 'NTFS_ComparisonSummary.json') -Raw|ConvertFrom-Json
         Assert ($summary.Version -eq $script:NtfsVersions.Comparison) 'Comparison summary uses registered version'
         Assert ($summary.DifferenceRows -eq @(Rows $output 'NTFS_Changes.csv').Count) 'Comparison counts reconcile'
+        $coverage=@(Rows $output 'NTFS_ComparisonCoverage.csv')
+        foreach($scopeStatus in @('NotCompared','ComparedObservedPathsOnly','ComparedCompleteDirectories')){
+            Assert ($summary.ScopeCounts.$scopeStatus -eq @($coverage|Where-Object Status -eq $scopeStatus).Count) "Comparison $($scopeStatus) scope count matches coverage records"
+        }
+        foreach($category in @(
+            @{Count=$summary.ScopeCounts.NotCompared;Label='uncomparable scopes'},
+            @{Count=$summary.ScopeCounts.ComparedObservedPathsOnly;Label='partial-coverage scopes'}
+        )){
+            $present=$console.Contains("$($category.Count) $($category.Label)")
+            Assert ($present -eq ($category.Count -gt 0)) "Comparison guidance includes only positive $($category.Label) counts"
+        }
+        if($ExpectedExit -eq 0){Assert (-not $console.Contains('Resolve/review:')) 'Complete comparison has no resolve/review section when no action is needed'}
         Get-ChildItem -LiteralPath $output -File -Filter '*.csv'|ForEach-Object{
             Assert ($_.Length -le 100000000) "Comparison CSV capped: $($_.Name)"
             [void]@(Read-NtfsCsvFile $_.FullName)
@@ -320,13 +347,32 @@ try {
     $conflictRun=New-Run 'conflict/run' 'conflict' '2026-10-29T12:00:00Z' $conflictAces $conflictFolders
     [void](Invoke-Merge (Split-Path $conflictRun -Parent) 'conflict-out' 2 'LatestSuccessful' 2)
     $script:TestArea='Collector end-to-end'
+    $completeOutput=Join-Path $testRoot "complete collector O'Brien"
+    $completeLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $completeOutput -LocalScan 2>&1)
+    $completeCode=$LASTEXITCODE
+    Assert ($completeCode -eq 0) "Complete local collector succeeds: $($completeLog -join "`n")"
+    $completeRun=@(Get-ChildItem -LiteralPath $completeOutput -Directory)[0].FullName
+    $completeConsole=$completeLog -join "`n"
+    $escapedRun=$completeRun.Replace("'","''")
+    Assert ($completeConsole.Contains('Assessment: Completed.') -and $completeConsole.Contains("-RunSelection 'Explicit'") -and $completeConsole.Contains("-RunFolder '$($escapedRun)'")) 'Complete assessment gives a correctly quoted command selecting the actual snapshot'
+    Assert ($completeConsole.Contains("Output: $($completeRun)") -and $completeConsole.Contains((Join-Path $completeRun 'ShareCoverage.csv'))) 'Complete assessment shows its actual output and coverage paths'
+    Assert (-not $completeConsole.Contains('Resolve/review:')) 'Complete assessment does not ask to resolve zero issues'
     $mockOutput=Join-Path $testRoot 'mocked-collector'
     $mockLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $mockOutput 2>&1)
     $code=$LASTEXITCODE
     $mockLog|Set-Content -LiteralPath (Join-Path $testRoot 'mocked-collector.log')
     Assert ($code -eq 1) "Full mocked collector exits with partial coverage: $code : $($mockLog -join "`n")"
+    Assert (($mockLog -join "`n").Contains('Assessment: CompletedWithWarnings.') -and ($mockLog -join "`n").Contains('Resolve collection gaps') -and ($mockLog -join "`n").Contains("-RunSelection 'Explicit'")) 'Partial assessment still offers supported offline merging while requiring gaps to be resolved before claiming completeness'
     $mockRun=@(Get-ChildItem -LiteralPath $mockOutput -Directory)[0].FullName
     $mockManifest=Get-Content -LiteralPath (Join-Path $mockRun 'manifest.json') -Raw|ConvertFrom-Json
+    $mockConsole=($mockLog -join "`n") -replace '\s+',' '
+    foreach($category in @(
+        @{Count=$mockManifest.Counts.Errors;Label='collection error records'},
+        @{Count=$mockManifest.Counts.SkippedPaths;Label='skipped-path records'}
+    )){
+        Assert ($mockConsole.Contains("$($category.Count) $($category.Label)") -eq ($category.Count -gt 0)) "Assessment guidance includes only positive $($category.Label) counts"
+    }
+    Assert ($mockConsole.Contains('- (') -and $mockConsole -notmatch '\b0 incomplete group expansions\b') 'Assessment reports recorded reasons without zero-count group-expansion actions'
     Assert ($mockManifest.ToolkitVersion -eq $script:NtfsVersions.Assessment) 'Collector manifest uses registered version'
     Assert-VersionLog (Join-Path $mockRun 'run.log') Assessment
     Assert ($mockManifest.Counts.NtfsAces -eq 1 -and $mockManifest.Counts.Folders -eq 1) 'Full collector finalization retains rows/counts'
@@ -339,6 +385,7 @@ try {
     $failureLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $failedOutput -FailChecksum 2>&1)
     $failureCode=$LASTEXITCODE
     Assert ($failureCode -eq 2) "Checksum finalization failure exits 2: $($failureLog -join "`n")"
+    Assert (($failureLog -join "`n").Contains('Assessment: Failed.') -and ($failureLog -join "`n").Contains('Do not merge or compare') -and -not ($failureLog -join "`n").Contains("-RunSelection 'Explicit'")) 'Failed assessment points to diagnostics without recommending a downstream command'
     Assert (@(Get-ChildItem -LiteralPath $failedOutput -Recurse -File -Filter 'manifest.json').Count -eq 0) 'Checksum failure never publishes a selectable manifest'
 
     $script:TestArea='Comparison'
