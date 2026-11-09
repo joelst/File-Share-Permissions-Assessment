@@ -26,7 +26,7 @@ BeforeDiscovery {
     $completed=$false
     $details=''
     try{
-        $log=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Test-NtfsAssessment.ps1') -ResultsPath $resultsPath 2>&1)
+        $log=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Test-NtfsAssessment.ps1') -ResultsPath $resultsPath 2>&1 })
         $code=$LASTEXITCODE
         if(Test-Path -LiteralPath $resultsPath){
             $report=Get-Content -LiteralPath $resultsPath -Raw|ConvertFrom-Json
@@ -38,7 +38,8 @@ BeforeDiscovery {
         if(Test-Path -LiteralPath $resultsPath){Remove-Item -LiteralPath $resultsPath -ErrorAction Stop}
     }
     $caseData=@(foreach($case in $cases){
-        @{CaseName=('{0:D4} [{1}] {2}' -f [int]$case.Id,$case.Area,$case.Message);Passed=[bool]$case.Passed;Reason=$case.Message}
+        $caseMessage=([string]$case.Message -replace '\x1B\[[0-?]*[ -/]*[@-~]','' -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]','?')
+        @{CaseName=('{0:D4} [{1}] {2}' -f [int]$case.Id,$case.Area,$caseMessage);Passed=[bool]$case.Passed;Reason=$case.Message}
     })
     $caseData+=@{CaseName='Harness completed all scenarios and cleanup successfully';Passed=$completed;Reason=$details}
 }

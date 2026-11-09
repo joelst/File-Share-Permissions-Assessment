@@ -189,7 +189,8 @@ try {
     $engine=(Get-Process -Id $PID).Path
     $collectorHarness=Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1'
     $collectorOutput=Join-Path $testRoot 'collector-opt-in'
-    $log=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $collectorOutput -BestPractices -PolicyPath $policyPath -Audit 2>&1)
+    # Capture expected native stderr without PowerShell 5.1 stopping before exit-code checks.
+    $log=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $collectorOutput -BestPractices -PolicyPath $policyPath -Audit 2>&1 })
     $exitCode=$LASTEXITCODE
     Assert ($exitCode -eq 0) "Mocked collector opt-in succeeds: $($log -join "`n")"
     Assert (($log -join "`n").Contains('Assessment: CompletedWithWarnings.') -and ($log -join "`n").Contains('BestPracticeChecks.csv') -and -not ($log -join "`n").Contains('StatusInterpretation')) 'Collector gives concise report guidance instead of dumping the summary object'
@@ -208,7 +209,7 @@ try {
     Assert (@(Read-NtfsCsvFile (Join-Path $collectorRun.FullName 'BestPracticeChecks.csv')).Count -gt 0) 'Collector produces populated checks'
     Assert ($collectorManifest.BestPractices.Baseline.Rules.ShareEncryptionEnabled -eq $false -and $collectorManifest.BestPractices.Baseline.Rules.SMBRequireSecuritySignature -eq $true) 'Collector manifest records custom expectations merged with the built-in baseline'
     $baselineCollectorOutput=Join-Path $testRoot 'collector-baseline'
-    $baselineLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $baselineCollectorOutput -BestPractices 2>&1)
+    $baselineLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $baselineCollectorOutput -BestPractices 2>&1 })
     $baselineExit=$LASTEXITCODE
     Assert ($baselineExit -eq 0) "Collector uses baseline without a custom policy: $($baselineLog -join "`n")"
     $baselineRun=Get-ChildItem -LiteralPath $baselineCollectorOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
@@ -217,7 +218,7 @@ try {
     $inlineManifest=Get-Content -LiteralPath (Join-Path $baselineRun.FullName 'manifest.json') -Raw|ConvertFrom-Json
     Assert ($inlineManifest.BestPractices.Baseline.Version -eq $script:NtfsVersions.BestPractices -and $inlineManifest.BestPractices.Baseline.Rules.ShareEncryptionEnabled -eq $true -and $null -eq $inlineManifest.BestPractices.PolicyFile) 'Collector persists baseline provenance without inventing a custom policy file'
     $cliOutput=Join-Path $testRoot 'cli-offline-report'
-    $cliLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $run -OutputFolder $cliOutput 2>&1)
+    $cliLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $run -OutputFolder $cliOutput 2>&1 })
     $cliExit=$LASTEXITCODE
     Assert ($cliExit -eq 0 -and ($cliLog -join "`n").Contains('Best practices: CompletedWithWarnings.') -and ($cliLog -join "`n").Contains((Join-Path $cliOutput 'BestPracticeChecks.csv')) -and ($cliLog -join "`n").Contains('Offline reporting cannot fill evidence gaps')) 'Offline report CLI points to actual findings and unavailable-evidence guidance'
     Assert (($cliLog -join "`n").Contains("Resolve or document $($baselineResult.StatusCounts.NotAssessed) missing evidence checks") -and ($cliLog -join "`n").Contains('- (') -and ($cliLog -join "`n").Contains('Invoke-NtfsAssessment.ps1')) 'Offline report names the next collection script and quantifies missing evidence with reasons'
@@ -225,7 +226,7 @@ try {
     $emptyCollectionOutput=Join-Path $testRoot 'collector-empty-scope'
     $ErrorActionPreference='Continue'
     try{
-        $emptyCollectionLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $emptyCollectionOutput -ExcludedOnly -BestPractices 2>&1)
+        $emptyCollectionLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $emptyCollectionOutput -ExcludedOnly -BestPractices 2>&1 })
         $emptyCollectionExit=$LASTEXITCODE
     }finally{$ErrorActionPreference='Stop'}
     $emptyCollectionText=($emptyCollectionLog -join ' ') -replace '\s+',' '
@@ -236,7 +237,7 @@ try {
     $emptyReportOutput=Join-Path $testRoot 'empty-scope-report'
     $ErrorActionPreference='Continue'
     try{
-        $emptyReportLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $emptyRun.FullName -OutputFolder $emptyReportOutput 2>&1)
+        $emptyReportLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder $emptyRun.FullName -OutputFolder $emptyReportOutput 2>&1 })
         $emptyReportExit=$LASTEXITCODE
     }finally{$ErrorActionPreference='Stop'}
     Assert ($emptyReportExit -eq 0) "Empty-scope offline report completes: $($emptyReportLog -join "`n")"
@@ -247,12 +248,12 @@ try {
     $cliFailureOutput=Join-Path $testRoot 'cli-failed-report'
     $ErrorActionPreference='Continue'
     try{
-        $cliFailure=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder (Join-Path $testRoot 'absent-run') -OutputFolder $cliFailureOutput 2>&1)
+        $cliFailure=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsBestPracticesReport.ps1') -InputRunFolder (Join-Path $testRoot 'absent-run') -OutputFolder $cliFailureOutput 2>&1 })
         $cliFailureExit=$LASTEXITCODE
     }finally{$ErrorActionPreference='Stop'}
     Assert ($cliFailureExit -eq 2 -and ($cliFailure -join "`n").Contains('Best practices: Failed.') -and ($cliFailure -join "`n").Contains((Join-Path $cliFailureOutput 'report.log'))) 'Offline report failure points to its diagnostic log'
     $failureOutput=Join-Path $testRoot 'collector-config-failure'
-    $failureLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $failureOutput -BestPractices -PolicyPath $policyPath -FailServerConfiguration 2>&1)
+    $failureLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $failureOutput -BestPractices -PolicyPath $policyPath -FailServerConfiguration 2>&1 })
     Assert ($LASTEXITCODE -eq 0) "Server-configuration failure remains a non-mutating partial-evidence result: $($failureLog -join "`n")"
     $failureRun=Get-ChildItem -LiteralPath $failureOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
     $failureChecks=Get-CheckRows (Join-Path $failureRun.FullName 'BestPracticeChecks.csv')
@@ -264,7 +265,7 @@ try {
         $uncOutput=Join-Path $testRoot "collector-unc-$($withAudit)"
         $auditArguments=@()
         if($withAudit){$auditArguments=@('-Audit')}
-        $uncLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $uncOutput -BestPractices -ExplicitUnc @auditArguments 2>&1)
+        $uncLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $uncOutput -BestPractices -ExplicitUnc @auditArguments 2>&1 })
         $uncExit=$LASTEXITCODE
         Assert ($uncExit -eq 1) "Nonempty UNC collector finalizes best practices with Audit=$($withAudit): $($uncLog -join "`n")"
         $uncRun=Get-ChildItem -LiteralPath $uncOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
@@ -285,7 +286,7 @@ try {
         Assert (@(Get-ChildItem -LiteralPath (Join-Path $uncRun.FullName 'PerShare') -File).Count -eq 2) 'UNC finalization preserves per-share copies'
     }
     $defaultOutput=Join-Path $testRoot 'collector-default-off'
-    $defaultLog=@(& $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $defaultOutput 2>&1)
+    $defaultLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $collectorHarness -OutputRoot $defaultOutput 2>&1 })
     $defaultExit=$LASTEXITCODE
     Assert ($defaultExit -eq 1) "Default collector preserves its existing partial-coverage exit: $($defaultLog -join "`n")"
     $defaultRun=Get-ChildItem -LiteralPath $defaultOutput -Directory -Filter 'ASSESS_*'|Select-Object -First 1
