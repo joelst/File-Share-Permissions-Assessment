@@ -207,7 +207,8 @@ function Get-NpGrants {
         if ($Json -notmatch '^\s*\[\s*(?:\{\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*,\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*\}\s*(?:,\s*\{\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*,\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*\}\s*)*)?\]\s*$') {
             throw 'Grant JSON must contain objects with exactly GroupName and Permissions string properties (literal property names).'
         }
-        $items = @($Json | ConvertFrom-NpJson)
+        $parsed = $Json | ConvertFrom-NpJson
+        $items = @($parsed)
     }
     if ($items.Count -lt 1 -or $items.Count -gt 128) { throw 'Supply 1 to 128 grants.' }
     $rights = @{ Read = 131209; ReadAndExecute = 131241; Modify = 197055; FullControl = 2032127 }
@@ -287,7 +288,8 @@ function Get-NpBytesHash([byte[]]$Bytes) {
 }
 
 function Get-NpSourceHash {
-    $parts = foreach ($name in @('Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1')) {
+    $parts = foreach ($name in @('Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1',
+        'NtfsPermissions.Local.ps1','NtfsPermissions.Local.cs')) {
         $name + ':' + (Get-NpBytesHash ([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name))))
     }
     return Get-NtfsHash ($parts -join "`n")
@@ -482,7 +484,7 @@ function New-NpPlan([string]$Target, $Grants, [string]$Scope, $Inventory, [strin
     if ($TargetDescriptor.Addressing -eq 'LocalFixed') {
         $reasons += "Local volume evidence=$($TargetDescriptor.VolumeObservation.Status); host=$($TargetDescriptor.LocalHost). Observations are not stable object identity, freshness or infrastructure trust proof."
     }
-    $reasons += "MutationNotQualified/$($TargetDescriptor.QualificationScope): native writer absent; identity, namespace/backend and propagation are unproven. Windows local, Windows SMB, NetApp SMB and generic SMB require separate qualification."
+    $reasons += "MutationNotQualified/$($TargetDescriptor.QualificationScope): qualified public writer absent; identity, namespace/backend and propagation are unproven in this planning workflow. Windows local, Windows SMB, NetApp SMB and generic SMB require separate qualification."
     return [pscustomobject][ordered]@{
         Schema = 'NtfsPermissionsPlan/2'; Version = $script:NtfsVersions.Permissions
         CreatedUtc = [DateTime]::UtcNow.ToString('o'); SourceHash = $SourceHash

@@ -6,7 +6,9 @@ permission-change planning.
 
 **This is an assessment and evidence toolkit, not a production remediation tool.**
 `Add-FileSharePermissions.ps1` can prepare review-only plans, but its `Apply` and
-`Revert` modes are deliberately blocked. No native permission writer exists.
+`Revert` modes are deliberately blocked. No qualified production writer exists.
+An internal local-NTFS candidate is isolated from these entry points and is not
+production qualification or an enable switch.
 Passing tests or completing a validation walkthrough does not enable writes or
 qualify a platform for remediation.
 
@@ -21,7 +23,7 @@ qualify a platform for remediation.
 | `Add-FileSharePermissions.ps1` | Resolves AD security groups and inventories folders/files to create an abstract permission plan and audit journal. | Optional, separate planning workflow after review. Never an automatic next step from findings. |
 | `Invoke-NtfsPermissionValidation.ps1` | Creates a sealed case and records before/after observations around separately approved external manual actions. | Optional disposable-lab workflow; not a permission-change executor. |
 
-Keep all top-level `.ps1` files together. These supporting scripts are loaded by
+Keep all top-level `.ps1` and `.cs` files together. These supporting scripts are loaded by
 the entry points rather than run as standalone workflows:
 
 | Shared script | Responsibility |
@@ -30,6 +32,11 @@ the entry points rather than run as standalone workflows:
 | `NtfsAssessment.BestPractices.ps1` | Policy validation, evidence-based checks, and best-practices report generation. |
 | `NtfsPermissions.Common.ps1` | Read-only planning, target/group validation, journals, and recovery-evidence checks. |
 | `NtfsPermissions.Validation.ps1` | Immutable validation stages, capture comparisons, case integrity, and manual-observation validation. |
+
+`NtfsPermissions.Local.ps1` and `NtfsPermissions.Local.cs` are internal candidate
+code, **not loaded by the public planner or validation entry point**. The permission
+source/evidence hashes include them so modifying the candidate invalidates old
+source bindings.
 
 ## Requirements and safety
 
@@ -405,6 +412,12 @@ record component/version fields; permission audit events record their version in
 
 ## Tests
 
+For a Windows file-server lab, `Tests\Invoke-NtfsLabEvidence.ps1` collects
+protected, shareable test logs. Its default run does not inspect a target;
+target reads and disposable-fixture Pester tests are opt-in. See the
+[lab runner instructions](PERMISSION-WRITE-QUALIFICATION.md#targeted-server-lab-runner)
+for prerequisites, commands, side effects, and evidence handling.
+
 Run synthetic regression harnesses from the repository root:
 
 ```powershell
@@ -416,7 +429,7 @@ The assessment harness exercises collection mocks, merge/comparison, integrity,
 coverage, CSV size limits, and logging. The best-practices harness covers policy
 validation, evidence handling, reports, and collector opt-in behavior.
 
-With Pester 5 or later installed:
+With Pester 5.2 or later installed:
 
 ```powershell
 Invoke-Pester -Path .\Tests\NtfsAssessment.Tests.ps1, .\Tests\NtfsPermissions.Tests.ps1, .\Tests\NtfsPermissionValidation.Tests.ps1 -Output Detailed
@@ -432,7 +445,52 @@ expects files and protected descendant boundaries in that fixture. Its environme
 variables are documented in the test file. It neither performs mutation tests nor
 qualifies a writer.
 
+### Internal local-NTFS candidate tests
+
+```powershell
+Invoke-Pester -Path .\Tests\NtfsPermissions.Local.Tests.ps1 -Output Detailed
+```
+
+Unlike the read-only preflight, these integration tests create and change ACLs
+**only on their own generated disposable fixture beneath `Tests`**. Direct Pester
+runs remove it; the lab evidence runner preserves it and copies available audit
+logs for review. They do not accept an existing target. Run on a local fixed NTFS
+checkout with Windows PowerShell 5.1/Pester 5.2+ or supported PowerShell 7.
+
+The candidate pins ancestor/leaf handles, checks volume-GUID namespaces and
+128-bit file identities, rejects reparse/hard-link aliases, validates exact
+preimages and desired descriptors, and requires restrictive local audit storage
+and durable write intent. Read/list access is explicitly requested on zero-share
+handles; security-only handles do not provide the tested propagation/sharing
+behavior. Directory enumeration uses the pinned handle, not a second path open.
+Both scopes retain full-tree sentinel coverage; protected branch contents are
+observed but unchanged. Inheritable grants are applied as individually verified
+inherited ACE states with implicit propagation suppressed, never as recursive
+explicit grants or inheritance-protection toggles.
+
+Recovery requires a reviewed complete candidate Apply journal and exact current
+identities/descriptors. Any conflicting path refuses the entire recovery before
+a parent write. Failed/interrupted cases retain `candidate.lock` and audit
+evidence; no retry or automatic rollback occurs. Simulations still write local
+audit evidence. Direct internal candidate experiments additionally require
+`DisposableAcknowledgement` and independent approval; do not invoke them on
+production data or treat the internal helpers as a supported remediation API.
+
+**Remaining qualification:** zero sharing does not exclude security-only edits
+by another administrator, and namespace observations are not atomic. Real
+crash/disconnect recovery, authority/trust, effective access, large/long-path
+inventories, and supported OS/storage combinations remain unqualified. Generic
+high-bit ACE masks, conditional/object/opaque ACEs, null/noncanonical DACLs,
+unreadable protected branches, SMB/NAS, and unavailable exclusive handles fail
+closed. `FILE_ID_INFO` and handle directory enumeration require Windows 8 /
+Windows Server 2012 or later APIs. Public `Apply`/`Revert` remain blocked.
+
 ## Work still required
+
+For the ordered lab procedure, test matrix, evidence handoff, and future writer
+release gates, see [Permission modification: testing and evidence guide](PERMISSION-WRITE-QUALIFICATION.md).
+It distinguishes current read-only/manual observations from qualification of a
+future native writer; following it does not enable `Apply` or `Revert`.
 
 The following are current gaps or required qualification work, not capabilities
 enabled by configuration switches:
@@ -441,7 +499,7 @@ enabled by configuration switches:
 |---|---|
 | Live platform validation | Exercise real Windows PowerShell 5.1, AD, CIM, SMB, permissions/privileges, and large/long-path inventories. Synthetic tests do not establish live interoperability. Qualify Windows local NTFS, Windows SMB, NetApp SMB, and generic NAS separately. |
 | Target identity and namespace proof | Establish stable volume/file identities, identity-bound handles, direct backend/security-style proof, target group authority/trust, and reliable DFS/alias/backend rejection before any writable implementation. Current path and volume observations are insufficient. |
-| Native permission writer | Design and implement a qualified writer before enabling `Apply`/`Revert`. The current release intentionally has none. Do not remove the qualification gate as a shortcut. |
+| Native permission writer | Qualify the isolated local candidate and implement remaining safeguards before connecting any writer to public `Apply`/`Revert`. The current release has no qualified production writer. Do not remove the qualification gate as a shortcut. |
 | Propagation and concurrency safety | Validate both scopes across folders/files, protected/reparse boundaries, existing inheritance, exclusive-handle availability and SMB client impact, propagation behavior, and concurrent administrator changes. |
 | Recovery qualification | Demonstrate exact owner/group/DACL/control and identity verification per affected path, drift-refused guarded rollback, and safe behavior under crashes, timeouts, partial propagation, and interrupted journals. DACL-only `icacls` backups are insufficient. |
 | Manual validation evidence | Complete the external test matrix with actual approved commands/results, accounts, UTC times, reviewers, platform bindings, and archived source/evidence hashes. Passing read-only preflight or matching captured descriptors is not qualification. |

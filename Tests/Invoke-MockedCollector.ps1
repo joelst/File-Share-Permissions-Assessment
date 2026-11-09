@@ -11,6 +11,8 @@
 
 param([Parameter(Mandatory=$true)][string]$OutputRoot,[switch]$FailChecksum,[switch]$DuplicateScopes,[switch]$LocalContainment,[switch]$LocalExplicitContainment,[switch]$ExplicitContainment,[switch]$ExcludedOnly,[string]$OntapCsv,[switch]$BestPractices,[string]$PolicyPath,[switch]$Audit,[switch]$FailServerConfiguration,[switch]$ExplicitUnc,[switch]$LocalScan)
 $ErrorActionPreference='Stop'
+# Load built-ins before defining mocks so Windows PowerShell autoload cannot shadow them.
+Import-Module Microsoft.PowerShell.Utility,Microsoft.PowerShell.Management -ErrorAction Stop
 $env:COMPUTERNAME='MOCK'
 $global:NtfsTestFailChecksum=[bool]$FailChecksum
 $global:NtfsTestFailServerConfiguration=[bool]$FailServerConfiguration

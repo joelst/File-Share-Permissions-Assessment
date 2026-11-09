@@ -18,8 +18,8 @@ $script:NtfsVersions = @{
     Comparison = '1.0.4'
     Merge = '2.8.6'
     BestPractices = '1.1.2'
-    Permissions = '0.2.3-unqualified'
-    PermissionValidation = '0.1.2'
+    Permissions = '0.3.0-unqualified'
+    PermissionValidation = '0.1.3'
 }
 
 function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$Stage,[string]$Message='') {

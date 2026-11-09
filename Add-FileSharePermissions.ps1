@@ -21,7 +21,7 @@ directory, verified mapped drive (converted to UNC), or deep direct UNC and affe
 folders AND files. Default scope is ThisFolderSubfoldersAndFiles through existing
 inheritance only. Protected descendant boundaries are recorded, not traversed.
 No SMB share ACLs, inheritance toggles, or recursive explicit grants are written.
-Plans are review-only/Blocked, not executable. Native mutation is absent.
+Plans are review-only/Blocked, not executable. Public native mutation is absent.
 
 Requires Windows, RSAT ActiveDirectory group reads and sufficient read access.
 SMB plans read Windows-style filesystem ACLs on Windows, NetApp or generic NAS;
@@ -158,7 +158,7 @@ try {
             Write-NpEvent $journal 'RecoveryEvidence' $recovery.Status @("ManifestSHA256=$($recovery.ManifestSHA256)")
         }
         $status = 'Blocked'
-        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): live Apply/Revert disabled; no native ACL writer exists. Qualify this exact platform separately; Windows tests never qualify NetApp/NAS."
+        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): live Apply/Revert disabled; no qualified native ACL writer is connected to this entry point. Qualify this exact platform separately; Windows tests never qualify NetApp/NAS."
         Write-NpEvent $journal 'QualificationGate' 'Blocked/NotQualified' @("QualificationScope=$($targetDescriptor.QualificationScope); MutationNotQualified")
     } else {
         Write-Progress -Activity 'NTFS plan' -Status 'Validate every group before ACL inventory'

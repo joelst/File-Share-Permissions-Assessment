@@ -99,7 +99,8 @@ function Write-RunManifest($Directory,$RunId,$Completed,$Scopes,$Status,$AceCoun
 }
 function Invoke-Merge($InputPath,$OutputName,[int]$Throttle=1,[string]$Selection='LatestSuccessful',[int]$ExpectedExit=0,[string[]]$Extra=@()) {
     $output=Join-Path $testRoot $OutputName
-    $log=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'Merge-NtfsAssessment.ps1') -InputRoot $InputPath -OutputFolder $output -ThrottleLimit $Throttle -RunSelection $Selection @Extra 2>&1)
+    # Capture expected native stderr without PowerShell 5.1 stopping before exit-code checks.
+    $log=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'Merge-NtfsAssessment.ps1') -InputRoot $InputPath -OutputFolder $output -ThrottleLimit $Throttle -RunSelection $Selection @Extra 2>&1 })
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('merge-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Merge $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
@@ -133,7 +134,7 @@ function Invoke-Comparison([string]$OutputName,[int]$ExpectedExit,[string[]]$Arg
     $output=Join-Path $testRoot $OutputName
     $state=Join-Path $output 'comparison-state.json'
     $existingState=Test-Path -LiteralPath $state
-    $log=@(& $engine -NoLogo -NoProfile -File (Join-Path $root 'Compare-NtfsAssessment.ps1') -OutputFolder $output @Arguments 2>&1)
+    $log=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'Compare-NtfsAssessment.ps1') -OutputFolder $output @Arguments 2>&1 })
     $code=$LASTEXITCODE
     $log|Set-Content -LiteralPath (Join-Path $testRoot ('comparison-'+(Get-NtfsHash $OutputName)+'.log'))
     Assert ($code -eq $ExpectedExit) "Comparison $OutputName exit=$code expected=$ExpectedExit : $($log -join "`n")"
@@ -348,7 +349,7 @@ try {
     [void](Invoke-Merge (Split-Path $conflictRun -Parent) 'conflict-out' 2 'LatestSuccessful' 2)
     $script:TestArea='Collector end-to-end'
     $completeOutput=Join-Path $testRoot "complete collector O'Brien"
-    $completeLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $completeOutput -LocalScan 2>&1)
+    $completeLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $completeOutput -LocalScan 2>&1 })
     $completeCode=$LASTEXITCODE
     Assert ($completeCode -eq 0) "Complete local collector succeeds: $($completeLog -join "`n")"
     $completeRun=@(Get-ChildItem -LiteralPath $completeOutput -Directory)[0].FullName
@@ -358,7 +359,7 @@ try {
     Assert ($completeConsole.Contains("Output: $($completeRun)") -and $completeConsole.Contains((Join-Path $completeRun 'ShareCoverage.csv'))) 'Complete assessment shows its actual output and coverage paths'
     Assert (-not $completeConsole.Contains('Resolve/review:')) 'Complete assessment does not ask to resolve zero issues'
     $mockOutput=Join-Path $testRoot 'mocked-collector'
-    $mockLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $mockOutput 2>&1)
+    $mockLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $mockOutput 2>&1 })
     $code=$LASTEXITCODE
     $mockLog|Set-Content -LiteralPath (Join-Path $testRoot 'mocked-collector.log')
     Assert ($code -eq 1) "Full mocked collector exits with partial coverage: $code : $($mockLog -join "`n")"
@@ -382,7 +383,7 @@ try {
     Assert (@(Get-ChildItem -LiteralPath (Join-Path $mockRun 'PerShare') -File).Count -eq 2) 'Collector split-by-share copies created'
     [void](Invoke-Merge $mockOutput 'mocked-collector-merge-out' 2 'LatestSuccessful' 1)
     $failedOutput=Join-Path $testRoot 'failed-collector'
-    $failureLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $failedOutput -FailChecksum 2>&1)
+    $failureLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $failedOutput -FailChecksum 2>&1 })
     $failureCode=$LASTEXITCODE
     Assert ($failureCode -eq 2) "Checksum finalization failure exits 2: $($failureLog -join "`n")"
     Assert (($failureLog -join "`n").Contains('Assessment: Failed.') -and ($failureLog -join "`n").Contains('Do not merge or compare') -and -not ($failureLog -join "`n").Contains("-RunSelection 'Explicit'")) 'Failed assessment points to diagnostics without recommending a downstream command'
@@ -647,7 +648,7 @@ try {
     $uniqueShareRows=@(Get-UniqueSharePermissions @($shareOne,$shareTwo,$shareDeny,$shareAlias,$shareSvm))
     Assert ($uniqueShareRows.Count -eq 4) 'Share deduplication retains distinct shares, SVMs and deny rules while normalizing repeated evidence'
     $duplicateOutput=Join-Path $testRoot 'duplicate-collector'
-    $duplicateLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $duplicateOutput -DuplicateScopes 2>&1)
+    $duplicateLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $duplicateOutput -DuplicateScopes 2>&1 })
     Assert ($LASTEXITCODE -eq 1) "Duplicate-scope collector stays offline and reports depth limitations: $($duplicateLog -join "`n")"
     $duplicateRun=@(Get-ChildItem -LiteralPath $duplicateOutput -Directory)[0].FullName
     $duplicateManifest=Get-Content -LiteralPath (Join-Path $duplicateRun 'manifest.json') -Raw|ConvertFrom-Json
@@ -716,7 +717,7 @@ try {
             $faultOutput=Join-Path $testRoot "$tool-cleanup-$failAnalysis"
             $arguments=@('-Tool',$tool,'-InputPath',$historyOld,'-Baseline',$historyOld,'-Comparison',$identityNew,'-OutputFolder',$faultOutput)
             if($failAnalysis){$arguments+='-FailAnalysis'}
-            $faultLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-FaultedNtfs.ps1') @arguments 2>&1)
+            $faultLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-FaultedNtfs.ps1') @arguments 2>&1 })
             $faultExit=$LASTEXITCODE
             Assert ($faultExit -eq $(if($failAnalysis){2}else{1})) "$tool cleanup failure preserves chosen analysis exit severity: $($faultLog -join "`n")"
             $stateName=if($tool -eq 'Merge'){'merge-state.json'}else{'comparison-state.json'}
@@ -759,21 +760,21 @@ try {
     Assert ($ShareAcl.Count -eq 1 -and $ShareAcl[0].SID -eq 'S-1-1-0' -and $ShareAcl[0].Source -eq 'NetAppONTAP_CSV') 'Valid scoped ONTAP import retains SID, SVM and source'
     Assert ($Shares.Count -eq 1 -and $Shares[0].ShareMetadataStatus -eq 'ExplicitUNC') 'ONTAP imports never invent scopes or complete ACL coverage'
     $ontapOutput=Join-Path $testRoot 'ontap-collector'
-    $ontapLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $ontapOutput -OntapCsv $ontapPath 2>&1)
+    $ontapLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $ontapOutput -OntapCsv $ontapPath 2>&1 })
     Assert ($LASTEXITCODE -eq 1) "Scoped ONTAP explicit-UNC collector runs offline: $($ontapLog -join "`n")"
     $ontapRun=@(Get-ChildItem -LiteralPath $ontapOutput -Directory)[0].FullName
     Assert (@(Rows $ontapRun 'SharePermissions.csv').Count -eq 1 -and @(Rows $ontapRun 'ScanErrors.csv').Count -eq 0) 'ONTAP import validates after explicit UNC scopes are declared'
     $containmentOutput=Join-Path $testRoot 'rejected-local-output'
-    $containmentLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $containmentOutput -LocalContainment 2>&1)
+    $containmentLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $containmentOutput -LocalContainment 2>&1 })
     Assert ($LASTEXITCODE -ne 0 -and -not(Test-Path -LiteralPath $containmentOutput)) "Known local share containment rejected before any directory creation: $($containmentLog -join "`n")"
     $localExplicitOutput=Join-Path $testRoot 'rejected-local-explicit-output'
-    $containmentLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $localExplicitOutput -LocalExplicitContainment 2>&1)
+    $containmentLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $localExplicitOutput -LocalExplicitContainment 2>&1 })
     Assert ($LASTEXITCODE -ne 0 -and ($containmentLog -join "`n") -match 'outside assessed tree' -and -not(Test-Path -LiteralPath $localExplicitOutput)) 'Explicit UNC local-host alias discovers Windows mappings case-insensitively before output creation'
     $excludedOutput=Join-Path $testRoot 'excluded-share-output'
-    $excludedLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $excludedOutput -ExcludedOnly 2>&1)
+    $excludedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $excludedOutput -ExcludedOnly 2>&1 })
     Assert ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $excludedOutput)) "Excluded administrative shares do not prohibit safe output on their volumes: $($excludedLog -join "`n")"
     $explicitOutput='\\server\data\assessment-output'
-    $containmentLog=@(& $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $explicitOutput -ExplicitContainment 2>&1)
+    $containmentLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'Invoke-MockedCollector.ps1') -OutputRoot $explicitOutput -ExplicitContainment 2>&1 })
     Assert ($LASTEXITCODE -ne 0 -and ($containmentLog -join "`n") -match 'outside assessed tree' -and ($containmentLog -join "`n") -notmatch 'forbidden directory creation') 'Explicit UNC containment is rejected before any directory creation attempt'
     $OutputRoot='D:\Data\reports';$beforeShares=$Shares.Count
     $smb=[pscustomobject]@{Path='D:\Data'}

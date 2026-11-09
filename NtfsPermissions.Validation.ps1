@@ -23,7 +23,8 @@ function Assert-NvWindows {
 
 function Get-NvSources {
     $files = foreach ($name in @('Invoke-NtfsPermissionValidation.ps1','NtfsPermissions.Validation.ps1',
-        'Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1')) {
+        'Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1',
+        'NtfsPermissions.Local.ps1','NtfsPermissions.Local.cs')) {
         [pscustomobject][ordered]@{ Name=$name; SHA256=(Get-NpBytesHash ([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name)))) }
     }
     return @($files)
