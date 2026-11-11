@@ -20,6 +20,7 @@ $script:NtfsVersions = @{
     BestPractices = '1.1.2'
     Permissions = '0.3.0-unqualified'
     PermissionValidation = '0.1.3'
+    LabFixture = '1.0.0'
 }
 
 function Write-NtfsLog([string]$Path,[string]$Component,[string]$Level,[string]$Stage,[string]$Message='') {
@@ -139,6 +140,11 @@ function Write-NtfsCompletion {
         $escapedScript = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($nextScriptPath)
         $command = "& '{0}'" -f $escapedScript
         foreach ($entry in $nextParameters.GetEnumerator()) {
+            if ($entry.Value -is [Management.Automation.SwitchParameter]) {
+                $switchValue = $entry.Value.IsPresent.ToString().ToLowerInvariant()
+                $command += ' `'+ "`n" + ('    -{0}:${1}' -f $entry.Key,$switchValue)
+                continue
+            }
             $escapedValue = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$entry.Value)
             $command += ' `'+ "`n" + ("    -{0} '{1}'" -f $entry.Key,$escapedValue)
         }

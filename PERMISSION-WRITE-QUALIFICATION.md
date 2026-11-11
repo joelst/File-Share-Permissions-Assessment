@@ -14,6 +14,14 @@ gaps, and does not qualify any backend merely by passing tests.
 
 ## Targeted server lab runner
 
+For an initial corporate-style fixture, see the README's
+**creating a corporate-style disposable lab** workflow and
+`Tests\New-NtfsLabFixture.ps1`. It creates real disposable AD objects, AGDLP
+memberships, placeholder files, NTFS cases and an SMB share. It is separate from
+the evidence runner below, which does not provision users, groups or a share.
+The fixture does not replace dedicated crash, reparse, unsupported-ACL or
+backend-specific experiments.
+
 Run `Tests\Invoke-NtfsLabEvidence.ps1` on an **approved nonproduction file
 server**, preferably not a production domain controller. It collects useful
 diagnostics without requiring a target. Run separately on the file server and,

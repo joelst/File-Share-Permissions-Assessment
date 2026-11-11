@@ -22,6 +22,7 @@ qualify a platform for remediation.
 | `Compare-NtfsAssessment.ps1` | Compares two original assessment snapshots for directory ACL, owner/inheritance, share metadata, and share ACL differences. | After two snapshots exist; merge is not a prerequisite. |
 | `Add-FileSharePermissions.ps1` | Resolves AD security groups and inventories folders/files to create an abstract permission plan and audit journal. | Optional, separate planning workflow after review. Never an automatic next step from findings. |
 | `Invoke-NtfsPermissionValidation.ps1` | Creates a sealed case and records before/after observations around separately approved external manual actions. | Optional disposable-lab workflow; not a permission-change executor. |
+| `Tests\New-NtfsLabFixture.ps1` | Provisions fictional AD employees, AGDLP groups, placeholder files, varied NTFS ACLs and a new SMB share. | Disposable lab setup only; creates real domain objects and changes permissions only on its new fixture. |
 
 Keep all top-level `.ps1` and `.cs` files together. These supporting scripts are loaded by
 the entry points rather than run as standalone workflows:
@@ -325,6 +326,121 @@ than computed post-propagation descriptors. `NoOp` is not effective-access proof
 `Blocked/NotQualified` and exit nonzero without target writes, even with reviewed
 hashes, tickets, `-WhatIf`, or `-Confirm`. Recovery-evidence verification does not
 execute restoration. There is no force or experimental bypass.
+
+## Separate workflow: creating a corporate-style disposable lab
+
+On an **approved nonproduction domain-joined member file server**, run
+`Tests\New-NtfsLabFixture.ps1` from an elevated Windows PowerShell 5.1 session.
+Requires the RSAT `ActiveDirectory` module, `SmbShare`, a writable domain controller,
+and delegated rights to create OUs, users, security groups and memberships beneath
+an existing approved lab OU. The DC/OU must be in the file server's domain for
+Domain Local permissions. Do not run it on a domain controller.
+
+The default fixture includes:
+
+- **100 fictional employees:** one executive, eight department managers and 91
+  other staff, with names, titles, departments and AD manager reporting lines.
+  Departments are HR, Finance, IT, Sales, Marketing, Operations, Legal and Engineering.
+- **38 security groups:** accounts join Global role groups; those groups join
+  Domain Local groups; Domain Local groups receive NTFS grants (**AGDLP**).
+  Managers can modify their department; department Readers can read and Writers
+  can modify. Separate all-staff, managers and deny-test groups exercise other cases.
+- **58 directories and 169 small placeholder files:** department trees and
+  scenario trees contain `Projects\Current\Drafts`, text, CSV and JSON files.
+  A protected managers-only child has a sentinel file.
+- **Permission scenarios:** Everyone Read/Execute, Modify and FullControl on
+  three separate trees; explicit grants, inherited descendants, protected
+  inheritance and a narrowly scoped Write deny. A Write deny is not a Delete deny.
+- A new `NtfsLab-<id>` SMB share with encryption, access-based enumeration and
+  **Everyone:Full at the share layer**, intentionally leaving NTFS to distinguish
+  the cases. Everyone is **not** granted NTFS access at the lab root.
+
+All data is synthetic. Everyone scenarios are deliberately insecure test cases:
+any otherwise authorized SMB client may access their known paths, not just lab
+employees. Network-isolate the lab and use no real business data. ABE affects
+visibility, not access authorization. Administrator/SYSTEM and the provisioning
+operator retain full NTFS access; test access with the generated nonadministrator
+accounts, not the provisioning operator.
+
+Select **new** fixture and inventory paths whose parent directories already exist.
+Both must be local fixed NTFS paths, outside the checkout and existing
+nonadministrative shares, with no reparse ancestors. The script refuses existing
+paths and overlapping storage; it never reuses or resets existing users/groups.
+Independently verify aliases/backing storage and parent-directory trust.
+
+```powershell
+$labParameters = @{
+    rootPath = 'D:\NtfsLab'
+    evidencePath = 'C:\NtfsLabInventory'
+    parentOu = 'OU=Labs,DC=example,DC=test'
+    domainController = 'DC01.example.test'
+    employeeCount = 100
+    disposableAcknowledgement = $true
+}
+
+# Read-only preflight and proposed employees, groups, memberships and scenarios.
+$preview = .\Tests\New-NtfsLabFixture.ps1 @labParameters -WhatIf
+$preview.Plan.Users |
+    Select-Object DisplayName, Department, Title, Role, SamAccountName, ManagerSam
+
+# Prompts before provisioning real lab objects.
+$lab = .\Tests\New-NtfsLabFixture.ps1 @labParameters
+
+$assessmentParameters = @{
+    ComputerName = $env:COMPUTERNAME
+    IncludeShare = @($lab.ShareName)
+    OutputRoot = Join-Path $lab.EvidencePath 'Assessments'
+    ResolveActiveDirectory = $true
+    BestPractices = $true
+    HashOutputs = $true
+}
+.\Invoke-NtfsAssessment.ps1 @assessmentParameters
+```
+
+Replace the example domain, DC, OU and paths. Preview performs live read-only
+checks but does not prove delegated write permissions or freeze the generated
+random lab ID: the subsequent provisioning invocation builds its own new plan.
+Review the actual confirmation prompt. There is no dependency installation.
+
+**Accounts are disabled by default**, require no password and cannot sign in.
+This is sufficient for ACL collection and group-expansion assessment. For approved
+real-account access testing, replace the provisioning invocation above with:
+
+```powershell
+$initialLabPassword = Read-Host -Prompt 'Initial password for disposable lab accounts' -AsSecureString
+try {
+    $lab = .\Tests\New-NtfsLabFixture.ps1 @labParameters `
+        -enableAccounts -initialPassword $initialLabPassword
+} finally {
+    $initialLabPassword.Dispose()
+}
+```
+
+Use a unique lab-only password satisfying domain policy; never place it in code
+or logs. All accounts expire seven days after creation. Enabled accounts must
+change the initial password at first sign-in; complete that password change
+before SMB access tests. Accounts are enabled only after fixture/share setup.
+Wait for replication and sign in afresh for group membership tokens. File-server
+logon policy may independently block interactive sign-in; do not weaken that policy
+for this fixture. Use an approved domain-joined client for access tests.
+
+The protected inventory contains `manifest.json`, `employees.csv`,
+`scenarios.json`, `acl-inventory.csv`, `share-permissions.csv`, `operations.jsonl`
+and `provisioning.log`. The provisioner reads back group memberships, user
+attributes, explicit directory ACLs and SMB settings before reporting success.
+These observations are not effective-access tests or writer qualification.
+Assessment collects directory ACLs, not individual file ACLs.
+
+**Failures preserve partial objects and throw.** Inspect the manifest status,
+error and completed-operation journal; if evidence protection itself fails,
+diagnostics are console-only. A process crash can leave `Provisioning` status.
+Do not rerun against the existing directories or assume that a missing journal
+entry proves an operation did not happen. Cleanup is manual and separately
+approved: identify only this run's share, fixture and AD objects from its inventory,
+verify their identities, remove the share before files, and remove only the
+generated lab OU after reviewing/unsetting accidental-deletion protection.
+Never delete the supplied parent OU or unrelated objects. Archive the inventory.
+Account expiry does not remove the share, files or AD objects.
 
 ## Separate workflow: disposable-lab validation
 

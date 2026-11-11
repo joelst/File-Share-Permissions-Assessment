@@ -74,6 +74,31 @@ Describe 'NTFS assessment offline regression coverage' {
             $commandAst.CommandElements[4].Value | Should -BeExactly $path
             $commandAst.CommandElements[6].Value | Should -BeExactly "$($path)\reports"
         }
+        It 'renders true and false switches as bound switches rather than quoted positional strings' {
+            function Test-CompletionSwitchBinding {
+                <#
+                .SYNOPSIS
+                Captures switch binding from a rendered next-step command.
+                #>
+                [CmdletBinding()]
+                param([switch]$enabled, [switch]$disabled)
+                [pscustomobject]@{
+                    Enabled = $enabled.IsPresent
+                    Disabled = $disabled.IsPresent
+                    BoundCount = $PSBoundParameters.Count
+                }
+            }
+            $parameters = [ordered]@{
+                enabled = [Management.Automation.SwitchParameter]$true
+                disabled = [Management.Automation.SwitchParameter]$false
+            }
+            $records = @(Write-NtfsCompletion -component Assessment -status Completed -nextStep 'Review this command.' `
+                -nextScriptPath 'Test-CompletionSwitchBinding' -nextParameters $parameters 6>&1)
+            $bound = & ([scriptblock]::Create([string]$records[-1].MessageData))
+            $bound.Enabled | Should -BeTrue
+            $bound.Disabled | Should -BeFalse
+            $bound.BoundCount | Should -Be 2
+        }
         It 'prioritizes missing evidence and bounds displayed reason groups without hiding totals' {
             $reasons=@([pscustomobject]@{Status='NotAssessed';Count=1;Reason='SMB configuration was not collected.'})
             $reasons+=@(1..6|ForEach-Object{[pscustomobject]@{Count=10;Reason="Contextual warning $($_)"}})
