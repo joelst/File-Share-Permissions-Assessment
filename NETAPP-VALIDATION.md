@@ -31,6 +31,25 @@ evidence, not just a zero exit code.
   commit them, passwords or credentials to Git. Archive evidence and hashes
   independently; local hashes are not authentication.
 
+## Observed isolated SMB behavior
+
+During an isolated, disposable SMB fixture check on 2026-11-13, an external
+folder-only allow ACE caused the server to set the DACL auto-inherited control
+flag on the changed directory and unprotected descendants. The toolkit's
+read-only validation correctly reported the Apply comparison as `Failed` in
+both PowerShell editions; descendant ACE contents and file hashes had not
+changed, but the descriptors had. A guarded external recovery restored every
+captured descriptor and file hash, and both editions then observed exact
+captured descriptors after recovery.
+
+This is a backend behavior observation, not an Apply/Revert qualification or
+an expected propagation rule. Preserve a per-path descriptor baseline, stop on
+any unexpected control-flag or descendant change, and independently verify
+recovery before further action. The original failed Apply observation remains
+part of the evidence; a successful recovery does not convert it to a pass.
+Backend identity, security style, share ACL completeness, effective access,
+and stable physical identity remain unverified.
+
 ## Before starting billable NAS time
 
 1. Freeze the checkout, record commit and dirty diff and hash every script used.

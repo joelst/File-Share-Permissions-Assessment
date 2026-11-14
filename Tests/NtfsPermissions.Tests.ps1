@@ -16,7 +16,9 @@ BeforeAll {
     function New-TestSnapshot([string]$Path = '\\SERVER1\Share1\Folder', [string]$Kind = 'Folder', [bool]$Protected = $false) {
         [pscustomobject][ordered]@{
             Path=$Path; Kind=$Kind; Identity="fixture-volume:file-id:$Path"
-            Owner='S-1-5-18'; Group='S-1-5-32-544'; Control=32772; Protected=$Protected
+            Owner='S-1-5-18'; Group='S-1-5-32-544'
+            Control=[int]([Security.AccessControl.ControlFlags]::SelfRelative -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent)
+            Protected=$Protected
             DaclPresent=$true; Canonical=$true; Aces=@(); Descriptor="fixture-before:$Path"
         }
     }
