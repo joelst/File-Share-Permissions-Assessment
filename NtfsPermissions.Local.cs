@@ -10,7 +10,7 @@ using Microsoft.Win32.SafeHandles;
 
 namespace NtfsPermissions.LocalCandidate
 {
-    // Internal candidate only. Public Apply/Revert do not load or invoke this adapter.
+    // Handle-pinned pure-SMB and local-NTFS DACL lease adapter (zero ONTAP CLI/API dependency).
     public sealed class Lease : IDisposable
     {
         public const string SourceSHA256 = "__SOURCE_SHA256__";
@@ -20,21 +20,75 @@ namespace NtfsPermissions.LocalCandidate
         private const uint ReadDataOrListDirectory = 0x1;
         private const uint OpenExisting = 3;
         private const uint BackupAndOpenReparse = 0x02200000;
+        private const uint PersistentAcls = 0x8;
+        private const ushort SeDaclAutoInheritReq = 0x0100;
         private readonly List<SafeFileHandle> ancestors = new List<SafeFileHandle>();
         private SafeFileHandle handle;
         private readonly bool writable;
+        private readonly bool isUnc;
         private readonly string volumeRoot;
+        private readonly string shareRoot;
         private readonly string identity;
         private bool disposed;
 
         public string Path { get; private set; }
-        public string PhysicalPath { get { return volumeRoot + Path.Substring(3); } }
+        public string PhysicalPath
+        {
+            get { return isUnc ? (@"\\?\UNC\" + Path.Substring(2)) : (volumeRoot + Path.Substring(3)); }
+        }
         public bool Writable { get { return writable; } }
 
         private Lease(string path, bool writeAccess, bool auditDirectory)
         {
             if (Environment.OSVersion.Platform != PlatformID.Win32NT)
                 throw new PlatformNotSupportedException("The local candidate requires Windows.");
+            if (String.IsNullOrWhiteSpace(path))
+                throw new ArgumentException("Only direct local paths below a fixed NTFS drive root or direct UNC paths are supported.");
+
+            if (!auditDirectory && path.StartsWith(@"\\"))
+            {
+                if (path.StartsWith(@"\\?\") || path.StartsWith(@"\\.\") ||
+                    !Regex.IsMatch(path, @"^\\\\[^\\]+\\[^\\]+(?:\\[^\\]+)*$") ||
+                    Regex.IsMatch(path.Substring(2), "[/\\x00-\\x1f:*?\"<>|]"))
+                    throw new ArgumentException("Only static direct UNC server/share paths without device prefixes or wildcards are supported.");
+                string[] uncParts = path.Substring(2).Split('\\');
+                foreach (string part in uncParts)
+                    if (part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" ") ||
+                        Regex.IsMatch(part, @"^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)"))
+                        throw new ArgumentException("Ambiguous UNC path component.");
+
+                isUnc = true;
+                Path = path;
+                writable = writeAccess;
+                volumeRoot = "";
+                shareRoot = @"\\" + uncParts[0] + @"\" + uncParts[1];
+
+                try
+                {
+                    if (uncParts.Length > 2)
+                    {
+                        string ancestor = shareRoot;
+                        ancestors.Add(OpenChecked(ancestor, ReadAttributes, 3));
+                        for (int i = 2; i < uncParts.Length - 1; i++)
+                        {
+                            ancestor = ancestor + @"\" + uncParts[i];
+                            ancestors.Add(OpenChecked(ancestor, ReadAttributes, 3));
+                        }
+                    }
+                    handle = OpenChecked(Path, ReadControl | ReadAttributes | ReadDataOrListDirectory | (writable ? WriteDac : 0), 0u);
+                    identity = ReadIdentity(handle);
+                    Snapshot initial = Read();
+                    if (uncParts.Length == 2 && initial.Kind != "Folder")
+                        throw new InvalidOperationException("SMB share root must be a directory.");
+                }
+                catch
+                {
+                    Dispose();
+                    throw;
+                }
+                return;
+            }
+
             if (!Regex.IsMatch(path, @"^[A-Za-z]:\\[^\\]+(?:\\[^\\]+)*$") ||
                 Regex.IsMatch(path.Substring(3), "[/\\x00-\\x1f:*?\"<>|]"))
                 throw new ArgumentException("Only direct local paths below a fixed NTFS drive root are supported.");
@@ -43,6 +97,8 @@ namespace NtfsPermissions.LocalCandidate
                     Regex.IsMatch(part, @"^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)"))
                     throw new ArgumentException("Ambiguous local path component.");
 
+            isUnc = false;
+            shareRoot = "";
             Path = char.ToUpperInvariant(path[0]) + path.Substring(1);
             writable = writeAccess;
             string driveRoot = Path.Substring(0, 3);
@@ -92,12 +148,22 @@ namespace NtfsPermissions.LocalCandidate
 
         private SafeFileHandle OpenChecked(string path, uint access, uint sharing)
         {
-            SafeFileHandle result = CreateFileW(path, access, sharing, IntPtr.Zero,
-                OpenExisting, BackupAndOpenReparse, IntPtr.Zero);
-            if (result.IsInvalid)
+            SafeFileHandle result = null;
+            int error = 0;
+            int maxAttempts = (isUnc && sharing == 0u) ? 4 : 1;
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                int error = Marshal.GetLastWin32Error();
+                if (attempt > 0) System.Threading.Thread.Sleep(50);
+                result = CreateFileW(path, access, sharing, IntPtr.Zero,
+                    OpenExisting, BackupAndOpenReparse, IntPtr.Zero);
+                if (!result.IsInvalid) break;
+                error = Marshal.GetLastWin32Error();
                 result.Dispose();
+                result = null;
+                if (error != 32) break;
+            }
+            if (result == null)
+            {
                 throw new Win32Exception(error, "Cannot pin local NTFS path: " + path);
             }
             try
@@ -122,10 +188,12 @@ namespace NtfsPermissions.LocalCandidate
                 throw new InvalidOperationException("Hard-linked files are unsupported: " + path);
 
             StringBuilder name = new StringBuilder(32768);
-            uint length = GetFinalPathNameByHandleW(file, name, (uint)name.Capacity, 1);
+            uint length = GetFinalPathNameByHandleW(file, name, (uint)name.Capacity, isUnc ? 0u : 1u);
+            if (length == 0 && isUnc && Marshal.GetLastWin32Error() == 32)
+                length = GetFinalPathNameByHandleW(file, name, (uint)name.Capacity, 8u);
             if (length == 0) ThrowLastError("Resolve handle namespace");
             if (length >= name.Capacity) throw new InvalidOperationException("Handle namespace exceeds the path bound.");
-            string expected = volumeRoot + path.Substring(3);
+            string expected = isUnc ? (@"\\?\UNC\" + path.Substring(2)) : (volumeRoot + path.Substring(3));
             if (!String.Equals(name.ToString().TrimEnd('\\'), expected.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Drive alias, short-name, or physical namespace mismatch: " + path);
 
@@ -133,17 +201,45 @@ namespace NtfsPermissions.LocalCandidate
             uint serial, maximum, flags;
             if (!GetVolumeInformationByHandleW(file, null, 0, out serial, out maximum, out flags,
                 filesystem, (uint)filesystem.Capacity)) ThrowLastError("Read handle filesystem");
-            if (!String.Equals(filesystem.ToString(), "NTFS", StringComparison.Ordinal))
+            if (!String.Equals(filesystem.ToString(), "NTFS", StringComparison.OrdinalIgnoreCase) ||
+                (flags & PersistentAcls) == 0)
                 throw new InvalidOperationException("The pinned object is not on NTFS.");
         }
 
         private string ReadIdentity(SafeFileHandle file)
         {
             byte[] id = new byte[24]; // FILE_ID_INFO: volume serial (64 bits), file ID (128 bits).
-            if (!GetFileInformationByHandleEx(file, 18, id, (uint)id.Length))
-                ThrowLastError("Read stable FILE_ID_INFO");
-            return "LocalNTFS:" + Environment.MachineName + ":" + volumeRoot + ":" +
-                BitConverter.ToString(id).Replace("-", "");
+            if (!isUnc)
+            {
+                if (!GetFileInformationByHandleEx(file, 18, id, (uint)id.Length))
+                    ThrowLastError("Read stable FILE_ID_INFO");
+                return "LocalNTFS:" + Environment.MachineName + ":" + volumeRoot + ":" +
+                    BitConverter.ToString(id).Replace("-", "");
+            }
+
+            if (GetFileInformationByHandleEx(file, 18, id, (uint)id.Length))
+            {
+                bool nonZero = false;
+                for (int i = 8; i < 24; i++)
+                {
+                    if (id[i] != 0) { nonZero = true; break; }
+                }
+                if (!nonZero) throw new InvalidOperationException("SMB 128-bit file identifier is zero: " + Path);
+                return "SMB:" + shareRoot.ToUpperInvariant() + ":FID128:" +
+                    BitConverter.ToString(id).Replace("-", "");
+            }
+            int error = Marshal.GetLastWin32Error();
+            if (error != 87 && error != 50 && error != 124 && error != 1)
+                throw new Win32Exception(error, "Read SMB FILE_ID_INFO");
+
+            FileInformation info;
+            if (!GetFileInformationByHandle(file, out info))
+                ThrowLastError("Read SMB file index");
+            ulong index = ((ulong)info.IndexHigh << 32) | info.IndexLow;
+            if (index == 0)
+                throw new InvalidOperationException("SMB 64-bit file identifier is zero: " + Path);
+            return "SMB:" + shareRoot.ToUpperInvariant() + ":FID64:" +
+                info.VolumeSerial.ToString("X8") + ":" + index.ToString("X16");
         }
 
         public Snapshot Read()
@@ -225,18 +321,28 @@ namespace NtfsPermissions.LocalCandidate
                 current.ControlFlags != desired.ControlFlags)
                 throw new InvalidOperationException("Only DACL changes are supported; owner/group/control must be preserved.");
             if (String.Equals(expectedDescriptor, desiredDescriptor, StringComparison.Ordinal)) return before;
-            byte[] bytes = new byte[desired.DiscretionaryAcl.BinaryLength];
-            desired.DiscretionaryAcl.GetBinaryForm(bytes, 0);
-            GCHandle pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-            try
+            bool prot = (desired.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0;
+            bool autoInherited = (desired.ControlFlags & ControlFlags.DiscretionaryAclAutoInherited) != 0;
+            uint securityInformation = 4u | (prot ? 0x80000000u : 0x20000000u);
+            byte[] sdBytes = new byte[desired.BinaryLength];
+            desired.GetBinaryForm(sdBytes, 0);
+            ushort control = BitConverter.ToUInt16(sdBytes, 2);
+            if (autoInherited)
+                control = (ushort)(control | SeDaclAutoInheritReq);
+            else
+                control = (ushort)(control & ~SeDaclAutoInheritReq);
+            byte[] controlBytes = BitConverter.GetBytes(control);
+            sdBytes[2] = controlBytes[0];
+            sdBytes[3] = controlBytes[1];
+            // Write the exact self-relative DACL control flags via NtSetSecurityObject so
+            // non-auto-inherited SMB/WAFL descriptors never silently gain SE_DACL_AUTO_INHERITED.
+            int status = NtSetSecurityObject(handle, securityInformation, sdBytes);
+            if (status != 0)
             {
-                // The coordinator writes and verifies each approved state separately. Zero-share
-                // handles do not universally prevent implicit descendant inheritance changes.
-                uint error = SetSecurityInfo(handle, 1, 4, IntPtr.Zero, IntPtr.Zero,
-                    pinned.AddrOfPinnedObject(), IntPtr.Zero);
-                if (error != 0) throw new Win32Exception((int)error, "Set handle DACL (outcome requires review)");
+                uint winError = RtlNtStatusToDosError(status);
+                throw new Win32Exception(winError != 0 ? (int)winError : status,
+                    "Set handle DACL (NTSTATUS 0x" + status.ToString("X8") + "; outcome requires review)");
             }
-            finally { pinned.Free(); }
             Snapshot after = Read();
             if (!String.Equals(after.Descriptor, desiredDescriptor, StringComparison.Ordinal))
                 throw new InvalidOperationException("Post-write descriptor mismatch; outcome is indeterminate.");
@@ -276,7 +382,7 @@ namespace NtfsPermissions.LocalCandidate
                         if (!names.Add(name) || name.IndexOfAny(new char[] { '\\', '/', '\0' }) >= 0)
                             throw new InvalidOperationException("Duplicate or invalid directory name.");
                         if (children.Count >= limit) throw new InvalidOperationException("Directory path limit reached.");
-                        children.Add(System.IO.Path.Combine(Path, name));
+                        children.Add(Path.TrimEnd('\\') + @"\" + name);
                     }
                     if (next == 0) break;
                     if (next % 8 != 0 || next < 68 + nameLength || next > buffer.Length - offset - 68)
@@ -346,9 +452,10 @@ namespace NtfsPermissions.LocalCandidate
             out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
         [DllImport("advapi32.dll")]
         private static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
-        [DllImport("advapi32.dll")]
-        private static extern uint SetSecurityInfo(SafeFileHandle file, int type, uint sections, IntPtr owner,
-            IntPtr group, IntPtr dacl, IntPtr sacl);
+        [DllImport("ntdll.dll")]
+        private static extern int NtSetSecurityObject(SafeFileHandle handle, uint securityInformation, byte[] securityDescriptor);
+        [DllImport("ntdll.dll")]
+        private static extern uint RtlNtStatusToDosError(int status);
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
     }

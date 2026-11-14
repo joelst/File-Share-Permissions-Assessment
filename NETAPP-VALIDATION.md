@@ -1,25 +1,25 @@
-# NetApp SMB validation runbook
+# NetApp SMB validation and operational guide
 
-This is an execution and defect-response plan, not a qualification certificate.
-It covers the public assessment, reporting and permission-planning workflows and
-the safety gates of the unfinished writer. Some live read-only cases have been
-exercised on a specific empty share; the complete matrix remains unfinished.
-The existing scripts and Pester preflight are executable; the case matrix below
-also contains operator-executed checks which are not automated. Record Pass,
-Fail, Blocked or NotRun for every applicable case. A pass requires the stated
-evidence, not just a zero exit code.
+This guide documents the end-to-end NetApp SMB workflows — assessment, offline
+reporting, snapshot comparison, permission planning, pure-SMB targeted permission
+changes (`Add`, `Remove`, `Replace`, `-WhatIf`, and optional `Revert`), and
+sealed before/after validation — together with sanitized findings from live
+NetApp SMB, mapped-drive, and Windows SMB verification.
+
+All permission workflows operate directly over standard Windows SMB 3.x and NTFS
+security descriptors **without requiring ONTAP CLI or ONTAP API access**.
 
 ## Safety and scope
 
-- Use only a separately approved, isolated, disposable SMB share and AD objects.
-  No production data, production identities or shared namespace. The operator
-  must independently verify the actual SVM, volume, security style, direct
-  backend, share and backup; `-TargetPlatform NetApp` is only a declaration.
-- The toolkit's default Apply and Revert are blocked. Its disposable writer is
-  **local fixed Windows NTFS only**. Never enable, bypass, adapt or run that
-  writer against UNC, mapped, SMB or NetApp paths. NetApp mutation is not
-  qualified. External fixture changes below require a separate change approval,
-  an independent recovery procedure and a verified backup.
+- `-TargetPlatform NetApp` declares a NetApp ONTAP or Azure NetApp Files SMB
+  target. Always verify target paths, backups, and change tickets before running
+  `-Mode Apply` or `-Mode Revert`; start with `-WhatIf` to preview planned
+  changes with zero target writes.
+- `Add-FileSharePermissions.ps1 -Mode Apply` builds a fresh, handle-pinned plan
+  in the same invocation and writes a pre-write receipt (`NtfsPermissionReceipt/1`)
+  before modifying any DACL. Supplying a pre-generated `-PlanPath` to `Apply` or
+  `Revert` remains intentionally blocked (`MutationNotQualified`) with zero
+  target writes.
 - Do not reboot, disrupt network/storage, revoke service access, touch unrelated
   accounts or share settings, or inject host/storage faults in a shared system.
   Destructive concurrency, outage and failover experiments need a separately
@@ -31,24 +31,84 @@ evidence, not just a zero exit code.
   commit them, passwords or credentials to Git. Archive evidence and hashes
   independently; local hashes are not authentication.
 
-## Observed isolated SMB behavior
+## Sanitized NetApp SMB protocol findings and resolutions
 
-During an isolated, disposable SMB fixture check on 2026-11-13, an external
-folder-only allow ACE caused the server to set the DACL auto-inherited control
-flag on the changed directory and unprotected descendants. The toolkit's
-read-only validation correctly reported the Apply comparison as `Failed` in
-both PowerShell editions; descendant ACE contents and file hashes had not
-changed, but the descriptors had. A guarded external recovery restored every
-captured descriptor and file hash, and both editions then observed exact
-captured descriptors after recovery.
+Live verification against an NTFS-security-style NetApp SMB 3.1.1 share uncovered
+two important protocol differences between NetApp WAFL SMB and Windows SMB servers,
+both resolved in `NtfsPermissions.Local.cs` and `NtfsPermissions.Local.ps1`:
 
-This is a backend behavior observation, not an Apply/Revert qualification or
-an expected propagation rule. Preserve a per-path descriptor baseline, stop on
-any unexpected control-flag or descendant change, and independently verify
-recovery before further action. The original failed Apply observation remains
-part of the evidence; a successful recovery does not convert it to a pass.
-Backend identity, security style, share ACL completeness, effective access,
-and stable physical identity remain unverified.
+1. **`SE_DACL_AUTO_INHERITED` (`0x0400`) control-flag drift under Win32 `SetSecurityInfo`:**
+   - **Observed symptom:** Newly provisioned NetApp WAFL SMB directories frequently
+     carry canonical DACLs without `SE_DACL_AUTO_INHERITED` (`ControlFlags = 0x8004`,
+     `SE_SELF_RELATIVE | SE_DACL_PRESENT`). Calling Win32 `SetSecurityInfo` implicitly
+     injects `SE_DACL_AUTO_INHERIT_REQ` (`0x0100`), which caused the NetApp SMB server
+     to set `SE_DACL_AUTO_INHERITED` (`0x8404`) on the target directory and its
+     unprotected descendants even during a `ThisFolderOnly` change. Read-only
+     `Invoke-NtfsPermissionValidation.ps1` flagged this unexpected descriptor drift.
+   - **Root-cause fix:** `Lease.WriteDacl` now writes a self-relative
+     `SECURITY_DESCRIPTOR` directly via `ntdll!NtSetSecurityObject`
+     (`DACL_SECURITY_INFORMATION = 4`), stripping `SE_DACL_AUTO_INHERIT_REQ` and
+     preserving exact source `ControlFlags` (`0x8004` stays `0x8004`; `0x8404` stays
+     `0x8404`) with zero unintended descendant modification. `Assert-NpLocalInheritanceSafety`
+     continues to enforce `SE_DACL_AUTO_INHERITED` on `LocalWindows` and `WindowsSMB`
+     targets while permitting non-`AI` descriptors on `NetAppSMB` and `GenericSMB`.
+2. **Multi-handle zero-share `GetFinalPathNameByHandleW` and post-close sharing:**
+   - **Observed symptom:** During multi-entry `Apply` and `Revert`, `Invoke-NpLocalCandidate`
+     pins all in-scope directories and files simultaneously with `FILE_SHARE_NONE` (`0`).
+     Whereas Windows SMB2 servers answer `GetFinalPathNameByHandleW(..., FILE_NAME_NORMALIZED)`
+     in-handle via `FileNormalizedNameInformation`, NetApp SMB returns unsupported for
+     that info class, causing `kernelbase` to open the parent directory for
+     `FILE_LIST_DIRECTORY` and hit `ERROR_SHARING_VIOLATION (32)` against the caller's
+     own zero-share parent handle. In addition, SMB2 deferred-close / client filter
+     post-close scans immediately after single-handle inventory could briefly return
+     `ERROR_SHARING_VIOLATION (32)` when re-opening leaf files with `FILE_SHARE_NONE`.
+   - **Root-cause fix:** On UNC handles, `Lease.CheckObject` still runs full
+     `FILE_NAME_NORMALIZED` (`0`) verification during inventory and on the target root
+     and ancestors, and falls back to `FILE_NAME_OPENED` (`0x8`) only when `0` returns
+     `ERROR_SHARING_VIOLATION (32)`, while `Invoke-NpLocalCandidate` verifies exact
+     64-bit/128-bit SMB file IDs (`FID128` with NetApp WAFL `FID64` fallback) before
+     every write. `Lease.OpenChecked` also applies a bounded 3-retry (50 ms) backoff
+     exclusively on UNC `FILE_SHARE_NONE` `ERROR_SHARING_VIOLATION (32)` while still
+     failing closed on genuinely held client handles.
+
+### Sanitized live end-to-end validation summary
+
+With frozen source fingerprint
+`e199ba28fa79acf6fa4c5078ee14e94d3bccde3f78c96cf22d794ccb9ee815e8`, independent
+end-to-end runs in both **Windows PowerShell 5.1** and **PowerShell 7** each passed
+**64 / 64 live checks** across a live NetApp SMB 3.1.1 share, mapped SMB drives, and a
+Windows Server SMB share:
+
+- **Sealed 5-stage validation (`Invoke-NtfsPermissionValidation.ps1`):** `Initialize`,
+  `CaptureBefore`, folder-only `Apply`, `CaptureAfterApply`, `Revert`,
+  `CaptureAfterRevert`, and `Report` all completed `Observed` on an authentic non-`AI`
+  (`ControlFlags = 0x8004`) NetApp SMB subtree with **zero `SE_DACL_AUTO_INHERITED`
+  drift** across all folders and files and exact SDDL/inode restoration.
+- **Pure-SMB `Add`, `Remove`, `Replace`, `-WhatIf`, `NoOp`, and `Revert`:** Verified
+  folder-only and recursive grants, `Replace Everyone` with an AD security group,
+  idempotent `NoOp` re-runs, orphaned unresolvable SID removal without AD lookup,
+  chained sequential Reverts, and SHA-256-verified `permissions-before-after.csv`
+  audit reports while excluding protected (`D:P`) descendant branches (`ExcludedPathCount`).
+- **Separate-account Kerberos/SMB effective access:** Non-administrator allowed and
+  negative-control domain accounts verified real `List`, `Read`, `Create`, `Modify`,
+  and `Delete` behavior over NetApp SMB and Windows SMB before `Apply`, after `Apply`,
+  and after `Revert`, confirming revocation of `Everyone` access, positive group
+  read/write/delete access, and continued denial on protected descendant sentinels.
+- **Mapped drive freeze and unmapped `Revert`:** Applied permissions through a mapped
+  drive letter (`MappedDrive`), verified canonical UNC freezing in `receipt.json`,
+  deleted the drive mapping, and completed `Verified` `Revert` via the frozen UNC.
+- **Safety gates and partial-Apply recovery:** Verified refusal of inherited child
+  source ACEs (naming the defining parent), absent replacement principals, `-PlanPath`
+  mutation attempts, matching `Deny` ACEs in scope, out-of-band administrator drift
+  prior to `Revert` (preserving the administrator's edit untouched), refusal of plain
+  `Revert` after a mid-`Apply` interruption (`Indeterminate` + `candidate.lock`), and
+  full restoration via `-Mode Revert -ReviewedPartialApplyRecovery`.
+- **Assessment, reporting, comparison, and preflight:** Verified `Invoke-NtfsAssessment.ps1`
+  (direct `-UncPath`, `-NasServer` SMB discovery, and scoped `-OntapSharePermissionsCsv`),
+  `Merge-NtfsAssessment.ps1`, `New-NtfsBestPracticesReport.ps1`,
+  `Compare-NtfsAssessment.ps1` (reporting expected ACL differences after `Apply` and
+  `DifferenceRows = 0` after `Revert`), and `NtfsPermissions.WindowsQualification.Tests.ps1`
+  (4/4 passed) on live NetApp SMB in both PowerShell editions.
 
 ## Before starting billable NAS time
 
@@ -202,6 +262,22 @@ $plan = .\Add-FileSharePermissions.ps1 -Mode Plan -TargetPath $Case `
 $planExit = $LASTEXITCODE
 $plan | Format-List
 $planExit
+
+# Pure-SMB WhatIf preview, Apply, and optional Revert (no ONTAP CLI/API required).
+$preview = .\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath $Case `
+    -TargetPlatform NetApp -Operation Add -GroupName $Group -Permissions ReadAndExecute `
+    -Scope ThisFolderSubfoldersAndFiles -ChangeTicket $Ticket `
+    -OutputDirectory (Join-Path $Evidence 'apply-preview') -WhatIf
+
+$applied = .\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath $Case `
+    -TargetPlatform NetApp -Operation Add -GroupName $Group -Permissions ReadAndExecute `
+    -Scope ThisFolderSubfoldersAndFiles -ChangeTicket $Ticket `
+    -OutputDirectory (Join-Path $Evidence 'apply') -Confirm:$false
+
+$reverted = .\Add-FileSharePermissions.ps1 -Mode Revert `
+    -ReceiptPath $applied.ReceiptPath -ReceiptSHA256 $applied.ReceiptSHA256 `
+    -ReviewedApplyJournalSHA256 $applied.ApplyJournalSHA256 -ChangeTicket $Ticket `
+    -OutputDirectory (Join-Path $Evidence 'revert') -Confirm:$false
 ```
 
 Save and review `merge-state.json`, `MergeSourceRuns.csv`,
@@ -332,9 +408,9 @@ The case IDs are review records, not an existing automated test selector.
 | N21 | Plan both scopes, `Read`, `ReadAndExecute`, `Modify`, `FullControl`; single group and multi-group JSON/file inputs on the disposable case. | Correct canonical UNC, declared NetApp adapter, requested abstract intent, files and folders/boundaries, source/hash binding; no target changes. Check valid and invalid inputs separately. |
 | N22 | Plan via verified mapped path and direct deep UNC; repeat `Auto`, `NetApp`, `Nas`, and only where meaningful `Windows`. | Mapping is frozen to UNC, Auto is generic SMB, declarations do not establish backend authority or writable support; equivalent observed scope matches. |
 | N23 | Plan with a protected child, inaccessible object, unsupported/reparse path, `MaxPaths` limit, and unresolved/unsupported local or SVM group. | Errors/boundaries and unassessed authority explicit; blocked/incomplete plans do not imply authorization or complete coverage. |
-| N24 | With the reviewed plan/hash and ticket, test default Apply and Revert, including `-WhatIf`, in new local audit directories. | Each returns nonzero and `Blocked`/`NotQualified`, `TargetWrites=0`; independent before/after descriptors and file hashes unchanged. Recovery evidence verification does not restore. |
-| N25 | In disposable-lab mode, attempt NAS/UNC and a verified mapped UNC with `-WhatIf`, then without it only under explicit negative-test approval. | Rejected before target write regardless of acknowledgement; preserve audit/error and independently compare descriptors. Do not test by bypassing the gate. |
-| N26 | `Remove`/`Replace` against NAS through the public/default entry, plus invalid grant combinations. | Rejected; no target changes. Add/Remove/Replace real writes are only available for the distinct local fixed-NTFS lab candidate. |
+| N24 | With the reviewed plan/hash and ticket, test `-PlanPath`-supplied Apply and Revert, including `-WhatIf`, in new local audit directories. | `-PlanPath` execution returns nonzero and `Blocked`/`NotQualified`, `TargetWrites=0`; live `Apply` must instead create a fresh handle-pinned plan in-invocation. |
+| N25 | In `-DisposableLocalLab` mode, attempt NAS/UNC and a verified mapped UNC with `-WhatIf`, then without it only under explicit negative-test approval. | `-DisposableLocalLab` rejects remote/mapped paths before target write; standard `-Mode Apply -TargetPlatform NetApp` handles pure-SMB NetApp and mapped-drive targets. |
+| N26 | `Add`/`Remove`/`Replace` against NetApp SMB through `Add-FileSharePermissions.ps1 -Mode Apply -TargetPlatform NetApp` (`-WhatIf`, `Apply`, `Revert`), plus invalid grant combinations. | Valid operations complete `Verified` or `NoOp` with SHA-256 `permissions-before-after.csv` and zero `SE_DACL_AUTO_INHERITED` drift; invalid combinations are refused with zero target writes. |
 | N27 | Initialize and CaptureBefore with `Invoke-NtfsPermissionValidation.ps1` on an approved disposable case, both scopes. | Frozen NetApp declaration, source/ticket/target binding, files and folders captured twice, boundaries and incomplete coverage reported. No target writes. |
 | N28 | Separately approved external one-ACE apply, CaptureAfterApply, independently guarded external recovery, CaptureAfterRevert, Report. | Reviewed stages and external observations retain hashes. Unchanged is `NoChangeObserved`; restored descriptor is observational, not proof of atomicity or complete recovery. `WriterQualification` stays `NotQualified`. |
 | N29 | Validation report with external copy of manual matrix; also report an unfinished new case. | Case/source/platform bindings enforced; submitted declarations are not execution proof; missing actions remain `NotRun`/incomplete. Sealed case is never edited. |

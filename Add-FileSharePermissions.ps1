@@ -11,19 +11,30 @@
 # This script is not an official Microsoft product or supported Microsoft service.
 <#
 .SYNOPSIS
-Read-only planning and an explicit, unqualified disposable local-NTFS lab option.
+Pure Windows SMB and local NTFS permission planning, handle-pinned Apply, and optional Revert.
 .DESCRIPTION
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
 
-Matches the shared permissions engine and evidence version.
-Plan validates all security groups and snapshots a local fixed Windows NTFS
-directory, verified mapped drive (converted to UNC), or deep direct UNC and affected
-folders AND files. Default scope is ThisFolderSubfoldersAndFiles through existing
-inheritance only. Protected descendant boundaries are recorded, not traversed.
-No SMB share ACLs, inheritance toggles, or recursive explicit grants are written.
-Default plans are review-only/Blocked, not executable. The separate
--DisposableLocalLab option invokes the unqualified local candidate only after
-explicit acknowledgement and a ticket; it must never be used in production.
+Executes read-only permission planning (-Mode Plan) as well as handle-pinned
+permission changes (-Mode Apply) and optional evidence-bound rollback (-Mode Revert)
+across direct local fixed Windows NTFS, Windows SMB shares, NetApp ONTAP SMB shares,
+generic NAS SMB shares, and mapped drives (frozen once into canonical UNC) without
+requiring ONTAP CLI, ONTAP REST APIs, or a prior full-server assessment.
+
+Supported operations in -Mode Apply:
+- Add (default): Adds explicit allow ACEs for one or more AD security groups/SIDs.
+- Remove: Removes matching allow ACEs for -RemovePrincipal (Everyone, SID, or AD group)
+  within the selected unprotected scope while preserving unrelated ACEs and protected branches.
+- Replace: Removes matching allow ACEs for -RemovePrincipal and inserts replacement allow
+  ACEs preserving each removed ACE's inheritance flags.
+
+Standard Apply creates a fresh handle-pinned preimage plan in the same invocation,
+pins every in-scope handle with zero share access, writes exact self-relative DACL
+control flags via ntdll!NtSetSecurityObject (preventing SE_DACL_AUTO_INHERITED drift
+on NetApp WAFL SMB), verifies every path's descriptor and file identifier before and
+after writes, and emits receipt.json, events.jsonl, and permissions-before-after.csv.
+Use -WhatIf on -Mode Apply to preview without mutating target ACLs.
+Review-only plans created by -Mode Plan (-PlanPath) remain non-executable snapshots.
 
 Requires Windows, RSAT ActiveDirectory group reads and sufficient read access.
 SMB plans read Windows-style filesystem ACLs on Windows, NetApp or generic NAS;
@@ -45,62 +56,39 @@ Machine/SVM-local groups are unsupported; unknown authority fails closed.
 NoOp means unconditional matching-SID ACL coverage, not effective-access proof.
 Proposals are abstract intent models, NOT computed post-propagation descriptors.
 
-Apply/Revert require a reviewed SHA256 and ticket but always emit Blocked /
-NotQualified before any target write, including with WhatIf/Confirm. WhatIf never
-changes target permissions; local audit/evidence is still written. Approvals are not
-identity authorization; SHA256 and a local hash chain are not tamper-proof.
-Archive plans, manifests, source hashes and journals externally under enterprise
-access control. Audit/run locks are local only, not distributed locks. Output
-must be on a trusted local volume which is not the share's backing directory.
-Known same-named local SMB backing paths are checked and mapped output drives
-are rejected. The caller must independently validate remaining physical mappings
-(aliases, subst/8.3/DFS); this tool cannot prove them.
-Named target mutexes coordinate this host only (not aliases or other hosts).
-Toolkit assessment reports use the 100,000,000-byte CSV part cap; the verified
-disposable-lab before/after audit is a single streamed CSV.
-Revert can additionally review RecoveryManifestPath, RecoveryJournalPath and
-RecoveryJournalSHA256 together. This verifies source/evidence bindings only;
-it never authorizes or executes restoration.
+Review-only plans created by -Mode Plan (-PlanPath / -PlanSHA256) are abstract intent
+snapshots without pinned physical file IDs or computed post-propagation descriptors, so
+invoking -Mode Apply or -Mode Revert with -PlanPath always emits Blocked / NotQualified
+without target writes. Instead, invoke -Mode Apply directly with -TargetPath (building a
+fresh handle-pinned plan in the same run) and invoke -Mode Revert with -ReceiptPath,
+-ReceiptSHA256, and -ReviewedApplyJournalSHA256. WhatIf never changes target permissions;
+local audit/evidence is still written. Approvals are not identity authorization; SHA256
+and a local hash chain are not tamper-proof. Archive receipts, plans, manifests, source
+hashes and journals externally under enterprise access control. Audit/run locks are local
+only, not distributed locks. Output must be on a trusted local volume which is not the
+share's backing directory. Known same-named local SMB backing paths are checked and mapped
+output drives are rejected. The caller must independently validate remaining physical
+mappings (aliases, subst/8.3/DFS); this tool cannot prove them. Named target mutexes
+coordinate this host only (not aliases or other hosts). Toolkit assessment reports use
+the 100,000,000-byte CSV part cap; the verified before/after audit is a single streamed CSV.
 
-PlanningSupported does not mean writable support. MutationNotQualified applies
-independently to LocalWindows, WindowsSMB, NetAppSMB and GenericSMB; Windows tests
-cannot qualify NetApp/NAS. Apply/Revert exit nonzero after recording Blocked.
-Old plans without addressing/platform/recovery bindings require replanning.
-Qualification still required on disposable Windows NTFS and each isolated SMB backend:
-identity-bound handles and stable volume/file IDs; direct backend/DFS rejection;
-controlled propagation for both scopes; exclusive handle availability (fail if
-unavailable), consequences for SMB clients, and SetSecurityInfo inheritance vs
-exclusive-handle propagation suppression; concurrent administrator drift; exact
-DACL/owner/group/control and identity verification on every affected path; guarded
-per-path rollback under propagation, protected boundaries and crashes/timeouts.
-SetKernelObjectSecurity is unsupported for files and is never used.
-No Force bypass exists for default modes. Offline mocks do NOT qualify this release.
-Failures stop, preserve evidence and require explicit recovery review; never retry
-or auto-rollback. Torn journal tails are Indeterminate and retained unchanged.
-These default-mode statements do not describe the separate disposable opt-in.
-Each Apply creates a fresh plan in that same invocation; it cannot consume a
-previous plan or WhatIf preview. It persists exact native preimages and desired
-states before writes, then returns a receipt and Apply journal hashes. Retain the
-receipt hash independently and review the source-bound journal before Revert;
-hashes are not authentication. Revert requires the same source, the saved record,
-the receipt, its retained hash and the reviewed Apply journal hash. Recovery
-evidence does not expire after 24 hours. Partial Apply recovery additionally
-requires -ReviewedPartialApplyRecovery. Separate fresh audit directories are
-created; no automatic rollback or overwrite is performed.
-Only direct fixed local Windows NTFS is supported, never SMB, mapped drives or NAS.
-Non-atomic administrator and namespace races remain; this is not production ready.
-Before a write, all inventoried paths outside protected branches must have the
-DACL auto-inherited control flag; otherwise the operation is blocked. NoOp remains
-available. Zero-share handles do not guarantee that propagation is suppressed.
-The disposable option also supports -Operation Remove or Replace with
--RemovePrincipal Everyone, a SID, or an AD security group. It removes matching
-allow ACEs only in the selected unprotected scope. An inherited source ACE at
-the target, matching denies, and folder-only removal of inheritable ACEs are
-refused rather than changing inheritance or unrelated access. Replace requires
-the destination group and permissions and preserves each source ACE's inheritance
-flags; it adds no replacement ACE on a path without a source ACE. The requested
-rights can be broader than the source rights. A verified run returns a before/after
-permissions CSV.
+Each Apply creates a fresh plan in that same invocation; it cannot consume a previous
+plan or WhatIf preview. It persists exact native preimages and desired states before
+writes, then returns a receipt and Apply journal hashes. Retain the receipt hash
+independently and review the source-bound journal before Revert; hashes are not
+authentication. Revert requires the same source, the saved record, the receipt, its
+retained hash and the reviewed Apply journal hash. Recovery evidence does not expire
+after 24 hours. Partial Apply recovery additionally requires -ReviewedPartialApplyRecovery.
+Separate fresh audit directories are created; no automatic rollback or overwrite is
+performed. Failures stop, preserve evidence and require explicit recovery review; never
+retry or auto-rollback. Torn journal tails are Indeterminate and retained unchanged.
+For local Windows NTFS and Windows SMB targets, all inventoried paths outside protected
+branches must carry the DACL auto-inherited control flag before a write; NetApp ONTAP SMB
+and generic NAS SMB shares routinely omit that flag on WAFL/NAS descriptors and are
+written via ntdll!NtSetSecurityObject so exact DACL control flags are preserved without
+introducing SE_DACL_AUTO_INHERITED drift. Legacy -DisposableLocalLab +
+-DisposableAcknowledgement remains backward-compatible and restricted to direct local
+fixed Windows NTFS.
 .EXAMPLE
 .\Add-FileSharePermissions.ps1 -Mode Plan -TargetPath 'Z:\share\folder' -TargetPlatform Windows -GroupName 'DOMAIN\Readers' -Permissions ReadAndExecute -OutputDirectory C:\NtfsAudit
 Z: must be verified as fixed NTFS or an available mapped UNC in this logon context.
@@ -124,8 +112,14 @@ Review and retain the Apply evidence and hashes independently before Revert.
 .\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -Operation Replace -RemovePrincipal Everyone -TargetPath C:\DisposableLab\Fixture -GroupName 'DOMAIN\LabReaders' -Permissions ReadAndExecute -Scope ThisFolderSubfoldersAndFiles -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence -WhatIf
 Preview replacing explicit Everyone allow entries with the selected group.
 .EXAMPLE
-.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -Operation Remove -RemovePrincipal S-1-1-0 -TargetPath C:\DisposableLab\Fixture -Scope ThisFolderSubfoldersAndFiles -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence
-Remove Everyone allow entries in the selected disposable scope.
+.\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath '\\FILER1\Assessment\Finance' -TargetPlatform NetApp -Operation Replace -RemovePrincipal Everyone -GroupName 'DOMAIN\Finance-Modify' -Permissions Modify -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit -WhatIf
+Preview replacing Everyone allow ACEs over standard Windows SMB on NetApp (no ONTAP CLI/API required).
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath '\\FILER1\Assessment\Finance' -TargetPlatform NetApp -Operation Replace -RemovePrincipal Everyone -GroupName 'DOMAIN\Finance-Modify' -Permissions Modify -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit -Confirm:$false
+Execute handle-pinned Replace over SMB and write receipt.json, events.jsonl, and permissions-before-after.csv.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Revert -ReceiptPath C:\NtfsAudit\Permissions_RUN\receipt.json -ReceiptSHA256 RETAINED_RECEIPT_SHA256 -ReviewedApplyJournalSHA256 REVIEWED_APPLY_JOURNAL_SHA256 -ChangeTicket CHG123-REV -OutputDirectory C:\NtfsAudit -Confirm:$false
+Optional rollback using retained Apply receipt and journal SHA256 hashes.
 #>
 [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
@@ -177,11 +171,39 @@ if ($DisposableLocalLab) {
     if ($labResult.Status -in @('Blocked','Indeterminate')) { exit 2 }
     exit 0
 }
-if ($DisposableAcknowledgement -or $ReceiptPath -or $ReceiptSHA256 -or $ReviewedApplyJournalSHA256 -or $ReviewedPartialApplyRecovery) {
-    throw 'Disposable lab options require -DisposableLocalLab; the default public mutation gate remains closed.'
+if ($DisposableAcknowledgement) {
+    throw 'DisposableAcknowledgement requires -DisposableLocalLab; omit both for standard Apply or Revert.'
+}
+$hasPreparedPlanArgs = (
+    $PSBoundParameters.ContainsKey('PlanPath') -or
+    $PSBoundParameters.ContainsKey('PlanSHA256') -or
+    $PSBoundParameters.ContainsKey('RecoveryManifestPath') -or
+    $PSBoundParameters.ContainsKey('RecoveryJournalPath') -or
+    $PSBoundParameters.ContainsKey('RecoveryJournalSHA256')
+)
+if ($Mode -in @('Apply','Revert') -and -not $hasPreparedPlanArgs) {
+    . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
+    $writeArguments = @{
+        Mode=$Mode; TargetPath=$TargetPath; TargetPlatform=$TargetPlatform; GroupName=$GroupName
+        Permissions=$Permissions; GroupPermissionsJson=$GroupPermissionsJson; GroupPermissionsFile=$GroupPermissionsFile
+        Operation=$Operation; RemovePrincipal=$RemovePrincipal
+        Scope=$Scope; OutputDirectory=$OutputDirectory; ChangeTicket=$ChangeTicket; MaxPaths=$MaxPaths
+        ReceiptPath=$ReceiptPath; ReceiptSHA256=$ReceiptSHA256
+        ReviewedApplyJournalSHA256=$ReviewedApplyJournalSHA256
+        ReviewedPartialApplyRecovery=$ReviewedPartialApplyRecovery; Preview=[bool]$WhatIfPreference
+        CallerConfirmPreference=[string]$ConfirmPreference
+        BoundParameters=$PSBoundParameters
+    }
+    $writeResult = Invoke-NpPermissionWrite @writeArguments
+    $writeResult
+    if ($writeResult.Status -in @('Blocked','Indeterminate')) { exit 2 }
+    exit 0
+}
+if ($ReceiptPath -or $ReceiptSHA256 -or $ReviewedApplyJournalSHA256 -or $ReviewedPartialApplyRecovery) {
+    throw 'Receipt and partial-Apply recovery options apply only to direct Apply/Revert runs without -PlanPath.'
 }
 if ($Operation -ne 'Add' -or $PSBoundParameters.ContainsKey('RemovePrincipal')) {
-    throw 'Remove and Replace are available only in the explicitly acknowledged disposable-local-lab workflow.'
+    throw 'Remove and Replace are executed with -Mode Apply (use -WhatIf to preview), not review-only -Mode Plan.'
 }
 
 # Parse/hash a supplied plan only once. Defer errors until safe local audit exists.

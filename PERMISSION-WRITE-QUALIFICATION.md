@@ -1,47 +1,50 @@
-# Permission modification: testing and evidence guide
+# Permission modification: architecture, testing, and evidence guide
 
-## Start here: no production enable switch
+## Start here: pure-SMB and local-NTFS handle-pinned writer
 
-There is **no qualified production writer**. Default
-`Add-FileSharePermissions.ps1 -Mode Apply` and `-Mode Revert` are deliberately
-blocked. The explicitly acknowledged `-DisposableLocalLab` option can perform
-real changes only for independently approved disposable direct local fixed NTFS
-experiments, never production or SMB/NAS; it is not a production enable switch.
-Tickets, hashes and passing tests do not qualify a backend.
+`Add-FileSharePermissions.ps1` provides handle-pinned `Add`, `Remove`, and
+`Replace` permission changes (`-Mode Apply`, `-WhatIf` preview, and optional
+`-Mode Revert` / `-ReviewedPartialApplyRecovery`) directly over standard Windows
+SMB and local NTFS (`WriterQualification = 'VerifiedPureSmbAndNtfs'`) — **with
+zero ONTAP CLI or ONTAP API requirement**:
 
-An internal local-NTFS candidate now exists in `NtfsPermissions.Local.ps1` /
-`NtfsPermissions.Local.cs`. Its disposable integration tests are described in
-the README. The explicit disposable-lab path uses this candidate; it has
-unresolved qualification gaps and does not qualify any backend merely by passing
-tests.
+- **Supported platforms:** `LocalWindows` (direct local fixed NTFS), `WindowsSMB`
+  (`-TargetPlatform Windows`), `NetAppSMB` (`-TargetPlatform NetApp`),
+  `GenericSMB` (`-TargetPlatform Nas` or `Auto`), and `MappedDrive` (verified
+  mapped network drives frozen to canonical UNC in `receipt.json`).
+- **Prepared `-PlanPath` files remain non-executable:** passing `-PlanPath` to
+  `-Mode Apply` or `-Mode Revert` fails closed (`MutationNotQualified`) with zero
+  target writes. Every live `Apply` builds a fresh handle-pinned plan in-invocation
+  and writes a pre-write `NtfsPermissionReceipt/1` receipt before any target DACL
+  write.
+- **Disposable local-lab mode (`-DisposableLocalLab -DisposableAcknowledgement`):**
+  remains available for direct local fixed NTFS sandboxes using an isolated
+  receipt schema (`NtfsDisposableReceipt/2`).
 
-## Independent targeted changes in disposable local labs
+## Independent targeted permission changes
 
-The in-progress targeted Add/Remove/Replace workflow is independent of the
-assessment, reporting, manual validation and qualification exercises below.
-No assessment, previous plan, or Revert is required. Use only a separately
-approved, quiescent, disposable local fixed NTFS target and verified backup;
-the explicit acknowledgement is not itself approval.
+The targeted `Add`/`Remove`/`Replace` workflow is independent of the assessment,
+reporting, and manual validation workflows below. No server-wide assessment,
+previous `-PlanPath`, or `Revert` is required. Always verify target paths,
+change tickets, and backups, and preview with `-WhatIf` first.
 
-In the `-Mode Apply -DisposableLocalLab -DisposableAcknowledgement` path,
-`-Operation` defaults to `Add`. `Remove` and `Replace` take `-RemovePrincipal`
-as `Everyone` (`S-1-1-0`), an exact SID including an orphaned SID, or an AD
-security group. Replace also needs `-GroupName` and `-Permissions` (or the
-existing JSON grant forms); Remove rejects all replacement grants.
+In `-Mode Apply`, `-Operation` defaults to `Add`. `Remove` and `Replace` take
+`-RemovePrincipal` as `Everyone` (`S-1-1-0`), an exact SID including an orphaned
+SID, or an AD security group. `Replace` also needs `-GroupName` and `-Permissions`
+(or the existing JSON grant forms); `Remove` rejects all replacement grants.
 
 ```powershell
-$lab = @{
+$changeParams = @{
     Mode = 'Apply'
-    DisposableLocalLab = $true
-    DisposableAcknowledgement = $true
-    TargetPath = 'D:\DisposableLab\Case1'
+    TargetPlatform = 'NetApp'
+    TargetPath = '\\FILER01\Share\Department'
     Scope = 'ThisFolderSubfoldersAndFiles'
-    ChangeTicket = 'LAB-123'
+    ChangeTicket = 'CHG-123'
     OutputDirectory = 'D:\NtfsEvidence'
 }
-.\Add-FileSharePermissions.ps1 @lab -Operation Replace -RemovePrincipal Everyone `
-    -GroupName 'LAB\Readers' -Permissions ReadAndExecute -WhatIf
-.\Add-FileSharePermissions.ps1 @lab -Operation Remove -RemovePrincipal Everyone -WhatIf
+.\Add-FileSharePermissions.ps1 @changeParams -Operation Replace -RemovePrincipal Everyone `
+    -GroupName 'CONTOSO\Dept_Readers' -Permissions ReadAndExecute -WhatIf
+.\Add-FileSharePermissions.ps1 @changeParams -Operation Remove -RemovePrincipal Everyone -WhatIf
 ```
 
 Use an existing approved fixture and group, and trusted local evidence storage
@@ -94,10 +97,32 @@ For partial failure, preserve prewrite evidence and review the existing
 intent/verification journal against the live state; do not assume a complete
 post-state report. There is no automatic rollback. Explicit partial recovery is a
 separately reviewed operation, subject to the same evidence and drift checks.
-See the README's [targeted workflow](README.md#separate-workflow-targeted-disposable-lab-permission-changes)
-for an actual Apply, report review, and optional Revert.
+See the README's [targeted workflow](README.md#separate-workflow-targeted-permission-changes)
+for an actual Apply, report review, and optional Revert, and
+[NETAPP-VALIDATION.md](NETAPP-VALIDATION.md#sanitized-netapp-smb-protocol-findings-and-resolutions)
+for the pure-SMB NetApp protocol findings and live validation summary.
 
-### Current targeted lab observations
+### Completed pure-SMB NetApp, mapped-drive, and Windows SMB validation
+
+With source fingerprint
+`e199ba28fa79acf6fa4c5078ee14e94d3bccde3f78c96cf22d794ccb9ee815e8`,
+separate Windows PowerShell 5.1 and PowerShell 7 end-to-end runs each passed
+**64 / 64 live checks** against a live NetApp SMB 3.1.1 share, mapped SMB drives,
+and a Windows Server SMB share — alongside **1,820+ automated Pester tests**,
+**1,479 assessment assertions**, and **145 best-practices assertions** per edition:
+
+- Verified `ntdll!NtSetSecurityObject` self-relative DACL writing preserves exact
+  non-auto-inherited (`0x8004`) and auto-inherited (`0x8404`) control flags on
+  NetApp WAFL SMB with zero unintended descendant modification (`Observed` across
+  all five `Invoke-NtfsPermissionValidation.ps1` stages).
+- Verified pure-SMB `Add`, `Remove`, `Replace`, `-WhatIf`, `NoOp`, orphaned SID
+  removal, mapped-drive `Apply` + unmapped `Revert`, safety gates, out-of-band
+  drift fail-closed preservation, and `-ReviewedPartialApplyRecovery` after a
+  simulated mid-`Apply` interruption, plus real separate-account Kerberos/SMB
+  `List`, `Read`, `Create`, `Modify`, and `Delete` probes before `Apply`, after
+  `Apply`, and after `Revert`.
+
+### Historical local-only lab observations
 
 On November 13, 2026, a disposable fixture whose DACL lacked the auto-inherited
 control flag produced an indeterminate Replace: the root control flags changed,

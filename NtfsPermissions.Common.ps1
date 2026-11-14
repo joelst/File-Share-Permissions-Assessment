@@ -11,10 +11,9 @@
 
 <#
 .SYNOPSIS
-Shared permission planning, evidence and guarded recovery helpers.
+Shared permission planning, evidence, and pure-SMB/NTFS execution helpers.
 .NOTES
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
-Live mutation is disabled.
 #>
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsAssessment.Common.ps1')
@@ -41,6 +40,18 @@ function ConvertTo-NpPath([string]$Path) {
     $prefix = '\\local\volume\'
     $suffix = (ConvertTo-NpUnc ($prefix + $Path.Substring(3))).Substring($prefix.Length)
     return $Path.Substring(0,1).ToUpperInvariant() + ':\' + $suffix
+}
+
+function Get-NpParentPath([string]$Path) {
+    if ($Path.StartsWith('\\')) {
+        $parts = $Path.TrimEnd('\').Substring(2).Split('\')
+        if ($parts.Length -le 2) { return '\\' + $parts[0] + '\' + $parts[1] }
+        return '\\' + ($parts[0..($parts.Length - 2)] -join '\')
+    }
+    $trimmed = $Path.TrimEnd('\')
+    $cut = $trimmed.LastIndexOf('\')
+    if ($cut -le 2) { return $trimmed.Substring(0, 2) + '\' }
+    return $trimmed.Substring(0, $cut)
 }
 
 function Get-NpDriveBinding([ValidatePattern('^[A-Za-z]:$')][string]$Drive) {

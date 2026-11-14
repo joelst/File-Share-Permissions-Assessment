@@ -114,7 +114,8 @@ Describe 'Internal local NTFS candidate safeguards (not production qualification
                 function New-NpLocalCandidatePlan {
                     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Injects test data without writes.')]
                     [CmdletBinding()]
-                    param($targetPath, $grants, $scope, $maxPaths, $operation, $removal)
+                    param($targetPath, $grants, $scope, $maxPaths, $operation, $removal, $targetPlatform = 'Windows', $targetDescriptor = $null, [switch]$allowRemoteTarget)
+                    $null = @($targetPlatform, $targetDescriptor, $allowRemoteTarget)
                     if ($targetPath -cne $script:injectedLocalPlan.TargetDescriptor.CanonicalPath -or
                         (Get-NpCanonicalJson $grants) -cne (Get-NpCanonicalJson $script:injectedLocalPlan.Grants) -or
                         $scope -cne $script:injectedLocalPlan.Scope -or $maxPaths -ne $script:injectedLocalPlan.MaxPaths) {
@@ -205,7 +206,7 @@ $parameters = @{
 if ($request.Journal.Mode -ceq 'Apply') {
     $script:injectedLocalPlan = $request.Plan
     function New-NpLocalCandidatePlan {
-        param($targetPath, $grants, $scope, $maxPaths, $operation, $removal)
+        param($targetPath, $grants, $scope, $maxPaths, $operation, $removal, $targetPlatform = 'Windows', $targetDescriptor = $null, [switch]$allowRemoteTarget)
         return $script:injectedLocalPlan
     }
     $request.Journal.PlanHash = ''
@@ -1401,12 +1402,98 @@ throw 'Apply returned before the interruption boundary.'
         Test-Path -LiteralPath $journal.Path | Should -BeFalse
     }
 
-    It 'rejects incomplete path bounds and direct remote native handles' {
+    It 'rejects incomplete path bounds, remote audit directories, and device-prefixed UNC handles' {
         $target = New-LocalFixture
         { New-NpLocalCandidatePlan -targetPath $target -grants $script:localGrants -maxPaths 1 } |
             Should -Throw '*path limit*'
-        { [NtfsPermissions.LocalCandidate.Lease]::Open('\\SERVER\Share\Folder', $true) } |
+        { [NtfsPermissions.LocalCandidate.Lease]::OpenAuditDirectory('\\SERVER\Share\Folder') } |
             Should -Throw '*direct local*'
+        { [NtfsPermissions.LocalCandidate.Lease]::Open('\\?\UNC\SERVER\Share\Folder', $true) } |
+            Should -Throw '*static direct UNC*'
+    }
+
+    It 'preserves non-auto-inherited DACL control flags during NtSetSecurityObject writes' {
+        $target = New-LocalFixture
+        $rawRoot = Join-Path $target 'non-ai-root'
+        $ownerObject = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rawAcl = [Security.AccessControl.DirectorySecurity]::new()
+        $rawAcl.SetAccessRuleProtection($true, $false)
+        $rawAcl.SetOwner($ownerObject)
+        $rawAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $ownerObject, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        if ($PSVersionTable.PSEdition -ceq 'Desktop') {
+            [void][IO.Directory]::CreateDirectory($rawRoot, $rawAcl)
+        } else {
+            [void][IO.FileSystemAclExtensions]::CreateDirectory($rawAcl, $rawRoot)
+        }
+        $leaf = Join-Path $rawRoot 'non-ai-leaf'
+        [void][IO.Directory]::CreateDirectory($leaf)
+        $setProbe = [NtfsPermissions.LocalCandidate.Lease]::Open($leaf, $true)
+        try {
+            $initial = $setProbe.Read()
+            $initialSnapshot = ConvertTo-NpLocalSnapshot -nativeSnapshot $initial
+            $initialRaw = [Security.AccessControl.RawSecurityDescriptor]::new($initial.Descriptor)
+            ([int]($initialRaw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)) |
+                Should -Be 0
+            $desiredSnapshot = New-NpLocalDesiredSnapshot -before $initialSnapshot -grants @(
+                [pscustomobject]@{ GroupName = 'TestGroup'; SID = 'S-1-5-21-100-200-300-400'; Permissions = 'ReadAndExecute'; Mask = 1179817 }
+            ) -scope ThisFolderSubfoldersAndFiles -isRoot $true
+            $updated = $setProbe.WriteDacl($initial.Descriptor, $desiredSnapshot.Descriptor)
+            $updated.Descriptor | Should -BeExactly $desiredSnapshot.Descriptor
+            $updatedRaw = [Security.AccessControl.RawSecurityDescriptor]::new($updated.Descriptor)
+            ([int]($updatedRaw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)) |
+                Should -Be 0
+            $reverted = $setProbe.WriteDacl($updated.Descriptor, $initial.Descriptor)
+            $reverted.Descriptor | Should -BeExactly $initial.Descriptor
+        } finally {
+            $setProbe.Dispose()
+        }
+    }
+
+    It 'resolves UNC share-root parents cleanly and scopes auto-inherited safety by platform' {
+        (Get-NpParentPath '\\filer\assessment\Dept') | Should -BeExactly '\\filer\assessment'
+        (Get-NpParentPath '\\filer\assessment\Dept\Child') | Should -BeExactly '\\filer\assessment\Dept'
+        (Get-NpParentPath 'C:\Dept') | Should -BeExactly 'C:\'
+        (Get-NpParentPath 'C:\Dept\Child') | Should -BeExactly 'C:\Dept'
+        $nonAiEntry = [pscustomobject]@{
+            Boundary = $false
+            Before = [pscustomobject]@{ Path = '\\filer\assessment\Dept'; Control = 32772; Descriptor = 'O:BAG:SYD:(A;OICI;FA;;;BA)' }
+            Desired = [pscustomobject]@{ Path = '\\filer\assessment\Dept'; Control = 32772; Descriptor = 'O:BAG:SYD:(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;WD)' }
+        }
+        { Assert-NpLocalInheritanceSafety -entries @($nonAiEntry) -platform LocalWindows } | Should -Throw '*auto-inherited*'
+        { Assert-NpLocalInheritanceSafety -entries @($nonAiEntry) -platform WindowsSMB } | Should -Throw '*auto-inherited*'
+        { Assert-NpLocalInheritanceSafety -entries @($nonAiEntry) -platform NetAppSMB } | Should -Not -Throw
+        { Assert-NpLocalInheritanceSafety -entries @($nonAiEntry) -platform GenericSMB } | Should -Not -Throw
+    }
+
+    It 'pins parent, nested directory, and child file simultaneously with zero-share handles and blocks external open handles' {
+        $target = New-LocalFixture
+        $nested = Join-Path $target 'child'
+        $childFile = Join-Path $nested 'file.txt'
+        $rootLease = [NtfsPermissions.LocalCandidate.Lease]::Open($target, $true)
+        try {
+            $nestedLease = [NtfsPermissions.LocalCandidate.Lease]::Open($nested, $true)
+            try {
+                $fileLease = [NtfsPermissions.LocalCandidate.Lease]::Open($childFile, $true)
+                try {
+                    $rootLease.Read().Identity | Should -Match '^LocalNTFS:'
+                    $nestedLease.Read().Identity | Should -Match '^LocalNTFS:'
+                    $fileLease.Read().Identity | Should -Match '^LocalNTFS:'
+                } finally {
+                    $fileLease.Dispose()
+                }
+            } finally {
+                $nestedLease.Dispose()
+            }
+        } finally {
+            $rootLease.Dispose()
+        }
+        $externalStream = [IO.File]::Open($childFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            { [NtfsPermissions.LocalCandidate.Lease]::Open($childFile, $true) } | Should -Throw '*Cannot pin*'
+        } finally {
+            $externalStream.Dispose()
+        }
     }
 
     It 'rejects missing disposable acknowledgement without creating audit or target writes' {

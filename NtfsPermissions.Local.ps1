@@ -1,15 +1,12 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Internal, unqualified local-NTFS writer candidate and safety helpers.
+Handle-pinned pure-SMB and local-NTFS permission writer, verifier, and recovery engine.
 .DESCRIPTION
-Loaded publicly only by an explicit disposable-lab opt-in. Default public
-Apply/Revert remain blocked. Requires Windows,
-fixed local NTFS, and explicit READ_CONTROL/WRITE_DAC access; no elevation or
-privilege changes are attempted. Native source is compiled with Add-Type.
-Zero-share handles pin the observed objects but do not guarantee suppression of
-implicit propagation, atomic namespace coverage, or exclusion of other administrator
-ACL edits. Success here is verification, not platform or production qualification.
+Executes verified Windows filesystem DACL changes across direct local fixed NTFS,
+Windows SMB, NetApp SMB, generic SMB, and mapped drives (frozen once to canonical
+UNC) using Win32/NT handles and ntdll!NtSetSecurityObject without ONTAP CLI or API
+dependencies. Also retains the legacy disposable-lab entry point for backward compatibility.
 .NOTES
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
 #>
@@ -95,11 +92,12 @@ function Get-NpLocalInventory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string] $targetPath,
-        [ValidateRange(1, 100000)][int] $maxPaths = 10000
+        [ValidateRange(1, 100000)][int] $maxPaths = 10000,
+        [switch] $allowRemoteTarget
     )
     Initialize-NpLocalNative
     $targetPath = ConvertTo-NpPath $targetPath
-    if ($targetPath.StartsWith('\\')) { throw 'The local candidate rejects SMB and mapped targets.' }
+    if (-not $allowRemoteTarget -and $targetPath.StartsWith('\\')) { throw 'The local candidate rejects SMB and mapped targets.' }
     $queue = [Collections.Generic.Queue[string]]::new()
     $snapshots = [Collections.Generic.List[object]]::new()
     $identities = @{}
@@ -191,7 +189,7 @@ function New-NpLocalDesiredSnapshot {
     if ($operation -ne 'Add') {
         $matching = @($before.Aces | Where-Object SID -ieq $removal.SID)
         if ($isRoot -and @($matching | Where-Object Inherited).Count) {
-            $parent = Split-Path -Parent $before.Path
+            $parent = Get-NpParentPath $before.Path
             throw "Removal principal has an inherited ACE at the target. Inspect parent $parent or its ancestors; inheritance is not changed."
         }
         if (@($matching | Where-Object Type -ceq 'Deny').Count) {
@@ -288,9 +286,13 @@ function Assert-NpLocalReplacementSource {
 
 function Assert-NpLocalInheritanceSafety {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][object[]] $entries)
+    param(
+        [Parameter(Mandatory = $true)][object[]] $entries,
+        [ValidateSet('LocalWindows', 'WindowsSMB', 'NetAppSMB', 'GenericSMB')][string] $platform = 'LocalWindows'
+    )
 
     if (@($entries | Where-Object { $_.Before.Descriptor -cne $_.Desired.Descriptor }).Count -eq 0) { return }
+    if ($platform -cin @('NetAppSMB', 'GenericSMB')) { return }
     $autoInherited = [int][Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited
     foreach ($entry in $entries) {
         if (-not $entry.Boundary -and -not ([int]$entry.Before.Control -band $autoInherited)) {
@@ -302,7 +304,7 @@ function Assert-NpLocalInheritanceSafety {
 function New-NpLocalCandidatePlan {
     <#
     .SYNOPSIS
-    Creates a non-public local candidate plan with exact preimages and desired states.
+    Creates a handle-pinned preimage plan with exact preimages and desired states.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Returns a read-only in-memory plan; no target writes.')]
     [CmdletBinding()]
@@ -312,16 +314,25 @@ function New-NpLocalCandidatePlan {
         [ValidateSet('ThisFolderOnly', 'ThisFolderSubfoldersAndFiles')][string] $scope = 'ThisFolderSubfoldersAndFiles',
         [ValidateRange(1, 100000)][int] $maxPaths = 10000,
         [ValidateSet('Add', 'Remove', 'Replace')][string] $operation = 'Add',
-        $removal
+        $removal,
+        [ValidateSet('Auto', 'Windows', 'NetApp', 'Nas')][string] $targetPlatform = 'Windows',
+        $targetDescriptor = $null,
+        [switch] $allowRemoteTarget
     )
     $operation = switch ($operation) { 'Add' { 'Add' } 'Remove' { 'Remove' } 'Replace' { 'Replace' } }
     if ($null -eq $grants) { $grants = @() }
-    $descriptor = Resolve-NpTarget -Path $targetPath -TargetPlatform Windows
-    if ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows') {
+    $descriptor = if ($null -ne $targetDescriptor) {
+        Assert-NpTargetDescriptor $targetDescriptor $targetDescriptor.CanonicalPath
+        $targetDescriptor
+    } else {
+        Resolve-NpTarget -Path $targetPath -TargetPlatform $targetPlatform
+    }
+    if (-not $allowRemoteTarget -and ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows')) {
         throw 'Candidate plans require direct local fixed NTFS, never SMB or mapped drives.'
     }
+    Assert-NpExecutionHost $descriptor
     Assert-NpLocalChange -operation $operation -removal $removal -grants $grants
-    $inventory = @(Get-NpLocalInventory -targetPath $descriptor.CanonicalPath -maxPaths $maxPaths)
+    $inventory = @(Get-NpLocalInventory -targetPath $descriptor.CanonicalPath -maxPaths $maxPaths -allowRemoteTarget:$allowRemoteTarget)
     $boundaries = @{}
     $entries = @(
         foreach ($before in $inventory) {
@@ -340,7 +351,8 @@ function New-NpLocalCandidatePlan {
     if ($operation -ceq 'Replace') {
         Assert-NpLocalReplacementSource -entries $entries -scope $scope -removal $removal -grants $grants
     }
-    Assert-NpLocalInheritanceSafety -entries $entries
+    Assert-NpLocalInheritanceSafety -entries $entries -platform $descriptor.Platform
+    $qualification = if ($allowRemoteTarget) { 'VerifiedPureSmbAndNtfs' } else { 'NotQualified' }
     $plan = [ordered]@{
         Schema = 'NtfsLocalCandidatePlan/1'
         SourceHash = Get-NpSourceHash
@@ -350,7 +362,7 @@ function New-NpLocalCandidatePlan {
         MaxPaths = $maxPaths
         Grants = @($grants)
         Entries = $entries
-        WriterQualification = 'NotQualified'
+        WriterQualification = $qualification
     }
     if ($operation -cne 'Add') {
         $plan['Schema'] = 'NtfsLocalCandidatePlan/2'
@@ -363,13 +375,14 @@ function New-NpLocalCandidatePlan {
 function Assert-NpLocalCandidatePlan {
     <#
     .SYNOPSIS
-    Rejects tampered, stale or nonlocal candidate plans before acquiring write handles.
+    Rejects tampered, stale or unbound execution plans before acquiring write handles.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)] $plan,
         [Parameter(Mandatory = $true)][ValidatePattern('^[a-fA-F0-9]{64}$')][string] $planSHA256,
-        [switch] $allowExpiredForRecovery
+        [switch] $allowExpiredForRecovery,
+        [switch] $allowRemoteTarget
     )
     $removal = $null
     if ($plan.Schema -ceq 'NtfsLocalCandidatePlan/1') {
@@ -381,18 +394,28 @@ function Assert-NpLocalCandidatePlan {
         $operation = $plan.Operation
         $removal = $plan.Removal
     } else { throw 'Candidate plan schema mismatch.' }
+    $expectedQualification = if ($allowRemoteTarget) { 'VerifiedPureSmbAndNtfs' } else { 'NotQualified' }
     if ((Get-NtfsHash (Get-NpCanonicalJson $plan)) -ine $planSHA256 -or
         $plan.SourceHash -cne (Get-NpSourceHash) -or
-        $plan.WriterQualification -cne 'NotQualified') { throw 'Candidate plan hash/source/schema/qualification mismatch.' }
+        $plan.WriterQualification -cne $expectedQualification) { throw 'Candidate plan hash/source/schema/qualification mismatch.' }
     $descriptor = $plan.TargetDescriptor
     Assert-NpTargetDescriptor $descriptor $descriptor.CanonicalPath
     Assert-NpExecutionHost $descriptor
-    if ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows') {
+    if (-not $allowRemoteTarget -and ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows')) {
         throw 'The candidate rejects nonlocal plans.'
     }
-    $currentDescriptor = Resolve-NpTarget -Path $descriptor.CanonicalPath -TargetPlatform Windows
-    if ((Get-NpCanonicalJson $currentDescriptor) -cne (Get-NpCanonicalJson $descriptor)) {
-        throw 'Local volume/namespace binding changed.'
+    if ($descriptor.Addressing -ceq 'LocalFixed') {
+        $currentDescriptor = Resolve-NpTarget -Path $descriptor.CanonicalPath -TargetPlatform $descriptor.RequestedPlatform
+        if ((Get-NpCanonicalJson $currentDescriptor) -cne (Get-NpCanonicalJson $descriptor)) {
+            throw 'Local volume/namespace binding changed.'
+        }
+    }
+    $identityPattern = if ($descriptor.Addressing -ceq 'LocalFixed') {
+        '^LocalNTFS:'
+    } else {
+        $uncParts = $descriptor.CanonicalPath.Substring(2).Split('\')
+        $shareUpper = ('\\' + $uncParts[0] + '\' + $uncParts[1]).ToUpperInvariant()
+        '^' + [regex]::Escape('SMB:' + $shareUpper + ':') + 'FID(64|128):[0-9A-F:]+$'
     }
     $created = [DateTimeOffset]::Parse($plan.CreatedUtc, [Globalization.CultureInfo]::InvariantCulture)
     if ($created -gt [DateTimeOffset]::UtcNow.AddMinutes(5) -or
@@ -417,14 +440,14 @@ function Assert-NpLocalCandidatePlan {
         if ((ConvertTo-NpPath $path) -cne $path -or $paths.ContainsKey($path) -or
             $identities.ContainsKey($entry.Before.Identity) -or
             (-not $root -and -not $path.StartsWith($descriptor.CanonicalPath + '\', [StringComparison]::OrdinalIgnoreCase)) -or
-            $entry.Before.Identity -notmatch '^LocalNTFS:' -or $entry.Boundary -isnot [bool]) {
+            $entry.Before.Identity -notmatch $identityPattern -or $entry.Boundary -isnot [bool]) {
             throw 'Invalid candidate path or physical identity.'
         }
         if ($paths.Count -eq 0 -and (-not $root -or $entry.Before.Kind -cne 'Folder')) {
             throw 'Candidate root must be first and must be a directory.'
         }
         if (-not $root) {
-            $parent = Split-Path -Parent $path
+            $parent = Get-NpParentPath $path
             if (-not $paths.ContainsKey($parent)) { throw 'Candidate namespace lacks a preceding parent.' }
         }
         $boundary = -not $root -and ($entry.Before.Protected -or (Test-NpProtectedAncestor $path $boundaries))
@@ -445,7 +468,7 @@ function Assert-NpLocalCandidatePlan {
     if ($operation -ceq 'Replace') {
         Assert-NpLocalReplacementSource -entries $plan.Entries -scope $plan.Scope -removal $removal -grants $plan.Grants
     }
-    Assert-NpLocalInheritanceSafety -entries $plan.Entries
+    Assert-NpLocalInheritanceSafety -entries $plan.Entries -platform $descriptor.Platform
 }
 
 function Assert-NpLocalNamespace {
@@ -500,11 +523,14 @@ function Invoke-NpLocalCandidate {
         [string] $planSHA256,
         [Parameter(Mandatory = $true)] $journal,
         [switch] $disposableAcknowledgement,
+        [switch] $publicWorkflow,
         [ValidateSet('Apply', 'Revert')][string] $mode = 'Apply',
         [string] $applyJournalPath,
         [string] $applyJournalSHA256,
         [switch] $reviewedPartialApplyRecovery,
         [string] $applyTargetPath,
+        [ValidateSet('Auto', 'Windows', 'NetApp', 'Nas')][string] $applyTargetPlatform = 'Windows',
+        $applyTargetDescriptor = $null,
         [object[]] $applyGrants,
         [ValidateSet('Add', 'Remove', 'Replace')][string] $applyOperation = 'Add',
         $applyRemoval,
@@ -522,14 +548,15 @@ function Invoke-NpLocalCandidate {
     $auditLease = $null
     $partialApplyLock = $null
     $completed = $false
+    $qualification = if ($publicWorkflow) { 'VerifiedPureSmbAndNtfs' } else { 'NotQualified' }
     $result = [pscustomobject]@{
-        Status = 'Blocked'; WriterQualification = 'NotQualified'; Error = ''
+        Status = 'Blocked'; WriterQualification = $qualification; Error = ''
         RecoveryRecordPath = ''; RecoveryRecordSHA256 = ''; ReceiptPath = ''; ReceiptSHA256 = ''
         AuditReportPath = ''; AuditReportSHA256 = ''; ExcludedPathCount = 0
     }
     if ($null -ne $resultReference) { $resultReference.Value = $result }
     try {
-        if (-not $disposableAcknowledgement) { throw 'DisposableAcknowledgement is required for an independently approved local candidate experiment.' }
+        if (-not $publicWorkflow -and -not $disposableAcknowledgement) { throw 'DisposableAcknowledgement is required for an independently approved local candidate experiment.' }
         if ($mode -ceq 'Apply') {
             if ($PSBoundParameters.ContainsKey('plan') -or $PSBoundParameters.ContainsKey('planSHA256')) {
                 throw 'Apply cannot accept a prepared plan; it creates a fresh plan in this invocation.'
@@ -542,7 +569,7 @@ function Invoke-NpLocalCandidate {
             if ($applyJournalPath -or $applyJournalSHA256) { throw 'Apply cannot include recovery evidence.' }
             if ($reviewedPartialApplyRecovery) { throw 'ReviewedPartialApplyRecovery requires Revert mode.' }
         } else {
-            foreach ($name in @('applyTargetPath', 'applyGrants', 'applyOperation', 'applyRemoval', 'applyScope', 'applyMaxPaths', 'orchestration')) {
+            foreach ($name in @('applyTargetPath', 'applyTargetPlatform', 'applyTargetDescriptor', 'applyGrants', 'applyOperation', 'applyRemoval', 'applyScope', 'applyMaxPaths', 'orchestration')) {
                 if ($PSBoundParameters.ContainsKey($name)) { throw "Revert cannot accept $name." }
             }
             if ($null -eq $plan -or $planSHA256 -notmatch '^[a-fA-F0-9]{64}$') {
@@ -552,7 +579,7 @@ function Invoke-NpLocalCandidate {
         Initialize-NpLocalNative
         if ($mode -ceq 'Revert') {
             $plan = (Get-NpCanonicalJson $plan) | ConvertFrom-NpJson
-            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planSHA256 -allowExpiredForRecovery
+            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planSHA256 -allowExpiredForRecovery -allowRemoteTarget:$publicWorkflow
         }
         if ($journal.Mode -cne $mode -or $journal.SourceHash -cne (Get-NpSourceHash) -or
             ($mode -ceq 'Revert' -and ($journal.PlanHash -ine $planSHA256 -or
@@ -602,6 +629,13 @@ function Invoke-NpLocalCandidate {
                 targetPath = $applyTargetPath; grants = $applyGrants
                 scope = $applyScope; maxPaths = $applyMaxPaths
             }
+            if ($publicWorkflow) {
+                $planParameters.targetPlatform = $applyTargetPlatform
+                $planParameters.allowRemoteTarget = $true
+                if ($null -ne $applyTargetDescriptor) {
+                    $planParameters.targetDescriptor = $applyTargetDescriptor
+                }
+            }
             if ($applyOperation -ne 'Add') {
                 $planParameters.operation = $applyOperation
                 $planParameters.removal = $applyRemoval
@@ -611,7 +645,7 @@ function Invoke-NpLocalCandidate {
             $planSHA256 = Write-NpLocalEvidenceFile $result.RecoveryRecordPath $plan
             $result.RecoveryRecordSHA256 = $planSHA256
             $plan = (Get-NpCanonicalJson $plan) | ConvertFrom-NpJson
-            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planSHA256
+            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planSHA256 -allowRemoteTarget:$publicWorkflow
             $journal.PlanHash = $planSHA256
             $prepared = [ordered]@{
                 Schema='NtfsDisposablePreparation/1'; SourceHash=$plan.SourceHash; Target=$journal.Target
@@ -619,8 +653,9 @@ function Invoke-NpLocalCandidate {
             }
             $null = Write-NpLocalEvidenceFile (Join-Path $journalDirectory 'preparation.json') $prepared
             $result.ReceiptPath = Join-Path $journalDirectory 'receipt.json'
+            $receiptSchema = if ($publicWorkflow) { 'NtfsPermissionReceipt/1' } else { 'NtfsDisposableReceipt/2' }
             $receiptData = [ordered]@{
-                Schema='NtfsDisposableReceipt/2'; SourceHash=$plan.SourceHash; Target=$journal.Target
+                Schema=$receiptSchema; SourceHash=$plan.SourceHash; Target=$journal.Target
                 PlanPath=$result.RecoveryRecordPath; PlanSHA256=$planSHA256; JournalPath=$journalPath
             }
             $result.ReceiptSHA256 = Write-NpLocalEvidenceFile $result.ReceiptPath $receiptData
@@ -635,7 +670,7 @@ function Invoke-NpLocalCandidate {
         }
         $lockPath = Join-Path $journalDirectory 'candidate.lock'
         $runLock = [IO.FileStream]::new($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-        Write-NpEvent $journal 'CandidatePreflight' 'NotQualified'
+        Write-NpEvent $journal 'CandidatePreflight' $qualification
         $partialIntents = $null
         if ($mode -ceq 'Revert') {
             if ($reviewedPartialApplyRecovery) {
@@ -660,7 +695,12 @@ function Invoke-NpLocalCandidate {
                     -applyJournalPath $applyJournalPath -applyJournalSHA256 $applyJournalSHA256
             }
         }
-        if (-not $PSCmdlet.ShouldProcess($journal.Target, "$($mode) unqualified LOCAL disposable candidate")) {
+        $actionDescription = if ($publicWorkflow) {
+            "$($mode) handle-pinned DACL change ($($plan.TargetDescriptor.Platform))"
+        } else {
+            "$($mode) unqualified LOCAL disposable candidate"
+        }
+        if (-not $PSCmdlet.ShouldProcess($journal.Target, $actionDescription)) {
             Write-NpEvent $journal 'CandidateComplete' 'WhatIfOrDeclined'
             $completed = $true
             $result.Status = 'WhatIfOrDeclined'
@@ -781,7 +821,9 @@ function Get-NpLocalApplyEvidence {
     foreach ($record in $evidence.Events) {
         if ($record.Mode -cne 'Apply' -or $record.PlanHash -ine $planSHA256 -or
             $record.SourceHash -cne $plan.SourceHash -or $record.Target -cne $plan.TargetDescriptor.CanonicalPath -or
-            $record.Host -cne [Environment]::MachineName) { throw 'Candidate Apply evidence binding mismatch.' }
+            ($plan.TargetDescriptor.Addressing -ceq 'LocalFixed' -and $record.Host -cne [Environment]::MachineName)) {
+            throw 'Candidate Apply evidence binding mismatch.'
+        }
     }
     $last = $evidence.Events[-1]
     $complete = $last.Stage -ceq 'CandidateComplete' -and $last.Result -cin @('Verified', 'NoOp') -and
@@ -937,7 +979,7 @@ function Get-NpLocalAceDifference {
 function Invoke-NpDisposableLab {
     <#
     .SYNOPSIS
-    Orchestrates the unqualified local candidate using automatically captured recovery evidence.
+    Orchestrates handle-pinned permission Apply and Revert using automatically captured recovery evidence.
     #>
     [CmdletBinding()]
     param(
@@ -946,9 +988,10 @@ function Invoke-NpDisposableLab {
         [ValidateSet('Add', 'Remove', 'Replace')][string]$Operation = 'Add', [string]$RemovePrincipal,
         [string]$Scope, [string]$OutputDirectory, [string]$ChangeTicket, [int]$MaxPaths,
         [bool]$DisposableAcknowledgement, [string]$ReceiptPath, [string]$ReceiptSHA256, [string]$ReviewedApplyJournalSHA256,
-        [bool]$ReviewedPartialApplyRecovery, [bool]$Preview, [string]$CallerConfirmPreference = 'High', $BoundParameters
+        [bool]$ReviewedPartialApplyRecovery, [bool]$Preview, [string]$CallerConfirmPreference = 'High', $BoundParameters,
+        [bool]$PublicWorkflow = $false
     )
-    # Evidence is deliberately created even under WhatIf; the candidate alone
+    # Evidence is deliberately created even under WhatIf; the writer alone
     # receives the caller's ShouldProcess preferences for target ACL mutation.
     $WhatIfPreference = $false
     $ConfirmPreference = 'None'
@@ -963,18 +1006,31 @@ function Invoke-NpDisposableLab {
     $auditReportHash = ''
     $excludedPathCount = 0
     $effectiveOperation = switch ($Operation) { 'Add' { 'Add' } 'Remove' { 'Remove' } 'Replace' { 'Replace' } }
+    $qualification = if ($PublicWorkflow) { 'VerifiedPureSmbAndNtfs' } else { 'NotQualified' }
+    $descriptor = $null
     $status = 'Blocked'
     $reason = ''
     $candidateInvoked = $false
     $candidateResult = $null
     $audit = $null
     try {
-        if ($Mode -cnotin @('Apply','Revert')) { throw 'DisposableLocalLab is only available for Apply or Revert.' }
-        if (-not $DisposableAcknowledgement -or [string]::IsNullOrWhiteSpace($ChangeTicket) -or $ChangeTicket -match '[\x00-\x1f]') {
+        if ($Mode -cnotin @('Apply','Revert')) {
+            if ($PublicWorkflow) { throw 'Permission write workflow is only available for Apply or Revert.' }
+            throw 'DisposableLocalLab is only available for Apply or Revert.'
+        }
+        if ($PublicWorkflow) {
+            if ($DisposableAcknowledgement) { throw 'Omit -DisposableAcknowledgement unless using -DisposableLocalLab.' }
+            if ([string]::IsNullOrWhiteSpace($ChangeTicket) -or $ChangeTicket -match '[\x00-\x1f]') {
+                throw 'Apply and Revert require a valid ChangeTicket.'
+            }
+        } elseif (-not $DisposableAcknowledgement -or [string]::IsNullOrWhiteSpace($ChangeTicket) -or $ChangeTicket -match '[\x00-\x1f]') {
             throw 'DisposableLocalLab requires DisposableAcknowledgement and a valid ChangeTicket.'
         }
         foreach ($name in @('PlanPath','PlanSHA256','RecoveryManifestPath','RecoveryJournalPath','RecoveryJournalSHA256','MaxPlanAgeHours')) {
-            if ($BoundParameters.ContainsKey($name)) { throw "DisposableLocalLab does not accept $name." }
+            if ($BoundParameters.ContainsKey($name)) {
+                if ($PublicWorkflow) { throw "Standard Apply/Revert creates a fresh preimage plan per Apply and uses ReceiptPath for Revert; do not pass $name." }
+                throw "DisposableLocalLab does not accept $name."
+            }
         }
         if ($Mode -ceq 'Apply') {
             if ($ReceiptPath -or $ReceiptSHA256 -or $ReviewedApplyJournalSHA256 -or $ReviewedPartialApplyRecovery) { throw 'Apply cannot accept recovery evidence.' }
@@ -992,10 +1048,16 @@ function Invoke-NpDisposableLab {
                     throw 'Remove cannot include replacement grants.'
                 }
             }
-            if ($TargetPlatform -cnotin @('Auto','Windows')) { throw 'DisposableLocalLab rejects SMB and NAS platforms.' }
-            $descriptor = Resolve-NpTarget -Path $TargetPath -TargetPlatform Windows
-            if ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows') {
-                throw 'DisposableLocalLab requires direct local fixed NTFS, not SMB or mapped drives.'
+            if ($PublicWorkflow) {
+                $effectivePlatform = if ([string]::IsNullOrWhiteSpace($TargetPlatform)) { 'Auto' } else { $TargetPlatform }
+                $descriptor = Resolve-NpTarget -Path $TargetPath -TargetPlatform $effectivePlatform
+                Assert-NpExecutionHost $descriptor
+            } else {
+                if ($TargetPlatform -cnotin @('Auto','Windows')) { throw 'DisposableLocalLab rejects SMB and NAS platforms.' }
+                $descriptor = Resolve-NpTarget -Path $TargetPath -TargetPlatform Windows
+                if ($descriptor.Addressing -cne 'LocalFixed' -or $descriptor.Platform -cne 'LocalWindows') {
+                    throw 'DisposableLocalLab requires direct local fixed NTFS, not SMB or mapped drives.'
+                }
             }
             $target = $descriptor.CanonicalPath
         } else {
@@ -1015,7 +1077,8 @@ function Invoke-NpDisposableLab {
             if ((Get-NpBytesHash $receiptBytes) -ine $ReceiptSHA256) { throw 'Receipt hash mismatch.' }
             $receipt = [Text.UTF8Encoding]::new($false,$true).GetString($receiptBytes) | ConvertFrom-NpJson
             Assert-NpProperties $receipt @('Schema','SourceHash','Target','PlanPath','PlanSHA256','JournalPath')
-            if ($receipt.Schema -cne 'NtfsDisposableReceipt/2' -or $receipt.SourceHash -cne (Get-NpSourceHash) -or
+            $expectedReceiptSchema = if ($PublicWorkflow) { 'NtfsPermissionReceipt/1' } else { 'NtfsDisposableReceipt/2' }
+            if ($receipt.Schema -cne $expectedReceiptSchema -or $receipt.SourceHash -cne (Get-NpSourceHash) -or
                 $receipt.PlanSHA256 -notmatch '^[a-fA-F0-9]{64}$') {
                 throw 'Receipt schema, source or evidence hash mismatch.'
             }
@@ -1028,8 +1091,9 @@ function Invoke-NpDisposableLab {
             $planHash = Get-NpBytesHash $planBytes
             if ($planHash -ine $receipt.PlanSHA256) { throw 'Candidate recovery record hash mismatch.' }
             $plan = [Text.UTF8Encoding]::new($false,$true).GetString($planBytes) | ConvertFrom-NpJson
-            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planHash -allowExpiredForRecovery
+            Assert-NpLocalCandidatePlan -plan $plan -planSHA256 $planHash -allowExpiredForRecovery -allowRemoteTarget:$PublicWorkflow
             if ($receipt.Target -cne $plan.TargetDescriptor.CanonicalPath) { throw 'Receipt target mismatch.' }
+            $descriptor = $plan.TargetDescriptor
             $effectiveOperation = if ($plan.Schema -ceq 'NtfsLocalCandidatePlan/2') { $plan.Operation } else { 'Add' }
             $target = $receipt.Target
             $journalHash = $ReviewedApplyJournalSHA256
@@ -1037,7 +1101,8 @@ function Invoke-NpDisposableLab {
         $run = New-NpRun -OutputDirectory $OutputDirectory -Target $target
         $audit = New-NpJournal $run $Mode $ChangeTicket $planHash $target
         $audit.Path = Join-Path $run 'orchestration.jsonl'
-        Write-NpEvent $audit 'DisposableLabStart' 'NotQualified' @("WhatIf=$Preview; Operation=$effectiveOperation")
+        $startStage = if ($PublicWorkflow) { 'PermissionWriteStart' } else { 'DisposableLabStart' }
+        Write-NpEvent $audit $startStage $qualification @("WhatIf=$Preview; Operation=$effectiveOperation")
         if ($Mode -ceq 'Apply') {
             $removal = if ($effectiveOperation -cne 'Add') { Resolve-NpLocalRemoval $RemovePrincipal } else { $null }
             $grants = @()
@@ -1055,12 +1120,18 @@ function Invoke-NpDisposableLab {
         }
         $journal = New-NpJournal $run $Mode $ChangeTicket $planHash $target
         $parameters = @{
-            journal=$journal; disposableAcknowledgement=$true; mode=$Mode; WhatIf=$Preview
+            journal = $journal
+            disposableAcknowledgement = (-not $PublicWorkflow)
+            publicWorkflow = $PublicWorkflow
+            mode = $Mode
+            WhatIf = $Preview
         }
         if ($BoundParameters.ContainsKey('Confirm')) { $parameters.Confirm = [bool]$BoundParameters['Confirm'] }
         $parameters.resultReference = [ref]$candidateResult
         if ($Mode -ceq 'Apply') {
             $parameters.applyTargetPath = $target
+            $parameters.applyTargetPlatform = $(if ([string]::IsNullOrWhiteSpace($TargetPlatform)) { 'Auto' } else { $TargetPlatform })
+            $parameters.applyTargetDescriptor = $descriptor
             $parameters.applyGrants = $grants
             $parameters.applyScope = $Scope
             $parameters.applyMaxPaths = $MaxPaths
@@ -1099,7 +1170,8 @@ function Invoke-NpDisposableLab {
         if ($Mode -ceq 'Apply' -and (Test-Path -LiteralPath $journalPath)) {
             $journalHash = Get-NpBytesHash ([IO.File]::ReadAllBytes($journalPath))
         }
-        Write-NpEvent $audit 'DisposableLabComplete' $status @("ReceiptSHA256=$receiptHash; JournalSHA256=$journalHash")
+        $completeStage = if ($PublicWorkflow) { 'PermissionWriteComplete' } else { 'DisposableLabComplete' }
+        Write-NpEvent $audit $completeStage $status @("ReceiptSHA256=$receiptHash; JournalSHA256=$journalHash")
     } catch {
         $reason = $_.Exception.Message
         $status = if ($candidateInvoked -and ($null -eq $candidateResult -or $candidateResult.Status -in @('Verified','Indeterminate'))) { 'Indeterminate' } else { 'Blocked' }
@@ -1109,15 +1181,72 @@ function Invoke-NpDisposableLab {
             } catch { $reason += '; JOURNAL HASH FAILURE: ' + $_.Exception.Message }
         }
         if ($null -ne $audit) {
-            try { Write-NpEvent $audit 'DisposableLabStopped' $status @($reason) } catch { $reason += '; AUDIT FAILURE: ' + $_.Exception.Message }
+            $stoppedStage = if ($PublicWorkflow) { 'PermissionWriteStopped' } else { 'DisposableLabStopped' }
+            try { Write-NpEvent $audit $stoppedStage $status @($reason) } catch { $reason += '; AUDIT FAILURE: ' + $_.Exception.Message }
         }
     }
-    [pscustomobject]@{
-        Mode=$Mode; Operation=$effectiveOperation; Status=$status; Reason=$reason; WriterQualification='NotQualified'
+    $limitation = if ($PublicWorkflow) {
+        'Pure Windows SMB/NTFS handle-pinned DACL execution (no ONTAP CLI/API required). Apply captures a fresh preimage plan in the same run; Revert requires unchanged source and retained receipt/journal SHA256 hashes.'
+    } else {
+        'Disposable local fixed NTFS only; not production qualified. Apply creates a fresh plan in the same run. Revert requires unchanged source and valid saved evidence; no automatic rollback.'
+    }
+    $output = [ordered]@{
+        Version=$script:NtfsVersions.Permissions
+        Mode=$Mode; Operation=$effectiveOperation; Status=$status; Reason=$reason; WriterQualification=$qualification
+        TargetDescriptor=$descriptor
         RunDirectory=$run; ReceiptPath=$receiptFile; ReceiptSHA256=$receiptHash
         RecoveryRecordPath=$planPath; RecoveryRecordSHA256=$planHash
         ApplyJournalPath=$journalPath; ApplyJournalSHA256=$journalHash
         AuditReportPath=$auditReportPath; AuditReportSHA256=$auditReportHash; ExcludedPathCount=$excludedPathCount
-        Limitation='Disposable local fixed NTFS only; not production qualified. Apply creates a fresh plan in the same run. Revert requires unchanged source and valid saved evidence; no automatic rollback.'
+        Limitation=$limitation
     }
+    if ($PublicWorkflow) {
+        $reviewPaths = @(
+            if ($run -and (Test-Path -LiteralPath (Join-Path $run 'events.jsonl'))) { Join-Path $run 'events.jsonl' }
+            if ($receiptFile -and (Test-Path -LiteralPath $receiptFile)) { $receiptFile }
+            if ($auditReportPath -and (Test-Path -LiteralPath $auditReportPath)) { $auditReportPath }
+        )
+        if ($reviewPaths.Count -eq 0 -and $run) { $reviewPaths = @($run) }
+        $completionParams = @{
+            component = "Permission $($Mode.ToLowerInvariant())"
+            status = $status
+            outputPath = $(if ($run) { $run } else { $OutputDirectory })
+            summary = "Mode=$Mode; Operation=$effectiveOperation; Platform=$(if ($descriptor) { $descriptor.Platform } else { 'Unresolved' }); ExcludedPaths=$excludedPathCount."
+            reviewPath = $reviewPaths
+            requirements = $(if ($status -in @('Blocked', 'Indeterminate')) {
+                'Preserve run evidence and resolve the reported blocker or review partial-Apply state before retrying.'
+            } else {
+                'Retain ReceiptPath, ReceiptSHA256, and ApplyJournalSHA256 independently if optional Revert may be needed later.'
+            })
+            reasonSummary = @(if ($reason) { [pscustomobject]@{ Count = 1; Reason = $reason } })
+            nextStep = $(if ($status -eq 'Indeterminate') {
+                'Inspect events.jsonl and use -Mode Revert -ReviewedPartialApplyRecovery with the preserved receipt and journal hashes before attempting a fresh Apply.'
+            } elseif ($status -eq 'Blocked') {
+                'Resolve the reported reason and re-run with -WhatIf first if previewing.'
+            } elseif ($Mode -eq 'Apply' -and $status -eq 'Verified') {
+                'Review permissions-before-after.csv. Optional rollback: Add-FileSharePermissions.ps1 -Mode Revert -ReceiptPath <ReceiptPath> -ReceiptSHA256 <ReceiptSHA256> -ReviewedApplyJournalSHA256 <ApplyJournalSHA256>.'
+            } else {
+                'Review events.jsonl and permissions-before-after.csv.'
+            })
+        }
+        Write-NtfsCompletion @completionParams
+    }
+    return [pscustomobject]$output
+}
+
+function Invoke-NpPermissionWrite {
+    <#
+    .SYNOPSIS
+    Executes public handle-pinned pure-SMB and local-NTFS permission Apply or Revert.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Mode, [string]$TargetPath, [string]$TargetPlatform, [string]$GroupName,
+        [string]$Permissions, [string]$GroupPermissionsJson, [string]$GroupPermissionsFile,
+        [ValidateSet('Add', 'Remove', 'Replace')][string]$Operation = 'Add', [string]$RemovePrincipal,
+        [string]$Scope, [string]$OutputDirectory, [string]$ChangeTicket, [int]$MaxPaths,
+        [string]$ReceiptPath, [string]$ReceiptSHA256, [string]$ReviewedApplyJournalSHA256,
+        [bool]$ReviewedPartialApplyRecovery, [bool]$Preview, [string]$CallerConfirmPreference = 'High', $BoundParameters
+    )
+    return Invoke-NpDisposableLab @PSBoundParameters -DisposableAcknowledgement $false -PublicWorkflow $true
 }

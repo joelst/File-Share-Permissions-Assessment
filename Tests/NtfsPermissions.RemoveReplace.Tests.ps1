@@ -1139,8 +1139,125 @@ Describe 'Disposable local remove and replace permissions' -Skip:([Environment]:
         Assert-FixtureContent $fixture
     }
 
+    It 'executes public Apply and Revert without -DisposableLocalLab across <Operation>' -ForEach @(
+        @{ Operation = 'Add' }
+        @{ Operation = 'Remove' }
+        @{ Operation = 'Replace' }
+    ) {
+        $fixture = New-RemovalFixture -IncludeSource ($Operation -ne 'Add')
+        $before = @(Get-FixtureState $fixture)
+        $evidenceRoot = Join-Path $script:caseWork 'evidence'
+        $arguments = @{
+            Mode = 'Apply'
+            TargetPath = $fixture.Target
+            TargetPlatform = 'Windows'
+            Operation = $Operation
+            Scope = 'ThisFolderSubfoldersAndFiles'
+            ChangeTicket = 'PUBLIC-CHG-01'
+            OutputDirectory = $evidenceRoot
+            Confirm = $false
+        }
+        if ($Operation -ne 'Add') { $arguments.RemovePrincipal = $fixture.SourceSid }
+        if ($Operation -in @('Add', 'Replace')) {
+            $arguments.GroupName = $script:replacementSid
+            $arguments.Permissions = 'ReadAndExecute'
+        }
+        $apply = & $script:entry @arguments
+        $apply.Status | Should -Be 'Verified' -Because (Get-ResultText $apply)
+        $apply.WriterQualification | Should -Be 'VerifiedPureSmbAndNtfs'
+        (Test-Path -LiteralPath $apply.ReceiptPath) | Should -BeTrue
+        (Test-Path -LiteralPath $apply.AuditReportPath) | Should -BeTrue
+        $revert = & $script:entry -Mode Revert -ReceiptPath $apply.ReceiptPath `
+            -ReceiptSHA256 $apply.ReceiptSHA256 -ReviewedApplyJournalSHA256 $apply.ApplyJournalSHA256 `
+            -ChangeTicket 'PUBLIC-CHG-01-REV' -OutputDirectory $evidenceRoot -Confirm:$false
+        $revert.Status | Should -Be 'Verified' -Because (Get-ResultText $revert)
+        Assert-SameFixtureState $before @(Get-FixtureState $fixture)
+        Assert-FixtureContent $fixture
+    }
+
+    It 'isolates public NtfsPermissionReceipt/1 receipts from -DisposableLocalLab NtfsDisposableReceipt/2 receipts' {
+        $fixture = New-RemovalFixture
+        $before = @(Get-FixtureState $fixture)
+        $evidenceRoot = Join-Path $script:caseWork 'evidence'
+        $publicApply = & $script:entry -Mode Apply -TargetPath $fixture.Target -TargetPlatform Windows `
+            -Operation Remove -RemovePrincipal $fixture.SourceSid -Scope ThisFolderSubfoldersAndFiles `
+            -ChangeTicket 'PUBLIC-ISO-01' -OutputDirectory $evidenceRoot -Confirm:$false
+        $publicApply.Status | Should -Be 'Verified'
+        $crossDisposable = Invoke-ExpectRefusal @{
+            Mode = 'Revert'; DisposableLocalLab = $true; DisposableAcknowledgement = $true
+            ReceiptPath = $publicApply.ReceiptPath; ReceiptSHA256 = $publicApply.ReceiptSHA256
+            ReviewedApplyJournalSHA256 = $publicApply.ApplyJournalSHA256
+            ChangeTicket = 'PUBLIC-ISO-CROSS'; OutputDirectory = $evidenceRoot; Confirm = $false
+        }
+        (Get-ResultText $crossDisposable) | Should -Match 'Receipt schema'
+        $publicRevert = & $script:entry -Mode Revert -ReceiptPath $publicApply.ReceiptPath `
+            -ReceiptSHA256 $publicApply.ReceiptSHA256 -ReviewedApplyJournalSHA256 $publicApply.ApplyJournalSHA256 `
+            -ChangeTicket 'PUBLIC-ISO-REV' -OutputDirectory $evidenceRoot -Confirm:$false
+        $publicRevert.Status | Should -Be 'Verified'
+        Assert-SameFixtureState $before @(Get-FixtureState $fixture)
+
+        $labArgs = Get-ChangeArgument $fixture
+        $labApply = & $script:entry @labArgs
+        $labApply.Status | Should -Be 'Verified'
+        $crossPublic = Invoke-ExpectRefusal @{
+            Mode = 'Revert'
+            ReceiptPath = $labApply.ReceiptPath; ReceiptSHA256 = $labApply.ReceiptSHA256
+            ReviewedApplyJournalSHA256 = $labApply.ApplyJournalSHA256
+            ChangeTicket = 'LAB-ISO-CROSS'; OutputDirectory = $evidenceRoot; Confirm = $false
+        }
+        (Get-ResultText $crossPublic) | Should -Match 'Receipt schema'
+        $labRevert = Invoke-OrdinaryRevert $labApply
+        $labRevert.Status | Should -Be 'Verified'
+        Assert-SameFixtureState $before @(Get-FixtureState $fixture)
+    }
+
+    It 'executes pure-SMB UNC and frozen MappedDrive Apply and Revert across <Platform>' -ForEach @(
+        @{ Platform = 'Windows'; UseMapped = $false }
+        @{ Platform = 'NetApp'; UseMapped = $false }
+        @{ Platform = 'Nas'; UseMapped = $false }
+        @{ Platform = 'NetApp'; UseMapped = $true }
+    ) {
+        $fixture = New-RemovalFixture
+        $driveLetter = $fixture.Target.Substring(0, 1).ToUpperInvariant()
+        $uncShareRoot = "\\$([Environment]::MachineName)\$($driveLetter)`$"
+        if (-not (Test-Path -LiteralPath $uncShareRoot)) {
+            Set-ItResult -Skipped -Because "Administrative loopback share $uncShareRoot is unavailable in this session."
+            return
+        }
+        $relativeSubpath = $fixture.Target.Substring(3)
+        $uncTarget = Join-Path $uncShareRoot $relativeSubpath
+        $before = @(Get-FixtureState $fixture)
+        $evidenceRoot = Join-Path $script:caseWork 'evidence'
+        if ($UseMapped) {
+            Mock Get-NpDriveBinding {
+                [pscustomobject]@{ Kind = 'Mapped'; MappingRoot = $uncShareRoot; HostName = '' }
+            }
+        }
+        $inputPath = if ($UseMapped) { 'Q:\' + $relativeSubpath } else { $uncTarget }
+        $apply = & $script:entry -Mode Apply -TargetPath $inputPath -TargetPlatform $Platform `
+            -Operation Replace -RemovePrincipal $fixture.SourceSid -GroupName $script:replacementSid `
+            -Permissions Modify -Scope ThisFolderSubfoldersAndFiles -ChangeTicket "SMB-$Platform-01" `
+            -OutputDirectory $evidenceRoot -Confirm:$false
+        $apply.Status | Should -Be 'Verified' -Because (Get-ResultText $apply)
+        $apply.WriterQualification | Should -Be 'VerifiedPureSmbAndNtfs'
+        $planData = Get-Content -LiteralPath $apply.RecoveryRecordPath -Raw | ConvertFrom-NpJson
+        $planData.TargetDescriptor.CanonicalPath | Should -Be $uncTarget
+        if ($UseMapped) {
+            $planData.TargetDescriptor.Addressing | Should -Be 'MappedDrive'
+            Mock Get-NpDriveBinding { throw 'Revert must never re-resolve a frozen mapped drive.' }
+        } else {
+            $planData.TargetDescriptor.Addressing | Should -Be 'DirectUNC'
+        }
+        $revert = & $script:entry -Mode Revert -ReceiptPath $apply.ReceiptPath `
+            -ReceiptSHA256 $apply.ReceiptSHA256 -ReviewedApplyJournalSHA256 $apply.ApplyJournalSHA256 `
+            -ChangeTicket "SMB-$Platform-REV" -OutputDirectory $evidenceRoot -Confirm:$false
+        $revert.Status | Should -Be 'Verified' -Because (Get-ResultText $revert)
+        Assert-SameFixtureState $before @(Get-FixtureState $fixture)
+        Assert-FixtureContent $fixture
+    }
+
     It 'does not mutate without the required <Missing> safety gate' -ForEach @(
-        @{ Missing = 'default production gate' }
+        @{ Missing = 'whatif preview' }
         @{ Missing = 'lab opt-in' }
         @{ Missing = 'acknowledgement' }
         @{ Missing = 'change ticket' }
@@ -1151,16 +1268,22 @@ Describe 'Disposable local remove and replace permissions' -Skip:([Environment]:
         Assert-InitialFixture $fixture $before
         $arguments = Get-ChangeArgument $fixture
         switch ($Missing) {
-            'default production gate' {
+            'whatif preview' {
                 [void]$arguments.Remove('DisposableLocalLab')
                 [void]$arguments.Remove('DisposableAcknowledgement')
+                $arguments.WhatIf = $true
             }
             'lab opt-in' { [void]$arguments.Remove('DisposableLocalLab') }
             'acknowledgement' { [void]$arguments.Remove('DisposableAcknowledgement') }
             'change ticket' { [void]$arguments.Remove('ChangeTicket') }
             'output directory' { $arguments.OutputDirectory = '' }
         }
-        $null = Invoke-ExpectRefusal $arguments
+        if ($Missing -eq 'whatif preview') {
+            $preview = & $script:entry @arguments
+            $preview.Status | Should -Be 'WhatIfOrDeclined' -Because (Get-ResultText $preview)
+        } else {
+            $null = Invoke-ExpectRefusal $arguments
+        }
         Assert-SameFixtureState $before @(Get-FixtureState $fixture)
         Assert-FixtureContent $fixture
     }
