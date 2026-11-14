@@ -113,9 +113,17 @@ each verified nine checks using an existing AD security group read-only. These
 included previews, fresh Remove/Replace Applies, audit reports, protected
 boundaries, no-op and refusal cases, and optional Reverts. The original fixture
 states and evidence hashes were verified after each successful run.
-No member/nonmember access tokens were supplied, so effective-access checks
-were not run. These observations do not qualify production, SMB/NAS, concurrent
-administrator activity, host crashes, power loss or storage failure.
+Those initial runs did not include member/nonmember access checks. Two subsequent
+runs on the same candidate source, one per PowerShell edition, each checked
+13 local and 13 SMB reads using separate temporary nonadministrator accounts
+inside and outside a newly created security group. Checks covered Remove and
+Replace after Apply and Revert, including protected paths. Each temporary share
+was removed before the next local NTFS write, and the fixture baseline and
+generated account, group, OU and share cleanup were verified.
+
+These are limited read observations, not comprehensive effective-access tests.
+They do not qualify writes through SMB or on active shares, production, NAS,
+concurrent administrator activity, host crashes, power loss or storage failure.
 
 ## Completed local access qualification
 
