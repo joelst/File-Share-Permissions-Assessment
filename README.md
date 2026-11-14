@@ -802,6 +802,13 @@ records historical, source-specific grant/Revert cases and regression results,
 not qualification of the in-progress Remove/Replace operations or current source.
 It also describes remaining design, infrastructure and approval requirements.
 
+## NetApp test preparation
+
+The [NetApp SMB validation runbook](NETAPP-VALIDATION.md) lists the disposable
+fixture, evidence, public-workflow test matrix, execution order and defect/retest
+process. Complete live NetApp validation remains outstanding, and the runbook
+does not enable or qualify SMB/NAS writes.
+
 ## Work still required
 
 For the ordered lab procedure, test matrix, evidence handoff, and future writer

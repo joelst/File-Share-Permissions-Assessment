@@ -448,6 +448,11 @@ try {
     Assert (@($deltas|Where-Object EntityType -eq 'SharePermission').Count -eq 2) 'Collected SMB allow/deny changes are compared'
     $explicitOut=Invoke-Comparison 'compare-explicit-out' 0 @('-BaselineRunFolder',$oldRun,'-ComparisonRunFolder',$newRun)
     Assert (@(Rows $explicitOut 'NTFS_Changes.csv').Count -eq $deltas.Count) 'Explicit folder pair matches default result'
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+        $longOut=Invoke-Comparison ('compare-long-'+('x'*70)) 0 @('-BaselineRunFolder',$oldRun,'-ComparisonRunFolder',$newRun)
+        Assert (@(Rows $longOut 'NTFS_Changes.csv').Count -eq $deltas.Count) 'Long comparison staging paths preserve all differences'
+        Assert (@(Get-ChildItem -LiteralPath $longOut -Directory -Filter '_temp_*').Count -eq 0) 'Long comparison staging paths are cleaned up'
+    }
     $reverseOut=Invoke-Comparison 'compare-reverse-out' 0 @('-OldRunFolder',$newRun,'-NewRunFolder',$oldRun)
     Assert (@(Rows $reverseOut 'NTFS_Changes.csv'|Where-Object{ $_.Path -eq '\\server\data\added' -and $_.ChangeType -eq 'Removed' }).Count -eq 1) 'Explicit direction is respected, including reverse comparison'
     $sameRun=New-Run 'compare-identical/run' 'identical' '2026-10-30T12:00:00Z' $oldAces $oldFolders

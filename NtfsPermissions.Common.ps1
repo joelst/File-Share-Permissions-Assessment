@@ -593,7 +593,7 @@ function New-NpRun([string]$OutputDirectory, [string]$Target = '') {
         $acl.SetAccessRuleProtection($true,$false)
         $acl.SetOwner($sid)
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit, ObjectInherit','None','Allow'))
-        Set-Acl -LiteralPath $run -AclObject $acl -ErrorAction Stop
+        Set-Acl -LiteralPath $run -AclObject $acl -WhatIf:$false -ErrorAction Stop
         $actual = Get-Acl -LiteralPath $run -ErrorAction Stop
         $rules = @($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
         if (-not $actual.AreAccessRulesProtected -or -not $actual.AreAccessRulesCanonical -or

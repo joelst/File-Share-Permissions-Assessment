@@ -120,6 +120,9 @@ inside and outside a newly created security group. Checks covered Remove and
 Replace after Apply and Revert, including protected paths. Each temporary share
 was removed before the next local NTFS write, and the fixture baseline and
 generated account, group, OU and share cleanup were verified.
+These observations are bound to that fingerprint, not later revisions. In
+particular, the subsequent audit-directory `WhatIf` fix changes the shared
+permission source hash; it does not requalify those access observations.
 
 These are limited read observations, not comprehensive effective-access tests.
 They do not qualify writes through SMB or on active shares, production, NAS,

@@ -114,11 +114,16 @@ Describe 'Internal local NTFS candidate safeguards (not production qualification
                 function New-NpLocalCandidatePlan {
                     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Injects test data without writes.')]
                     [CmdletBinding()]
-                    param($targetPath, $grants, $scope, $maxPaths)
+                    param($targetPath, $grants, $scope, $maxPaths, $operation, $removal)
                     if ($targetPath -cne $script:injectedLocalPlan.TargetDescriptor.CanonicalPath -or
                         (Get-NpCanonicalJson $grants) -cne (Get-NpCanonicalJson $script:injectedLocalPlan.Grants) -or
                         $scope -cne $script:injectedLocalPlan.Scope -or $maxPaths -ne $script:injectedLocalPlan.MaxPaths) {
                         throw 'Injected snapshot does not match the Apply request.'
+                    }
+                    if ($script:injectedLocalPlan.Schema -ceq 'NtfsLocalCandidatePlan/2' -and
+                        ($operation -cne $script:injectedLocalPlan.Operation -or
+                        (Get-NpCanonicalJson $removal) -cne (Get-NpCanonicalJson $script:injectedLocalPlan.Removal))) {
+                        throw 'Injected snapshot does not match the Apply operation or removal.'
                     }
                     return $script:injectedLocalPlan
                 }
@@ -129,6 +134,10 @@ Describe 'Internal local NTFS candidate safeguards (not production qualification
                 $audit.Path = Join-Path $directory 'orchestration.jsonl'
                 $parameters.applyTargetPath = $plan.TargetDescriptor.CanonicalPath
                 $parameters.applyGrants = $plan.Grants
+                if ($plan.Schema -ceq 'NtfsLocalCandidatePlan/2') {
+                    $parameters.applyOperation = $plan.Operation
+                    $parameters.applyRemoval = $plan.Removal
+                }
                 $parameters.applyScope = $plan.Scope
                 $parameters.applyMaxPaths = $plan.MaxPaths
                 $parameters.orchestration = $audit
@@ -196,7 +205,7 @@ $parameters = @{
 if ($request.Journal.Mode -ceq 'Apply') {
     $script:injectedLocalPlan = $request.Plan
     function New-NpLocalCandidatePlan {
-        param($targetPath, $grants, $scope, $maxPaths)
+        param($targetPath, $grants, $scope, $maxPaths, $operation, $removal)
         return $script:injectedLocalPlan
     }
     $request.Journal.PlanHash = ''
@@ -205,6 +214,10 @@ if ($request.Journal.Mode -ceq 'Apply') {
     $audit.Path = Join-Path $directory 'orchestration.jsonl'
     $parameters.ApplyTargetPath = $request.Plan.TargetDescriptor.CanonicalPath
     $parameters.ApplyGrants = $request.Plan.Grants
+    if ($request.Plan.Schema -ceq 'NtfsLocalCandidatePlan/2') {
+        $parameters.ApplyOperation = $request.Plan.Operation
+        $parameters.ApplyRemoval = $request.Plan.Removal
+    }
     $parameters.ApplyScope = $request.Plan.Scope
     $parameters.ApplyMaxPaths = $request.Plan.MaxPaths
     $parameters.Orchestration = $audit
@@ -1216,6 +1229,67 @@ throw 'Apply returned before the interruption boundary.'
             [IO.File]::ReadAllText((Join-Path $plan.TargetDescriptor.CanonicalPath $file)) |
                 Should -BeExactly $content
         }
+    }
+
+    It 'recovers <Operation> Apply interrupted at <Boundary> before a fresh retry' -ForEach @(
+        @{ Operation = 'Remove'; Boundary = 'durable intent'; Stage = 'CandidateWriteIntent'; BeforeEvent = $false; Written = $false }
+        @{ Operation = 'Remove'; Boundary = 'write before proof'; Stage = 'CandidatePathVerified'; BeforeEvent = $true; Written = $true }
+        @{ Operation = 'Remove'; Boundary = 'durable proof'; Stage = 'CandidatePathVerified'; BeforeEvent = $false; Written = $true }
+        @{ Operation = 'Replace'; Boundary = 'durable intent'; Stage = 'CandidateWriteIntent'; BeforeEvent = $false; Written = $false }
+        @{ Operation = 'Replace'; Boundary = 'write before proof'; Stage = 'CandidatePathVerified'; BeforeEvent = $true; Written = $true }
+        @{ Operation = 'Replace'; Boundary = 'durable proof'; Stage = 'CandidatePathVerified'; BeforeEvent = $false; Written = $true }
+    ) {
+        $target = New-LocalFixture
+        $sourceSid = 'S-1-5-21-100-200-300-401'
+        $acl = Get-Acl -LiteralPath $target -ErrorAction Stop
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            [Security.Principal.SecurityIdentifier]::new($sourceSid),
+            'ReadPermissions', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+        Set-Acl -LiteralPath $target -AclObject $acl -ErrorAction Stop
+        $grants = if ($Operation -ceq 'Replace') { @($script:localGrants) } else { @() }
+        $plan = New-NpLocalCandidatePlan -targetPath $target -operation $Operation `
+            -removal (Resolve-NpLocalRemoval $sourceSid) -grants $grants
+        $journal = New-LocalJournal -plan $plan
+        Invoke-LocalProcessInterruption -plan $plan -journal $journal -stage $Stage -beforeEvent:$BeforeEvent
+        $evidence = Read-NpJournal -Path $journal.Path
+        $evidence.Status | Should -Be 'Verified'
+        @($evidence.Events | Where-Object Stage -ceq 'CandidateWriteIntent').Count | Should -Be 1
+        @($evidence.Events | Where-Object { $_.Stage -in @('CandidateComplete', 'CandidateStopped') }).Count |
+            Should -Be 0
+        $observed = @(Get-LocalState -plan $plan)
+        for ($index = 0; $index -lt $observed.Count; $index++) {
+            $expected = if ($Written -and $index -eq 0) { $plan.Entries[$index].Desired } else { $plan.Entries[$index].Before }
+            (Get-NpCanonicalJson $observed[$index]) | Should -BeExactly (Get-NpCanonicalJson $expected)
+        }
+        $blockedJournal = New-LocalJournal -plan $plan -mode Revert
+        $blocked = Invoke-NpLocalCandidate -plan $plan -planSHA256 $journal.PlanHash -journal $blockedJournal `
+            -mode Revert -applyJournalPath $journal.Path -applyJournalSHA256 $evidence.SHA256 `
+            -DisposableAcknowledgement -Confirm:$false
+        $blocked.Status | Should -Be 'Blocked'
+        $blocked.Error | Should -Match 'interrupted recovery requires independent review'
+        (Get-NpCanonicalJson (Get-LocalState -plan $plan)) | Should -BeExactly (Get-NpCanonicalJson $observed)
+
+        $recoveryJournal = New-LocalJournal -plan $plan -mode Revert
+        $recovery = Invoke-NpLocalCandidate -plan $plan -planSHA256 $journal.PlanHash -journal $recoveryJournal `
+            -mode Revert -applyJournalPath $journal.Path -applyJournalSHA256 $evidence.SHA256 `
+            -reviewedPartialApplyRecovery -DisposableAcknowledgement -Confirm:$false
+        $expectedStatus = if ($Written) { 'Verified' } else { 'NoOp' }
+        $recovery.Status | Should -Be $expectedStatus -Because $recovery.Error
+        (Get-NpCanonicalJson (Get-LocalState -plan $plan)) |
+            Should -BeExactly (Get-NpCanonicalJson @($plan.Entries | ForEach-Object Before))
+        $freshJournal = New-LocalJournal -plan $plan
+        $fresh = Invoke-LocalCandidateWithInjectedPlan -plan $plan -planSHA256 $freshJournal.PlanHash -journal $freshJournal `
+            -DisposableAcknowledgement -Confirm:$false
+        $fresh.Status | Should -Be 'Verified' -Because $fresh.Error
+        $revertJournal = New-LocalJournal -plan $plan -mode Revert
+        $revert = Invoke-NpLocalCandidate -plan $plan -planSHA256 $freshJournal.PlanHash -journal $revertJournal `
+            -mode Revert -applyJournalPath $freshJournal.Path `
+            -applyJournalSHA256 (Get-NpBytesHash ([IO.File]::ReadAllBytes($freshJournal.Path))) `
+            -DisposableAcknowledgement -Confirm:$false
+        $revert.Status | Should -Be 'Verified' -Because $revert.Error
+        (Get-NpCanonicalJson (Get-LocalState -plan $plan)) |
+            Should -BeExactly (Get-NpCanonicalJson @($plan.Entries | ForEach-Object Before))
+        (Get-NpBytesHash ([IO.File]::ReadAllBytes($journal.Path))) | Should -BeExactly $evidence.SHA256
     }
 
     It 'refuses reviewed partial Apply recovery for <Fault> without changing any path' -ForEach @(

@@ -841,3 +841,27 @@ Describe 'Public qualification gate' {
         $command.Parameters['TargetPath'].Aliases | Should -Contain ShareName
     }
 }
+
+Describe 'Windows public gate audit ACL' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    It 'creates restricted audit evidence for <Mode> WhatIf without writing the target' -ForEach @(
+        @{ Mode = 'Apply' }
+        @{ Mode = 'Revert' }
+    ) {
+        $saved = Save-TestPlan (New-TestPlan)
+        $result = & (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') -Mode $Mode `
+            -PlanPath $saved.Path -PlanSHA256 $saved.Hash -ChangeTicket CHG123 `
+            -OutputDirectory $script:work -WhatIf
+        $LASTEXITCODE | Should -Be 2
+        $result.Status | Should -Be Blocked
+        $result.TargetWrites | Should -Be 0
+        $acl = Get-Acl -LiteralPath $result.RunDirectory
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be $sid.Value
+        $rules.Count | Should -Be 1
+        $rules[0].IdentityReference.Value | Should -Be $sid.Value
+        (Read-NpJournal (Join-Path $result.RunDirectory 'events.jsonl')).Events.Result |
+            Should -Contain 'Blocked/NotQualified'
+    }
+}
