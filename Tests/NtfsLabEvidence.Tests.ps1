@@ -53,6 +53,16 @@ Describe 'Lab evidence runner safety and reporting' -Skip:([Environment]::OSVers
         @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])).Count | Should -Be 1
     }
 
+    It 'records the native lab probe source in the evidence hashes' {
+        $root = Join-Path $script:labTestRoot ([guid]::NewGuid().ToString('N'))
+        $result = & $script:labRunner -outputRoot $root
+        $probe = Join-Path $PSScriptRoot 'NtfsCandidateLabProbe.cs'
+        $entries = @(Import-Csv -LiteralPath (Join-Path $result.EvidencePath 'source-hashes.csv') |
+            Where-Object Path -eq $probe)
+        $entries.Count | Should -Be 1
+        $entries[0].Hash | Should -BeExactly (Get-FileHash -LiteralPath $probe -Algorithm SHA256).Hash
+    }
+
     It 'keeps evidence and reports incomplete inspection for a nonexistent target' {
         $root = Join-Path $script:labTestRoot ([guid]::NewGuid().ToString('N'))
         $missingTarget = Join-Path $script:labTestRoot ('missing_' + [guid]::NewGuid().ToString('N'))
@@ -115,6 +125,29 @@ Describe 'Lab evidence runner safety and reporting' -Skip:([Environment]::OSVers
         } finally {
             [Environment]::SetEnvironmentVariable('NTFS_LAB_CANDIDATE_ID', $previousId, 'Process')
         }
+    }
+
+    It 'includes targeted remove and replace tests in the candidate suite' {
+        Mock Invoke-Pester {
+            param($Configuration)
+            $paths = @($Configuration.Run.Path.Value)
+            if ($paths -notcontains (Join-Path $PSScriptRoot 'NtfsPermissions.Local.Tests.ps1') -or
+                $paths -notcontains (Join-Path $PSScriptRoot 'NtfsPermissions.RemoveReplace.Tests.ps1')) {
+                throw 'Candidate test paths are incomplete.'
+            }
+            [pscustomobject]@{
+                Result = 'Passed'; PassedCount = 1; FailedCount = 0; SkippedCount = 0
+                InconclusiveCount = 0; NotRunCount = 0
+                Tests = @([pscustomobject]@{ Result = 'Passed'; ExpandedPath = 'Passing test' })
+            }
+        }
+        $root = Join-Path $script:labTestRoot ([guid]::NewGuid().ToString('N'))
+        { & $script:labRunner -outputRoot $root -runDisposableCandidateTests -disposableAcknowledgement } |
+            Should -Throw '*Evidence requires review*'
+        $run = @(Get-ChildItem -LiteralPath $root -Directory)
+        $summary = Get-Content -LiteralPath (Join-Path $run[0].FullName 'summary.json') -Raw | ConvertFrom-Json
+        ($summary.Checks | Where-Object Name -ceq 'Pester').Status | Should -Be 'Observed'
+        ($summary.Checks | Where-Object Name -ceq 'CandidateFixtureEvidence').Status | Should -Be 'Incomplete'
     }
 
     It 'reports failed Pester discovery even when no individual test failed' {

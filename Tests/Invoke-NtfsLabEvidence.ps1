@@ -159,7 +159,8 @@ try {
         $sourceFiles = @(
             Get-ChildItem -LiteralPath $repositoryRoot -File -ErrorAction Stop |
                 Where-Object Extension -in @('.ps1', '.cs')
-            Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1' -File -ErrorAction Stop
+            Get-ChildItem -LiteralPath $PSScriptRoot -File -ErrorAction Stop |
+                Where-Object Extension -in @('.ps1', '.cs')
         )
         $sourceFiles | Sort-Object FullName | Get-FileHash -Algorithm SHA256 -ErrorAction Stop |
             Select-Object Path, Algorithm, Hash |
@@ -232,6 +233,7 @@ try {
     }
     if ($runDisposableCandidateTests) {
         $testPaths.Add((Join-Path $PSScriptRoot 'NtfsPermissions.Local.Tests.ps1'))
+        $testPaths.Add((Join-Path $PSScriptRoot 'NtfsPermissions.RemoveReplace.Tests.ps1'))
         $candidateId = [guid]::NewGuid().ToString('N')
         $candidateFixturePath = Join-Path $PSScriptRoot ('LocalCandidateTests_' + $candidateId)
     }
@@ -323,7 +325,10 @@ try {
                             $auditDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
                             throw 'Unexpected candidate audit directory or reparse point.'
                         }
-                        foreach ($fileName in @('events.jsonl', 'candidate.lock')) {
+                        foreach ($fileName in @(
+                            'events.jsonl', 'candidate.lock', 'interruption.json',
+                            'interruption-request.clixml', 'child-stdout.txt', 'child-stderr.txt'
+                        )) {
                             $auditPath = Join-Path $auditDirectory.FullName $fileName
                             if (Test-Path -LiteralPath $auditPath -PathType Leaf) {
                                 $auditFile = Get-Item -LiteralPath $auditPath -Force -ErrorAction Stop
@@ -382,7 +387,7 @@ try {
         Checks = @($checks.ToArray())
         Limitations = @(
             'No production change authorization or writer qualification.'
-            'No effective-access, external client, crash/disconnect or interrupted-recovery tests.'
+            'No effective-access, external-client, OS-crash, power-loss, storage-failure or backend-disconnect tests.'
             'Fixture Pester tests use synthetic SIDs; the selected candidate fixture is preserved for review.'
             'Read-only inventory is scoped, non-atomic and does not prove target authority or physical identity.'
         )

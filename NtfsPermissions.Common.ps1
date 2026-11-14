@@ -211,7 +211,8 @@ function Get-NpGrants {
         $items = @($parsed)
     }
     if ($items.Count -lt 1 -or $items.Count -gt 128) { throw 'Supply 1 to 128 grants.' }
-    $rights = @{ Read = 131209; ReadAndExecute = 131241; Modify = 197055; FullControl = 2032127 }
+    # Windows allow rules include SYNCHRONIZE, which common file opens require.
+    $rights = @{ Read = 1179785; ReadAndExecute = 1179817; Modify = 1245631; FullControl = 2032127 }
     $seen = @{}
     $result = @()
     foreach ($item in $items) {
@@ -240,7 +241,7 @@ function Get-NpSidSize([string]$SID) {
 
 function Assert-NpNormalizedGrants($Grants) {
     $seen = @{}
-    $masks = @{ Read = 131209; ReadAndExecute = 131241; Modify = 197055; FullControl = 2032127 }
+    $masks = @{ Read = 1179785; ReadAndExecute = 1179817; Modify = 1245631; FullControl = 2032127 }
     if (@($Grants).Count -lt 1 -or @($Grants).Count -gt 128) { throw 'Invalid grants.' }
     foreach ($grant in $Grants) {
         Assert-NpProperties $grant @('GroupName','SID','Permissions','Mask')
@@ -338,7 +339,8 @@ function New-NpProposal($Before, $Grants, [string]$Scope, [bool]$Root = $true) {
         $covered = 0L
         foreach ($ace in $aces) {
             if ($ace.Type -eq 'Allow' -and $ace.SID -eq $grant.SID -and -not $ace.InheritOnly -and
-                (-not ($inherit -and $Root) -or ($ace.ContainerInherit -and $ace.ObjectInherit -and -not $ace.NoPropagate))) {
+                (-not ($inherit -and $Before.Kind -eq 'Folder') -or
+                    ($ace.ContainerInherit -and $ace.ObjectInherit -and -not $ace.NoPropagate))) {
                 $covered = $covered -bor [long]$ace.Mask
             }
         }

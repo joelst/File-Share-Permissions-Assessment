@@ -16,7 +16,8 @@ $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 . (Join-Path $root 'NtfsAssessment.Common.ps1')
 $engine=(Get-Process -Id $PID).Path
-$testRoot=Join-Path $PSScriptRoot ('NtfsAssessmentTests_'+[guid]::NewGuid().ToString('N'))
+# Keep nested evidence paths below Windows PowerShell 5.1's MAX_PATH in this checkout.
+$testRoot=Join-Path $PSScriptRoot ('Nat_'+[guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $testRoot)
 $script:checks=0
 $script:TestArea='CSV and parsing'

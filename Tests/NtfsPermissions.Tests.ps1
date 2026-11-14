@@ -20,7 +20,7 @@ BeforeAll {
             DaclPresent=$true; Canonical=$true; Aces=@(); Descriptor="fixture-before:$Path"
         }
     }
-    function New-TestAce([string]$SID='S-1-5-21-1-2-3-1001',[string]$Type='Allow',[long]$Mask=131241) {
+    function New-TestAce([string]$SID='S-1-5-21-1-2-3-1001',[string]$Type='Allow',[long]$Mask=1179817) {
         [pscustomobject][ordered]@{
             SID=$SID; Type=$Type; Mask=$Mask; Inherited=$false
             ContainerInherit=$true; ObjectInherit=$true; InheritOnly=$false; NoPropagate=$false
@@ -108,7 +108,7 @@ Describe 'Strict UNC and grant validation' {
         $grants=@(Get-NpGrants -Json '[{"GroupName":"A","Permissions":"Read"},{"Permissions":"Modify","GroupName":"B"}]' -Resolve $resolve)
         $grants.Count | Should -Be 2
         $calls.Count | Should -Be 2
-        $grants[1].Mask | Should -Be 197055
+        $grants[1].Mask | Should -Be 1245631
     }
     It 'accepts escaped domain names and JSON files' {
         $json='[{"GroupName":"DOMAIN\\Readers","Permissions":"Read"}]'
@@ -344,6 +344,29 @@ Describe 'Read-only abstract ACL proposal safety' {
             $before.Aces=@($ace)
             (New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles).NoOp | Should -BeFalse
         }
+    }
+    It 'requires propagating coverage on recursive descendant folders, but not files' {
+        foreach($condition in @('Noninheritable','NoPropagate')){
+            $before=New-TestSnapshot '\\SERVER1\Share1\Folder\child'
+            $ace=New-TestAce
+            if($condition -eq 'Noninheritable'){
+                $ace.ContainerInherit=$false
+                $ace.ObjectInherit=$false
+            } else { $ace.NoPropagate=$true }
+            $before.Aces=@($ace)
+            $proposal=New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles $false
+            $proposal.NoOp | Should -BeFalse
+            $proposal.Intent.Aces.Count | Should -Be 2
+            $proposal.Intent.Aces[-1].Inherited | Should -BeTrue
+            $proposal.Intent.Aces[-1].ContainerInherit | Should -BeTrue
+            $proposal.Intent.Aces[-1].ObjectInherit | Should -BeTrue
+        }
+        $file=New-TestSnapshot '\\SERVER1\Share1\Folder\child\file.txt' File
+        $ace=New-TestAce
+        $ace.ContainerInherit=$false
+        $ace.ObjectInherit=$false
+        $file.Aces=@($ace)
+        (New-NpProposal $file (New-TestGrants) ThisFolderSubfoldersAndFiles $false).NoOp | Should -BeTrue
     }
     It 'rejects absent/null DACL and noncanonical ACL' {
         foreach($flag in @('DaclPresent','Canonical')){

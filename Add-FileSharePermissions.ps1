@@ -11,7 +11,7 @@
 # This script is not an official Microsoft product or supported Microsoft service.
 <#
 .SYNOPSIS
-Read-only NTFS permission planning with audited, DISABLED live Apply/Revert.
+Read-only planning and an explicit, unqualified disposable local-NTFS lab option.
 .DESCRIPTION
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
 
@@ -21,7 +21,9 @@ directory, verified mapped drive (converted to UNC), or deep direct UNC and affe
 folders AND files. Default scope is ThisFolderSubfoldersAndFiles through existing
 inheritance only. Protected descendant boundaries are recorded, not traversed.
 No SMB share ACLs, inheritance toggles, or recursive explicit grants are written.
-Plans are review-only/Blocked, not executable. Public native mutation is absent.
+Default plans are review-only/Blocked, not executable. The separate
+-DisposableLocalLab option invokes the unqualified local candidate only after
+explicit acknowledgement and a ticket; it must never be used in production.
 
 Requires Windows, RSAT ActiveDirectory group reads and sufficient read access.
 SMB plans read Windows-style filesystem ACLs on Windows, NetApp or generic NAS;
@@ -54,7 +56,8 @@ Known same-named local SMB backing paths are checked and mapped output drives
 are rejected. The caller must independently validate remaining physical mappings
 (aliases, subst/8.3/DFS); this tool cannot prove them.
 Named target mutexes coordinate this host only (not aliases or other hosts).
-Reports use the toolkit's 100,000,000-byte CSV part cap.
+Toolkit assessment reports use the 100,000,000-byte CSV part cap; the verified
+disposable-lab before/after audit is a single streamed CSV.
 Revert can additionally review RecoveryManifestPath, RecoveryJournalPath and
 RecoveryJournalSHA256 together. This verifies source/evidence bindings only;
 it never authorizes or executes restoration.
@@ -71,9 +74,33 @@ exclusive-handle propagation suppression; concurrent administrator drift; exact
 DACL/owner/group/control and identity verification on every affected path; guarded
 per-path rollback under propagation, protected boundaries and crashes/timeouts.
 SetKernelObjectSecurity is unsupported for files and is never used.
-No Force/experimental bypass exists. Offline mocks do NOT qualify this release.
+No Force bypass exists for default modes. Offline mocks do NOT qualify this release.
 Failures stop, preserve evidence and require explicit recovery review; never retry
 or auto-rollback. Torn journal tails are Indeterminate and retained unchanged.
+These default-mode statements do not describe the separate disposable opt-in.
+Each Apply creates a fresh plan in that same invocation; it cannot consume a
+previous plan or WhatIf preview. It persists exact native preimages and desired
+states before writes, then returns a receipt and Apply journal hashes. Retain the
+receipt hash independently and review the source-bound journal before Revert;
+hashes are not authentication. Revert requires the same source, the saved record,
+the receipt, its retained hash and the reviewed Apply journal hash. Recovery
+evidence does not expire after 24 hours. Partial Apply recovery additionally
+requires -ReviewedPartialApplyRecovery. Separate fresh audit directories are
+created; no automatic rollback or overwrite is performed.
+Only direct fixed local Windows NTFS is supported, never SMB, mapped drives or NAS.
+Non-atomic administrator and namespace races remain; this is not production ready.
+Before a write, all inventoried paths outside protected branches must have the
+DACL auto-inherited control flag; otherwise the operation is blocked. NoOp remains
+available. Zero-share handles do not guarantee that propagation is suppressed.
+The disposable option also supports -Operation Remove or Replace with
+-RemovePrincipal Everyone, a SID, or an AD security group. It removes matching
+allow ACEs only in the selected unprotected scope. An inherited source ACE at
+the target, matching denies, and folder-only removal of inheritable ACEs are
+refused rather than changing inheritance or unrelated access. Replace requires
+the destination group and permissions and preserves each source ACE's inheritance
+flags; it adds no replacement ACE on a path without a source ACE. The requested
+rights can be broader than the source rights. A verified run returns a before/after
+permissions CSV.
 .EXAMPLE
 .\Add-FileSharePermissions.ps1 -Mode Plan -TargetPath 'Z:\share\folder' -TargetPlatform Windows -GroupName 'DOMAIN\Readers' -Permissions ReadAndExecute -OutputDirectory C:\NtfsAudit
 Z: must be verified as fixed NTFS or an available mapped UNC in this logon context.
@@ -87,6 +114,18 @@ Read-only Windows-style filesystem ACL plan, not share permissions or ONTAP writ
 .EXAMPLE
 .\Add-FileSharePermissions.ps1 -Mode Apply -PlanPath C:\NtfsAudit\Permissions_RUN\plan.json -PlanSHA256 REVIEWED_SHA256 -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit
 This records Blocked/NotQualified; no target ACL write is possible.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -TargetPath C:\DisposableLab\Fixture -GroupName 'DOMAIN\LabReaders' -Permissions Read -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence -WhatIf
+Preview only. Remove -WhatIf only in an independently approved disposable lab.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Revert -DisposableLocalLab -DisposableAcknowledgement -ReceiptPath C:\LabEvidence\Permissions_RUN\receipt.json -ReceiptSHA256 RETAINED_RECEIPT_SHA256 -ReviewedApplyJournalSHA256 REVIEWED_APPLY_JOURNAL_SHA256 -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence
+Review and retain the Apply evidence and hashes independently before Revert.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -Operation Replace -RemovePrincipal Everyone -TargetPath C:\DisposableLab\Fixture -GroupName 'DOMAIN\LabReaders' -Permissions ReadAndExecute -Scope ThisFolderSubfoldersAndFiles -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence -WhatIf
+Preview replacing explicit Everyone allow entries with the selected group.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -Operation Remove -RemovePrincipal S-1-1-0 -TargetPath C:\DisposableLab\Fixture -Scope ThisFolderSubfoldersAndFiles -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence
+Remove Everyone allow entries in the selected disposable scope.
 #>
 [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
@@ -97,6 +136,8 @@ param(
     [string]$Permissions,
     [string]$GroupPermissionsJson,
     [string]$GroupPermissionsFile,
+    [ValidateSet('Add','Remove','Replace')][string]$Operation = 'Add',
+    [string]$RemovePrincipal,
     [ValidateSet('ThisFolderSubfoldersAndFiles','ThisFolderOnly')][string]$Scope = 'ThisFolderSubfoldersAndFiles',
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [string]$PlanPath,
@@ -105,12 +146,43 @@ param(
     [string]$RecoveryManifestPath,
     [string]$RecoveryJournalPath,
     [string]$RecoveryJournalSHA256,
+    [switch]$DisposableLocalLab,
+    [switch]$DisposableAcknowledgement,
+    [string]$ReceiptPath,
+    [string]$ReceiptSHA256,
+    [string]$ReviewedApplyJournalSHA256,
+    [switch]$ReviewedPartialApplyRecovery,
     [ValidateRange(1,100000)][int]$MaxPaths = 10000,
     [ValidateRange(1,24)][int]$MaxPlanAgeHours = 24
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Common.ps1')
+
+if ($DisposableLocalLab) {
+    . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
+    $labArguments = @{
+        Mode=$Mode; TargetPath=$TargetPath; TargetPlatform=$TargetPlatform; GroupName=$GroupName
+        Permissions=$Permissions; GroupPermissionsJson=$GroupPermissionsJson; GroupPermissionsFile=$GroupPermissionsFile
+        Operation=$Operation; RemovePrincipal=$RemovePrincipal
+        Scope=$Scope; OutputDirectory=$OutputDirectory; ChangeTicket=$ChangeTicket; MaxPaths=$MaxPaths
+        DisposableAcknowledgement=$DisposableAcknowledgement; ReceiptPath=$ReceiptPath; ReceiptSHA256=$ReceiptSHA256
+        ReviewedApplyJournalSHA256=$ReviewedApplyJournalSHA256
+        ReviewedPartialApplyRecovery=$ReviewedPartialApplyRecovery; Preview=[bool]$WhatIfPreference
+        CallerConfirmPreference=[string]$ConfirmPreference
+        BoundParameters=$PSBoundParameters
+    }
+    $labResult = Invoke-NpDisposableLab @labArguments
+    $labResult
+    if ($labResult.Status -in @('Blocked','Indeterminate')) { exit 2 }
+    exit 0
+}
+if ($DisposableAcknowledgement -or $ReceiptPath -or $ReceiptSHA256 -or $ReviewedApplyJournalSHA256 -or $ReviewedPartialApplyRecovery) {
+    throw 'Disposable lab options require -DisposableLocalLab; the default public mutation gate remains closed.'
+}
+if ($Operation -ne 'Add' -or $PSBoundParameters.ContainsKey('RemovePrincipal')) {
+    throw 'Remove and Replace are available only in the explicitly acknowledged disposable-local-lab workflow.'
+}
 
 # Parse/hash a supplied plan only once. Defer errors until safe local audit exists.
 $plan = $null

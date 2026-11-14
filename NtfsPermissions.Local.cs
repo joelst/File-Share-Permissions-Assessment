@@ -31,7 +31,7 @@ namespace NtfsPermissions.LocalCandidate
         public string PhysicalPath { get { return volumeRoot + Path.Substring(3); } }
         public bool Writable { get { return writable; } }
 
-        private Lease(string path, bool writeAccess)
+        private Lease(string path, bool writeAccess, bool auditDirectory)
         {
             if (Environment.OSVersion.Platform != PlatformID.Win32NT)
                 throw new PlatformNotSupportedException("The local candidate requires Windows.");
@@ -64,10 +64,14 @@ namespace NtfsPermissions.LocalCandidate
                     ancestor = System.IO.Path.Combine(ancestor, parts[i]);
                     ancestors.Add(OpenChecked(ancestor, ReadAttributes, 3));
                 }
-                // No fallback to shared handles: SetSecurityInfo propagation depends on sharing.
-                handle = OpenChecked(Path, ReadControl | ReadAttributes | ReadDataOrListDirectory | (writable ? WriteDac : 0), 0);
+                // Target handles remain zero-share during DACL operations. The audit directory
+                // permits child-file renames while still denying delete sharing on its route.
+                handle = OpenChecked(Path, ReadControl | ReadAttributes | ReadDataOrListDirectory | (writable ? WriteDac : 0),
+                    auditDirectory ? 3u : 0u);
                 identity = ReadIdentity(handle);
-                Read();
+                Snapshot initial = Read();
+                if (auditDirectory && initial.Kind != "Folder")
+                    throw new InvalidOperationException("The audit namespace must be a directory.");
             }
             catch
             {
@@ -78,7 +82,12 @@ namespace NtfsPermissions.LocalCandidate
 
         public static Lease Open(string path, bool writable)
         {
-            return new Lease(path, writable);
+            return new Lease(path, writable, false);
+        }
+
+        public static Lease OpenAuditDirectory(string path)
+        {
+            return new Lease(path, false, true);
         }
 
         private SafeFileHandle OpenChecked(string path, uint access, uint sharing)
@@ -188,6 +197,19 @@ namespace NtfsPermissions.LocalCandidate
             }
             if (!new CommonSecurityDescriptor(false, false, raw).IsDiscretionaryAclCanonical)
                 throw new InvalidOperationException("Noncanonical DACL.");
+            RawSecurityDescriptor roundTrip = new RawSecurityDescriptor(raw.GetSddlForm(
+                AccessControlSections.Owner | AccessControlSections.Group | AccessControlSections.Access));
+            if (raw.ControlFlags != roundTrip.ControlFlags || !raw.Owner.Equals(roundTrip.Owner) ||
+                !raw.Group.Equals(roundTrip.Group) || roundTrip.DiscretionaryAcl == null ||
+                raw.DiscretionaryAcl.BinaryLength != roundTrip.DiscretionaryAcl.BinaryLength)
+                throw new InvalidOperationException("Security descriptor cannot be represented losslessly.");
+            byte[] originalAcl = new byte[raw.DiscretionaryAcl.BinaryLength];
+            byte[] roundTripAcl = new byte[roundTrip.DiscretionaryAcl.BinaryLength];
+            raw.DiscretionaryAcl.GetBinaryForm(originalAcl, 0);
+            roundTrip.DiscretionaryAcl.GetBinaryForm(roundTripAcl, 0);
+            for (int i = 0; i < originalAcl.Length; i++)
+                if (originalAcl[i] != roundTripAcl[i])
+                    throw new InvalidOperationException("DACL cannot be represented losslessly.");
         }
 
         public Snapshot WriteDacl(string expectedDescriptor, string desiredDescriptor)
@@ -208,8 +230,8 @@ namespace NtfsPermissions.LocalCandidate
             GCHandle pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
             try
             {
-                // A zero-share handle suppresses implicit descendant propagation. The coordinator
-                // writes and verifies each approved inherited state separately; no protection toggles.
+                // The coordinator writes and verifies each approved state separately. Zero-share
+                // handles do not universally prevent implicit descendant inheritance changes.
                 uint error = SetSecurityInfo(handle, 1, 4, IntPtr.Zero, IntPtr.Zero,
                     pinned.AddrOfPinnedObject(), IntPtr.Zero);
                 if (error != 0) throw new Win32Exception((int)error, "Set handle DACL (outcome requires review)");

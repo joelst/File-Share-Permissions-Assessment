@@ -94,7 +94,7 @@ Describe 'Read-only validation evidence workflow' {
     It 'records an already covered no-op without calling it a successful change' {
         $s=New-VSnapshot
         $s.Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         $script:fixture=New-VInventory @($s)
@@ -536,7 +536,7 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='observed-different'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'NotAssessed' }
@@ -551,7 +551,7 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='grant-plus-unrelated-drift'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'Failed' }
@@ -564,7 +564,7 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='root-only-grant'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'ObservedUnchanged' }

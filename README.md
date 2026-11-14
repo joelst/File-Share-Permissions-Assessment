@@ -2,15 +2,22 @@
 
 PowerShell tools for collecting SMB share and NTFS directory permissions, producing
 offline review reports, comparing snapshots, and gathering read-only evidence for
-permission-change planning.
+permission-change planning. An explicit disposable-lab option also provides
+targeted permission changes.
 
 **This is an assessment and evidence toolkit, not a production remediation tool.**
-`Add-FileSharePermissions.ps1` can prepare review-only plans, but its `Apply` and
-`Revert` modes are deliberately blocked. No qualified production writer exists.
-An internal local-NTFS candidate is isolated from these entry points and is not
+`Add-FileSharePermissions.ps1` prepares review-only plans; its default `Apply` and
+`Revert` modes remain blocked. Its in-progress, explicit disposable-local-lab
+option performs real targeted Add/Remove/Replace changes without requiring the
+operator to prepare a plan. No qualified production writer exists.
+The disposable-lab option uses an internal local-NTFS candidate; it is not
 production qualification or an enable switch.
 Passing tests or completing a validation walkthrough does not enable writes or
 qualify a platform for remediation.
+
+[Targeted disposable-lab changes](#separate-workflow-targeted-disposable-lab-permission-changes)
+are independent of assessment, reporting and validation. No assessment or
+previous plan is required, and Revert is optional.
 
 ## Scripts and their roles
 
@@ -20,7 +27,7 @@ qualify a platform for remediation.
 | `Merge-NtfsAssessment.ps1` | Reads collected runs and produces consolidated findings, folder/share risk indicators, group reports, coverage reports, and executive summaries. | After collection; does not collect live data. |
 | `New-NtfsBestPracticesReport.ps1` | Generates a best-practices report from one verified assessment run, optionally against a JSON policy. | After collection; independent of merge. |
 | `Compare-NtfsAssessment.ps1` | Compares two original assessment snapshots for directory ACL, owner/inheritance, share metadata, and share ACL differences. | After two snapshots exist; merge is not a prerequisite. |
-| `Add-FileSharePermissions.ps1` | Resolves AD security groups and inventories folders/files to create an abstract permission plan and audit journal. | Optional, separate planning workflow after review. Never an automatic next step from findings. |
+| `Add-FileSharePermissions.ps1` | Creates abstract permission plans; its explicitly acknowledged disposable-local-lab option also performs targeted Add/Remove/Replace with recovery evidence and optional Revert. | Independent planning or disposable-lab workflow. Never an automatic next step from findings or a production writer. |
 | `Invoke-NtfsPermissionValidation.ps1` | Creates a sealed case and records before/after observations around separately approved external manual actions. | Optional disposable-lab workflow; not a permission-change executor. |
 | `Tests\New-NtfsLabFixture.ps1` | Provisions fictional AD employees, AGDLP groups, placeholder files, varied NTFS ACLs and a new SMB share. | Disposable lab setup only; creates real domain objects and changes permissions only on its new fixture. |
 
@@ -35,9 +42,9 @@ the entry points rather than run as standalone workflows:
 | `NtfsPermissions.Validation.ps1` | Immutable validation stages, capture comparisons, case integrity, and manual-observation validation. |
 
 `NtfsPermissions.Local.ps1` and `NtfsPermissions.Local.cs` are internal candidate
-code, **not loaded by the public planner or validation entry point**. The permission
-source/evidence hashes include them so modifying the candidate invalidates old
-source bindings.
+code. The default planner and validation entry point do not load them; the explicit
+disposable-lab option does. The permission source/evidence hashes include them so
+modifying the candidate invalidates old source bindings.
 
 ## Requirements and safety
 
@@ -48,9 +55,11 @@ source bindings.
   CIM connectivity and authorization; reading remote filesystem ACLs also requires
   SMB access in the running user's context. `-CimCredential` supplies CIM
   credentials, not a separate SMB login.
-- AD enrichment (`-ResolveActiveDirectory`) and permission planning/validation
-  group resolution require the RSAT `ActiveDirectory` module and directory access.
-  `-IncludeLocalGroups` optionally collects local group membership during assessment.
+- AD enrichment (`-ResolveActiveDirectory`) and named AD security-group resolution
+  for planning, validation, or targeted changes require the RSAT `ActiveDirectory`
+  module and directory access. Removal by `Everyone` or an exact SID, including
+  an orphaned SID, does not require resolving that identity. `-IncludeLocalGroups`
+  optionally collects local group membership during assessment.
 - Use an account authorized to read the selected shares and security descriptors.
   Reading SACLs or audit policy may require additional privileges. Missing evidence
   is reported; do not assume unavailable data means a secure or empty configuration.
@@ -70,6 +79,9 @@ paths, and tickets with approved values. These commands do not grant authorizati
 to assess a system or make changes.
 
 ## Recommended assessment order
+
+This optional assessment/reporting workflow is not a prerequisite for targeted
+disposable-lab permission changes.
 
 ### 1. Collect a baseline
 
@@ -322,10 +334,146 @@ Plans inventory affected folders and files within the chosen scope, record
 protected boundaries without traversing them, and contain abstract intent rather
 than computed post-propagation descriptors. `NoOp` is not effective-access proof.
 
-**Do not use `Apply` or `Revert` as remediation steps.** They record
+**Do not use default `Apply` or `Revert` as remediation steps.** They record
 `Blocked/NotQualified` and exit nonzero without target writes, even with reviewed
 hashes, tickets, `-WhatIf`, or `-Confirm`. Recovery-evidence verification does not
-execute restoration. There is no force or experimental bypass.
+execute restoration. A separate explicit disposable-lab option is described below;
+it is not a production enable switch.
+
+## Separate workflow: targeted disposable-lab permission changes
+
+The in-progress `-DisposableLocalLab -DisposableAcknowledgement -Mode Apply`
+path performs real changes only on an independently approved, quiescent,
+disposable **direct local fixed NTFS** target. Use a nonproduction host, disposable
+data, a change ticket, and a separately verified backup. UNC paths, mapped drives,
+SMB/NAS mutation, and production use are unsupported. The default public
+Apply/Revert gate stays blocked.
+
+This is a standalone admin workflow: no assessment, merge, validation case, or
+previous plan is required. Reporting/assessment is optional, as is Revert.
+Every Apply creates its own plan from current permissions in that invocation
+and preserves restricted prewrite recovery evidence before any target write.
+`-WhatIf` is a separate preview, not a plan that can later be executed; a later
+Apply replans and may differ. Preview does not change the target, but can write
+local evidence.
+
+`-Operation` accepts `Add` (the default), `Remove`, or `Replace`:
+
+- `Remove` and `Replace` require `-RemovePrincipal`: `Everyone` (`S-1-1-0`),
+  an exact SID (including an orphaned identity), or an AD security group.
+- `Replace` also takes `-GroupName` and `-Permissions`; the existing
+  `-GroupPermissionsJson` or `-GroupPermissionsFile` forms are alternatives.
+  `Remove` rejects replacement grants, and `Add` rejects `-RemovePrincipal`.
+- Recursive scope removes matching allow ACEs from every selected nonprotected
+  path, including explicit descendant entries. Protected branches remain
+  unchanged. Remove/Replace warns when protected paths are excluded, and the
+  returned `ExcludedPathCount` counts excluded objects, not just branch roots.
+- A matching inherited source ACE at the target is refused: inspect the parent
+  or ancestors. The candidate does not intentionally disable inheritance.
+  Matching source deny ACEs in the selected scope are also refused.
+- `ThisFolderOnly` refuses removal of an inheritable source allow ACE to avoid
+  misleading propagation effects; use an independently approved recursive
+  scope or review the ACE manually.
+- Descriptors that cannot be represented without losing control flags, ACL
+  revision, or ACE bytes are refused rather than rewritten.
+- A change is blocked before writing if any inventoried path outside a protected
+  branch lacks the DACL auto-inherited control flag. This also applies to paths
+  outside a folder-only scope; a no-op remains available.
+- Replace refuses a replacement SID equal to the source SID. If no source allow
+  ACE exists at the target, it never creates access: it can be `NoOp` only when
+  the entire selected scope already needs no change; otherwise it blocks.
+- Replace adds the requested group rights only where a source allow ACE exists,
+  retaining each source ACE's inheritance and propagation flags. The requested
+  rights can be broader than the source rights; existing destination grants are
+  not reduced.
+
+Run from the repository root with an existing approved fixture and, for Replace,
+an existing AD security group. Choose trusted local evidence storage outside the
+target and its backing paths; replace the example values.
+
+```powershell
+# Preview replacing Everyone with a group.
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab `
+    -DisposableAcknowledgement -Operation Replace -RemovePrincipal Everyone `
+    -TargetPath 'D:\DisposableLab\Case1' -GroupName 'LAB\Readers' `
+    -Permissions ReadAndExecute -Scope ThisFolderSubfoldersAndFiles `
+    -ChangeTicket LAB-123 -OutputDirectory 'D:\NtfsEvidence' -WhatIf
+
+# Alternatively, preview removal without a replacement grant.
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab `
+    -DisposableAcknowledgement -Operation Remove -RemovePrincipal Everyone `
+    -TargetPath 'D:\DisposableLab\Case1' -Scope ThisFolderSubfoldersAndFiles `
+    -ChangeTicket LAB-123 -OutputDirectory 'D:\NtfsEvidence' -WhatIf
+
+# After independent approval, run a NEW Apply, not the preview.
+$change = .\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab `
+    -DisposableAcknowledgement -Operation Replace -RemovePrincipal Everyone `
+    -TargetPath 'D:\DisposableLab\Case1' -GroupName 'LAB\Readers' `
+    -Permissions ReadAndExecute -Scope ThisFolderSubfoldersAndFiles `
+    -ChangeTicket LAB-123 -OutputDirectory 'D:\NtfsEvidence'
+```
+
+Confirm any real-write prompt only after independent authorization. For Remove,
+repeat its preview command without `-WhatIf` instead. Review `Status`, `Reason`,
+the protected-branch warning, and `ExcludedPathCount`.
+
+A `Verified` or `NoOp` Apply or Revert returns `AuditReportPath` and
+`AuditReportSHA256` for `permissions-before-after.csv`. The report is produced
+only after final verification of the post-write state, or unchanged state for
+`NoOp`; it is not produced for `-WhatIf` or declined operations. An interrupted
+report write retains a `.pending` file. A later journal failure can leave a
+completed CSV, so check the returned status and completion journal as well.
+Each row contains:
+
+- `OperationId`, `Host`, `Mode`, `Operation`, `Actor`, `ChangeTicket`, and `VerifiedUtc`;
+- `Path`, `Kind`, `Scope` (`InScope`, `ProtectedBoundary`, or
+  `OutsideSelectedScope`), `Result`, `BeforeDescriptor`, and `AfterDescriptor`;
+- JSON `BeforeAces` and `AfterAces`, plus `RemovedAces` and `AddedAces` multiset
+  differences, which account for duplicate ACEs.
+
+This audit CSV is streamed as a single UTF-8-with-BOM file, not split at the
+toolkit's 100,000,000-byte part cap. Formula-like `ChangeTicket` values are
+prefixed with an apostrophe in the CSV; the journal retains the original ticket.
+It records NTFS DACLs, not share permissions, SACLs, or effective access.
+
+```powershell
+$change | Format-List Status, Reason, ExcludedPathCount, AuditReportPath, AuditReportSHA256
+if ($change.Status -in @('Verified', 'NoOp')) {
+    if ((Get-FileHash -LiteralPath $change.AuditReportPath -Algorithm SHA256).Hash -ne $change.AuditReportSHA256) {
+        throw 'Audit report hash mismatch.'
+    }
+    Import-Csv -LiteralPath $change.AuditReportPath | Format-List
+}
+```
+
+Archive the report and its hash independently; ACE records are not effective-access
+proof. Revert is optional. If desired after a completed Apply, review its journal,
+retain the original receipt and journal hashes independently, and run the original
+source version with its original evidence:
+
+```powershell
+$revert = .\Add-FileSharePermissions.ps1 -Mode Revert -DisposableLocalLab `
+    -DisposableAcknowledgement -ReceiptPath $change.ReceiptPath `
+    -ReceiptSHA256 $change.ReceiptSHA256 `
+    -ReviewedApplyJournalSHA256 $change.ApplyJournalSHA256 `
+    -ChangeTicket LAB-123 -OutputDirectory 'D:\NtfsEvidence'
+$revert | Format-List Status, Reason, ExcludedPathCount, AuditReportPath, AuditReportSHA256
+```
+
+Revert revalidates the target volume/namespace, exact object identities and
+per-path state, and refuses drift or unverifiable evidence. The 24-hour freshness
+guard applies to a new Apply's same-run plan, not to saved recovery evidence.
+Preserve the exact source version used for each Apply so its receipt can still
+be used after source updates.
+
+Failed or interrupted writes are not automatically rolled back. Preserve the
+prewrite evidence, receipt, source, and existing intent/verification journal;
+review `CandidateWriteIntent` and `CandidatePathVerified` against the live state.
+Do not assume a complete post-state report after failure. The prewrite receipt
+path and hash are printed before the first write; after the process stops,
+independently review and hash the surviving Apply journal. Consider
+`-ReviewedPartialApplyRecovery` only after separate review; it still refuses
+drift or unverifiable evidence.
 
 ## Separate workflow: creating a corporate-style disposable lab
 
@@ -446,6 +594,8 @@ Account expiry does not remove the share, files or AD objects.
 
 This workflow records observations only. Any external manual apply/revert requires
 its own approval and operating procedure. It is not authorized by these examples.
+These stages are optional and are not prerequisites for targeted lab changes or
+their audit report.
 
 Run the stages in this order:
 
@@ -510,10 +660,13 @@ Archive evidence and each reported commit hash externally.
 | Merge and comparison | `0`: completed; `1`: completed with warnings/limitations; `2`: invalid input or failure. Inspect the state JSON before consuming reports. Differences alone do not make comparison fail. |
 | Best-practices report | `0`: report generated; `2`: failure. A generated report can still contain `NotAssessed` evidence. |
 | Permission planner | `0`: planning path completed; `2`: blocked. Review-only plans can still be marked blocked; neither result enables mutation. |
+| Disposable-lab permission change | `Verified` or `NoOp`: review the verified report and excluded count. `WhatIfOrDeclined`: no target writes. `Blocked` or `Indeterminate`: preserve and review evidence. |
 | Validation | Inspect result/report status and completeness explicitly; successful invocation is not change success or writer qualification. |
 
-CSV files rotate at **100,000,000 bytes per part**, including encoding/header
-overhead. Keep all parts together. Merge/comparison default to a
+Many toolkit CSV datasets rotate at **100,000,000 bytes per part**, including
+encoding/header overhead. The targeted permission audit CSV is one streamed
+file and is not subject to this part cap. Keep split parts together.
+Merge/comparison default to a
 `MaxRowsPerShare` guard of 1,000,000 input rows; increasing it requires sufficient
 memory. Merge parallel workers multiply per-share memory use, so start with
 `-ThrottleLimit 1`.
@@ -573,6 +726,12 @@ runs remove it; the lab evidence runner preserves it and copies available audit
 logs for review. They do not accept an existing target. Run on a local fixed NTFS
 checkout with Windows PowerShell 5.1/Pester 5.2+ or supported PowerShell 7.
 
+The suite also terminates its own child PowerShell processes at three Apply/Revert
+write boundaries, checks surviving state and retained evidence, refuses incomplete
+Apply recovery, and rehearses explicitly reviewed interrupted-Revert restoration
+and drift refusal. This does not test host crashes, power loss or storage failure;
+no unrelated process is terminated.
+
 The candidate pins ancestor/leaf handles, checks volume-GUID namespaces and
 128-bit file identities, rejects reparse/hard-link aliases, validates exact
 preimages and desired descriptors, and requires restrictive local audit storage
@@ -580,33 +739,75 @@ and durable write intent. Read/list access is explicitly requested on zero-share
 handles; security-only handles do not provide the tested propagation/sharing
 behavior. Directory enumeration uses the pinned handle, not a second path open.
 Both scopes retain full-tree sentinel coverage; protected branch contents are
-observed but unchanged. Inheritable grants are applied as individually verified
-inherited ACE states with implicit propagation suppressed, never as recursive
-explicit grants or inheritance-protection toggles.
+observed and verified unchanged. Inheritable grants are applied as individually
+verified inherited ACE states, never as recursive explicit grants or intentional
+inheritance-protection toggles. Zero-share handles do not guarantee suppression
+of implicit propagation, and the auto-inherited guard does not qualify a writer.
 
-Recovery requires a reviewed complete candidate Apply journal and exact current
-identities/descriptors. Any conflicting path refuses the entire recovery before
-a parent write. Failed/interrupted cases retain `candidate.lock` and audit
-evidence; no retry or automatic rollback occurs. Simulations still write local
-audit evidence. Direct internal candidate experiments additionally require
-`DisposableAcknowledgement` and independent approval; do not invoke them on
-production data or treat the internal helpers as a supported remediation API.
+Scope describes ACL changes, not all effective access. In particular, a
+folder-only FullControl grant can allow deletion of immediate child files via
+the parent directory even when their ACLs are unchanged.
+
+Ordinary Revert requires a reviewed complete candidate Apply journal. An explicit
+internal `-ReviewedPartialApplyRecovery` experiment can instead restore a failed
+Apply before a fresh attempt: it requires the original reviewed journal/hash,
+exclusive read access to its preserved lock, exact identities/descriptors, and
+durable intent for every path needing restoration. It does not resume Apply.
+Any conflicting path refuses the entire recovery before a parent write.
+Failures retain their locks and evidence; fresh attempts use new audits, without
+deleting or rewriting failed evidence. No automatic retry or rollback occurs.
+See the [safe retry procedure](PERMISSION-WRITE-QUALIFICATION.md#safe-retries-in-the-disposable-local-candidate).
+A completed WhatIf records local audit evidence without target writes. Direct
+internal candidate experiments additionally require `DisposableAcknowledgement`
+and independent approval; do not invoke them on production data or treat the
+internal helpers as a supported remediation API.
 
 **Remaining qualification:** zero sharing does not exclude security-only edits
 by another administrator, and namespace observations are not atomic. Real
-crash/disconnect recovery, authority/trust, effective access, large/long-path
+crash/disconnect durability (deferred, not inferred from retries), authority/trust,
+comprehensive effective access, large/long-path
 inventories, and supported OS/storage combinations remain unqualified. Generic
 high-bit ACE masks, conditional/object/opaque ACEs, null/noncanonical DACLs,
-unreadable protected branches, SMB/NAS, and unavailable exclusive handles fail
-closed. `FILE_ID_INFO` and handle directory enumeration require Windows 8 /
-Windows Server 2012 or later APIs. Public `Apply`/`Revert` remain blocked.
+applicable overlapping deny ACEs, unreadable protected branches, SMB/NAS, and
+unavailable exclusive handles fail closed. `FILE_ID_INFO` and handle directory
+enumeration require Windows 8 / Windows Server 2012 or later APIs. On one host
+with long-path policy disabled, tested existing paths of 260 or more characters
+failed native opening during planning; other limits are unqualified. Public
+default `Apply`/`Revert` remain blocked.
+
+### Real-account disposable candidate validation
+
+`Tests\Invoke-NtfsCandidateLabValidation.ps1` exercises the **actual unqualified
+local candidate** with dedicated domain accounts on a newly generated disposable
+fixture. It performs real Apply and Revert writes; its internal WhatIf stage does
+not make the whole run a dry run. It never accepts an existing write target or
+changes AD membership. An optional separate Windows client uses an encrypted
+temporary share for access checks; candidate writes remain local.
+The default fixture starts with a group ReadAndExecute grant; `-StartWithoutGroupGrant`
+also tests a first grant and subsequent removal by Revert. The runner exercises
+Read, ReadAndExecute, Modify or FullControl grants. `DeleteExisting` uses
+marker-checked handle deletion; `DeleteChild` uses name-based deletion. Both can
+obtain delete authorization through file DELETE or parent `FILE_DELETE_CHILD`;
+neither isolates one permission source. The handle probe additionally requires
+file read access. For example, folder-only FullControl can delete an immediate
+child file by name even when that file's ACL is unchanged.
+
+See the [real-account runner instructions](PERMISSION-WRITE-QUALIFICATION.md#real-account-disposable-candidate-runner)
+for prerequisites, both scopes, credentials, side effects, failure handling,
+and evidence review. This is for customer-owned **disposable labs only**, not a
+production remediation tool, public Apply/Revert bypass, or backend qualification.
+
+The [completed local access qualification](PERMISSION-WRITE-QUALIFICATION.md#completed-local-access-qualification)
+records historical, source-specific grant/Revert cases and regression results,
+not qualification of the in-progress Remove/Replace operations or current source.
+It also describes remaining design, infrastructure and approval requirements.
 
 ## Work still required
 
 For the ordered lab procedure, test matrix, evidence handoff, and future writer
 release gates, see [Permission modification: testing and evidence guide](PERMISSION-WRITE-QUALIFICATION.md).
 It distinguishes current read-only/manual observations from qualification of a
-future native writer; following it does not enable `Apply` or `Revert`.
+future native writer; following it does not enable default public `Apply` or `Revert`.
 
 The following are current gaps or required qualification work, not capabilities
 enabled by configuration switches:
@@ -615,7 +816,7 @@ enabled by configuration switches:
 |---|---|
 | Live platform validation | Exercise real Windows PowerShell 5.1, AD, CIM, SMB, permissions/privileges, and large/long-path inventories. Synthetic tests do not establish live interoperability. Qualify Windows local NTFS, Windows SMB, NetApp SMB, and generic NAS separately. |
 | Target identity and namespace proof | Establish stable volume/file identities, identity-bound handles, direct backend/security-style proof, target group authority/trust, and reliable DFS/alias/backend rejection before any writable implementation. Current path and volume observations are insufficient. |
-| Native permission writer | Qualify the isolated local candidate and implement remaining safeguards before connecting any writer to public `Apply`/`Revert`. The current release has no qualified production writer. Do not remove the qualification gate as a shortcut. |
+| Native permission writer | Qualify the local candidate and implement remaining safeguards before enabling production writes. The explicit disposable-lab path is unqualified; the default public gate remains closed. |
 | Propagation and concurrency safety | Validate both scopes across folders/files, protected/reparse boundaries, existing inheritance, exclusive-handle availability and SMB client impact, propagation behavior, and concurrent administrator changes. |
 | Recovery qualification | Demonstrate exact owner/group/DACL/control and identity verification per affected path, drift-refused guarded rollback, and safe behavior under crashes, timeouts, partial propagation, and interrupted journals. DACL-only `icacls` backups are insufficient. |
 | Manual validation evidence | Complete the external test matrix with actual approved commands/results, accounts, UTC times, reviewers, platform bindings, and archived source/evidence hashes. Passing read-only preflight or matching captured descriptors is not qualification. |
