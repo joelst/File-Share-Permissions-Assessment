@@ -777,7 +777,9 @@ unavailable exclusive handles fail closed. `FILE_ID_INFO` and handle directory
 enumeration require Windows 8 / Windows Server 2012 or later APIs. On one host
 with long-path policy disabled, tested existing paths of 260 or more characters
 failed native opening during planning; other limits are unqualified. Public
-default `Apply`/`Revert` remain blocked.
+`Apply`/`Revert` with `-PlanPath` remain blocked. Direct targeted `Apply`
+and receipt-bound `Revert` are enabled and can modify real ACLs over local NTFS
+and SMB; the qualification gaps above are not an execution gate.
 
 ### Real-account disposable candidate validation
 
@@ -817,8 +819,10 @@ does not enable or qualify SMB/NAS writes.
 
 For the ordered lab procedure, test matrix, evidence handoff, and future writer
 release gates, see [Permission modification: testing and evidence guide](PERMISSION-WRITE-QUALIFICATION.md).
-It distinguishes current read-only/manual observations from qualification of a
-future native writer; following it does not enable default public `Apply` or `Revert`.
+It distinguishes read-only/manual observations from writer qualification.
+Direct targeted public `Apply` and receipt-bound `Revert` are already enabled
+and can modify real ACLs; following the guide does not qualify those writes.
+Only the review-only `-PlanPath` Apply/Revert workflow remains blocked.
 
 The following are current gaps or required qualification work, not capabilities
 enabled by configuration switches:
@@ -827,7 +831,7 @@ enabled by configuration switches:
 |---|---|
 | Live platform validation | Exercise real Windows PowerShell 5.1, AD, CIM, SMB, permissions/privileges, and large/long-path inventories. Synthetic tests do not establish live interoperability. Qualify Windows local NTFS, Windows SMB, NetApp SMB, and generic NAS separately. |
 | Target identity and namespace proof | Establish stable volume/file identities, identity-bound handles, direct backend/security-style proof, target group authority/trust, and reliable DFS/alias/backend rejection before any writable implementation. Current path and volume observations are insufficient. |
-| Native permission writer | Qualify the local candidate and implement remaining safeguards before enabling production writes. The explicit disposable-lab path is unqualified; the default public gate remains closed. |
+| Native permission writer | Direct targeted public `Apply` and receipt-bound `Revert` can modify real local NTFS/SMB ACLs; only the review-only `-PlanPath` workflow remains blocked. Complete platform/safety qualification and required approvals before production use; the explicit disposable-lab path is also unqualified. |
 | Propagation and concurrency safety | Validate both scopes across folders/files, protected/reparse boundaries, existing inheritance, exclusive-handle availability and SMB client impact, propagation behavior, and concurrent administrator changes. |
 | Recovery qualification | Demonstrate exact owner/group/DACL/control and identity verification per affected path, drift-refused guarded rollback, and safe behavior under crashes, timeouts, partial propagation, and interrupted journals. DACL-only `icacls` backups are insufficient. |
 | Manual validation evidence | Complete the external test matrix with actual approved commands/results, accounts, UTC times, reviewers, platform bindings, and archived source/evidence hashes. Passing read-only preflight or matching captured descriptors is not qualification. |

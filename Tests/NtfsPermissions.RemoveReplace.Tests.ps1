@@ -16,6 +16,12 @@ Describe 'Disposable local remove and replace permissions' -Skip:([Environment]:
         $script:caseWork = $null
         $script:caseIdentity = $null
         $script:unsafeCleanup = $false
+        $fixtureId = [Environment]::GetEnvironmentVariable('NTFS_LAB_CANDIDATE_ID', 'Process')
+        $script:preserveLabEvidence = -not [string]::IsNullOrEmpty($fixtureId)
+        if ($fixtureId -and $fixtureId -cnotmatch '^[a-f0-9]{32}$') {
+            throw 'Invalid lab candidate fixture identifier.'
+        }
+        if (-not $fixtureId) { $fixtureId = [guid]::NewGuid().ToString('N').Substring(0, 12) }
         . (Join-Path (Split-Path $PSScriptRoot -Parent) 'NtfsPermissions.Local.ps1')
         Initialize-NpLocalNative
 
@@ -538,7 +544,7 @@ Describe 'Disposable local remove and replace permissions' -Skip:([Environment]:
                 -ChangeTicket 'DISPOSABLE-REVERT-TEST' -Confirm:$false
         }
 
-        $script:work = Join-Path $PSScriptRoot ('RemoveReplace_' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+        $script:work = Join-Path $PSScriptRoot ('RemoveReplace_' + $fixtureId)
         if (Test-Path -LiteralPath $script:work) { throw "Fixture root already exists: $($script:work)" }
         [void][IO.Directory]::CreateDirectory($script:work)
         Set-RestrictedFixtureAcl -Path $script:work
@@ -568,13 +574,17 @@ Describe 'Disposable local remove and replace permissions' -Skip:([Environment]:
                 $script:unsafeCleanup = $true
                 throw "Refusing to delete a fixture with changed identity: $($script:caseWork)"
             }
-            Remove-Item -LiteralPath $script:caseWork -Recurse -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
+            if (-not $script:preserveLabEvidence) {
+                Remove-Item -LiteralPath $script:caseWork -Recurse -Force -ErrorAction Stop -WhatIf:$false -Confirm:$false
+            }
         }
     }
 
     AfterAll {
         if ($script:work -and (Test-Path -LiteralPath $script:work)) {
-            if ($script:unsafeCleanup -or -not $script:workIdentity -or
+            if ($script:preserveLabEvidence) {
+                Write-Warning "Preserved lab remove/replace fixture: $($script:work)"
+            } elseif ($script:unsafeCleanup -or -not $script:workIdentity -or
                 (Get-FixtureIdentity $script:work) -cne $script:workIdentity) {
                 Write-Warning "Preserved fixture root for identity review: $($script:work)"
             } else {

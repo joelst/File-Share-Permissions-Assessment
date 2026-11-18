@@ -153,6 +153,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Common.ps1')
 
+$Mode = switch ($Mode) { 'Plan' { 'Plan' } 'Apply' { 'Apply' } 'Revert' { 'Revert' } }
+$Scope = switch ($Scope) {
+    'ThisFolderSubfoldersAndFiles' { 'ThisFolderSubfoldersAndFiles' }
+    'ThisFolderOnly' { 'ThisFolderOnly' }
+}
+
 if ($DisposableLocalLab) {
     . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
     $labArguments = @{

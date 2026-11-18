@@ -281,7 +281,8 @@ not qualify file-server or SMB behavior.
    Both switches require the acknowledgement. The tests create files, change
    ACLs, and exercise failure/recovery cases in their own generated directories
    beneath the checkout's `Tests` directory. Synthetic fixtures are removed;
-   the candidate fixture is **preserved** for review, including failures.
+   both the Local and Remove/Replace candidate fixtures are **preserved** for
+   review, including failures and each Remove/Replace case's audit evidence.
    They never use `readOnlyTarget` as a write target. The suites require a local
    fixed NTFS checkout with permission to set fixture ACLs. They use synthetic SIDs,
    not actual test-account access. Do not run these suites from a production
@@ -293,10 +294,13 @@ Each invocation creates a separate evidence directory and prints `EvidencePath`.
 Start with `summary.json`, `environment.json`, `source-hashes.csv`,
 `SHA256SUMS.csv`, and `transcript.txt`. Requested tests also create
 `pester-summary.json` and `pester-results.xml`; the candidate suite also records
-`candidate-fixture.json` and copies its available journals/locks into
-`candidate-audits`, including process-interruption requests, boundary records and
-child output when present. The original fixture remains at the path recorded in
-`candidate-fixture.json`. Optional probes create
+`candidate-fixture.json` and copies available journals, locks, plans, receipts,
+and before/after reports into suite-specific directories under `candidate-audits`,
+including process-interruption requests, boundary records and child output when
+present. The manifest's `Fixtures` array records both original fixture paths and
+per-suite copy counts; evidence is incomplete if either suite supplies no audit
+files. Remove/Replace audits retain their per-case directory structure.
+Optional probes create
 `ad-group.json` or `read-only-inventory.json`. A normal Windows run of the
 synthetic suite skips one non-Windows-only test; other skips are reported as
 incomplete. If a probe or suite fails, the runner retains the evidence, reports

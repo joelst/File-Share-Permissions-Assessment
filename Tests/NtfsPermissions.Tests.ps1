@@ -844,6 +844,39 @@ Describe 'Public qualification gate' {
     }
 }
 
+Describe 'Public writer parameter casing' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '../NtfsPermissions.Local.ps1')
+    }
+
+    It 'canonicalizes <InputMode>/<InputScope> before dispatch with DisposableLocalLab=<Lab>' -ForEach @(
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'thisfolderonly'; ExpectedScope = 'ThisFolderOnly'; Lab = $false }
+        @{ InputMode = 'aPpLy'; ExpectedMode = 'Apply'; InputScope = 'thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles'; Lab = $true }
+        @{ InputMode = 'revert'; ExpectedMode = 'Revert'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; Lab = $false }
+        @{ InputMode = 'rEvErT'; ExpectedMode = 'Revert'; InputScope = 'THISFOLDERONLY'; ExpectedScope = 'ThisFolderOnly'; Lab = $true }
+    ) {
+        Mock Invoke-NpDisposableLab {
+            param($Mode, $Scope)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope }
+        }
+        Mock Invoke-NpPermissionWrite {
+            param($Mode, $Scope)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope }
+        }
+        $result = & (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') `
+            -Mode $InputMode -Scope $InputScope -DisposableLocalLab:$Lab -OutputDirectory $script:work -WhatIf
+        $result.Mode | Should -BeExactly $ExpectedMode
+        $result.Scope | Should -BeExactly $ExpectedScope
+        if ($Lab) {
+            Should -Invoke Invoke-NpDisposableLab -Times 1 -Exactly
+            Should -Invoke Invoke-NpPermissionWrite -Times 0 -Exactly
+        } else {
+            Should -Invoke Invoke-NpPermissionWrite -Times 1 -Exactly
+            Should -Invoke Invoke-NpDisposableLab -Times 0 -Exactly
+        }
+    }
+}
+
 Describe 'Windows public gate audit ACL' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     It 'creates restricted audit evidence for <Mode> WhatIf without writing the target' -ForEach @(
         @{ Mode = 'Apply' }

@@ -195,8 +195,10 @@ function Open-LabShare([string]$Phase) {
     if ($shareOpen -or @(Get-SmbShare | Where-Object Name -eq $shareName).Count) {
         throw 'The generated share name already exists.'
     }
+    $administratorsName = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544').
+        Translate([Security.Principal.NTAccount]).Value
     $null = New-SmbShare -Name $shareName -Path $fixture -EncryptData $true `
-        -FullAccess @($groupName, $controlCredential.UserName, 'BUILTIN\Administrators') -ErrorAction Stop
+        -FullAccess @($groupName, $controlCredential.UserName, $administratorsName) -ErrorAction Stop
     $script:shareOpen = $true
     Write-LabJson "$Phase-share.json" @(Get-SmbShareAccess -Name $shareName |
         Select-Object AccountName, AccessControlType, AccessRight)

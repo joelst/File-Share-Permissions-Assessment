@@ -154,4 +154,32 @@ Describe 'Disposable candidate validation entry point' -Skip:([Environment]::OSV
         { & $script:runner @arguments -DisposableAcknowledgement } | Should -Throw '*ticket*'
         Test-Path -LiteralPath $script:parent | Should -BeFalse
     }
+
+    It 'publishes the share using the local account name for the Administrators SID' {
+        $ast = [Management.Automation.Language.Parser]::ParseFile($script:runner, [ref]$null, [ref]$null)
+        $definition = $ast.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Open-LabShare'
+        }, $true)
+        . ([scriptblock]::Create($definition.Extent.Text))
+        function Write-LabJson { throw 'Unexpected real lab evidence write.' }
+        Mock Write-LabJson {}
+        Mock Get-SmbShare { @() }
+        Mock New-SmbShare {}
+        Mock Get-SmbShareAccess { @() }
+        $shareOpen = $false
+        $shareName = 'DisposableShare'
+        $fixture = 'C:\DisposableFixture'
+        $groupName = 'LAB\Readers'
+        $controlCredential = $script:control
+        $expectedName = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544').
+            Translate([Security.Principal.NTAccount]).Value
+        $shareOpen | Should -BeFalse
+        Open-LabShare -Phase 'test'
+        Should -Invoke New-SmbShare -Times 1 -Exactly -ParameterFilter {
+            $Name -eq $shareName -and $Path -eq $fixture -and
+                $FullAccess.Count -eq 3 -and $FullAccess -contains $expectedName -and
+                $FullAccess -contains $groupName -and $FullAccess -contains $controlCredential.UserName
+        }
+    }
 }

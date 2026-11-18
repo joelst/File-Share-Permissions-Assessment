@@ -77,7 +77,7 @@ $checks = [Collections.Generic.List[object]]::new()
 $startedUtc = [DateTime]::UtcNow.ToString('o')
 $transcriptStarted = $false
 $fatalMessage = ''
-$candidateFixturePath = ''
+$candidateFixtures = @()
 $copiedAuditFiles = [Collections.Generic.List[string]]::new()
 
 function Add-LabCheck {
@@ -111,6 +111,43 @@ function Write-LabJson {
     )
     $value | ConvertTo-Json -Depth 40 |
         Set-Content -LiteralPath (Join-Path $run $name) -Encoding UTF8 -ErrorAction Stop
+}
+
+function Copy-LabCandidateAudit {
+    <#
+    .SYNOPSIS
+    Copies known audit artifacts without traversing fixture targets or reparse points.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string] $evidenceDirectory,
+        [Parameter(Mandatory = $true)][string] $destinationRoot
+    )
+    if (-not (Test-Path -LiteralPath $evidenceDirectory -PathType Container)) { return }
+    $evidenceItem = Get-Item -LiteralPath $evidenceDirectory -Force -ErrorAction Stop
+    if ($evidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate evidence directory is a reparse point.' }
+    foreach ($auditDirectory in @(Get-ChildItem -LiteralPath $evidenceDirectory -Directory -Force -ErrorAction Stop)) {
+        if ($auditDirectory.Name -cnotmatch '^Permissions_[a-f0-9]{32}$' -or
+            $auditDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'Unexpected candidate audit directory or reparse point.'
+        }
+        foreach ($fileName in @(
+            'events.jsonl', 'orchestration.jsonl', 'candidate.lock', 'run.lock',
+            'candidate-plan.json', 'preparation.json', 'receipt.json', 'permissions-before-after.csv',
+            'interruption.json', 'interruption-request.clixml', 'child-stdout.txt', 'child-stderr.txt'
+        )) {
+            $auditPath = Join-Path $auditDirectory.FullName $fileName
+            if (Test-Path -LiteralPath $auditPath -PathType Leaf) {
+                $auditFile = Get-Item -LiteralPath $auditPath -Force -ErrorAction Stop
+                if ($auditFile.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate audit file is a reparse point.' }
+                $destinationDirectory = Join-Path $destinationRoot $auditDirectory.Name
+                [void][IO.Directory]::CreateDirectory($destinationDirectory)
+                $destination = Join-Path $destinationDirectory $fileName
+                Copy-Item -LiteralPath $auditPath -Destination $destination -ErrorAction Stop
+                $copiedAuditFiles.Add($destination)
+            }
+        }
+    }
 }
 
 try {
@@ -235,7 +272,10 @@ try {
         $testPaths.Add((Join-Path $PSScriptRoot 'NtfsPermissions.Local.Tests.ps1'))
         $testPaths.Add((Join-Path $PSScriptRoot 'NtfsPermissions.RemoveReplace.Tests.ps1'))
         $candidateId = [guid]::NewGuid().ToString('N')
-        $candidateFixturePath = Join-Path $PSScriptRoot ('LocalCandidateTests_' + $candidateId)
+        $candidateFixtures = @(
+            [pscustomobject]@{ Suite = 'Local'; Path = (Join-Path $PSScriptRoot ('LocalCandidateTests_' + $candidateId)) }
+            [pscustomobject]@{ Suite = 'RemoveReplace'; Path = (Join-Path $PSScriptRoot ('RemoveReplace_' + $candidateId)) }
+        )
     }
     if ($testPaths.Count -gt 0) {
         try {
@@ -265,7 +305,9 @@ try {
             $previousCandidateId = [Environment]::GetEnvironmentVariable('NTFS_LAB_CANDIDATE_ID', 'Process')
             try {
                 if ($runDisposableCandidateTests) {
-                    if (Test-Path -LiteralPath $candidateFixturePath) { throw 'Candidate fixture path already exists.' }
+                    foreach ($fixture in $candidateFixtures) {
+                        if (Test-Path -LiteralPath $fixture.Path) { throw 'Candidate fixture path already exists.' }
+                    }
                     [Environment]::SetEnvironmentVariable('NTFS_LAB_CANDIDATE_ID', $candidateId, 'Process')
                 }
                 $testResult = Invoke-Pester -Configuration $configuration
@@ -313,44 +355,43 @@ try {
 
     if ($runDisposableCandidateTests) {
         try {
-            if (Test-Path -LiteralPath $candidateFixturePath -PathType Container) {
-                $fixtureItem = Get-Item -LiteralPath $candidateFixturePath -Force -ErrorAction Stop
-                if ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate fixture is a reparse point.' }
-                $candidateEvidence = Join-Path $candidateFixturePath 'evidence'
-                if (Test-Path -LiteralPath $candidateEvidence -PathType Container) {
-                    $candidateEvidenceItem = Get-Item -LiteralPath $candidateEvidence -Force -ErrorAction Stop
-                    if ($candidateEvidenceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate evidence directory is a reparse point.' }
-                    foreach ($auditDirectory in @(Get-ChildItem -LiteralPath $candidateEvidence -Directory -Force -ErrorAction Stop)) {
-                        if ($auditDirectory.Name -cnotmatch '^Permissions_[a-f0-9]{32}$' -or
-                            $auditDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                            throw 'Unexpected candidate audit directory or reparse point.'
-                        }
-                        foreach ($fileName in @(
-                            'events.jsonl', 'candidate.lock', 'interruption.json',
-                            'interruption-request.clixml', 'child-stdout.txt', 'child-stderr.txt'
-                        )) {
-                            $auditPath = Join-Path $auditDirectory.FullName $fileName
-                            if (Test-Path -LiteralPath $auditPath -PathType Leaf) {
-                                $auditFile = Get-Item -LiteralPath $auditPath -Force -ErrorAction Stop
-                                if ($auditFile.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate audit file is a reparse point.' }
-                                $destinationDirectory = Join-Path (Join-Path $run 'candidate-audits') $auditDirectory.Name
-                                [void][IO.Directory]::CreateDirectory($destinationDirectory)
-                                $destination = Join-Path $destinationDirectory $fileName
-                                Copy-Item -LiteralPath $auditPath -Destination $destination -ErrorAction Stop
-                                $copiedAuditFiles.Add($destination)
+            $fixtureSummaries = @(
+                foreach ($fixture in $candidateFixtures) {
+                    $beforeCount = $copiedAuditFiles.Count
+                    $fixtureStatus = 'Missing'
+                    if (Test-Path -LiteralPath $fixture.Path -PathType Container) {
+                        $fixtureItem = Get-Item -LiteralPath $fixture.Path -Force -ErrorAction Stop
+                        if ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Candidate fixture is a reparse point.' }
+                        $destinationRoot = Join-Path (Join-Path $run 'candidate-audits') $fixture.Suite
+                        if ($fixture.Suite -ceq 'Local') {
+                            Copy-LabCandidateAudit -evidenceDirectory (Join-Path $fixture.Path 'evidence') -destinationRoot $destinationRoot
+                        } else {
+                            foreach ($case in @(Get-ChildItem -LiteralPath $fixture.Path -Directory -Force -ErrorAction Stop)) {
+                                if ($case.Name -cnotmatch '^case_[a-f0-9]{12}$' -or
+                                    $case.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                                    throw 'Unexpected remove/replace case directory or reparse point.'
+                                }
+                                Copy-LabCandidateAudit -evidenceDirectory (Join-Path $case.FullName 'evidence') `
+                                    -destinationRoot (Join-Path $destinationRoot $case.Name)
                             }
                         }
+                        $fixtureStatus = 'Preserved'
+                    }
+                    [pscustomobject]@{
+                        Suite = $fixture.Suite; Path = $fixture.Path; Status = $fixtureStatus
+                        AuditFilesCopied = $copiedAuditFiles.Count - $beforeCount
                     }
                 }
-                Write-LabJson -name 'candidate-fixture.json' -value ([ordered]@{
-                    Path = $candidateFixturePath
-                    Status = 'Preserved'
-                    AuditFilesCopied = $copiedAuditFiles.Count
-                    Note = 'Generated disposable fixture; preserve for review before approved cleanup.'
-                })
-                Add-LabCheck -name 'CandidateFixtureEvidence' -status Observed -detail "Preserved fixture and copied $($copiedAuditFiles.Count) audit files."
+            )
+            Write-LabJson -name 'candidate-fixture.json' -value ([ordered]@{
+                Fixtures = $fixtureSummaries
+                AuditFilesCopied = $copiedAuditFiles.Count
+                Note = 'Generated disposable fixtures; preserve for review before approved cleanup.'
+            })
+            if (@($fixtureSummaries | Where-Object { $_.Status -cne 'Preserved' -or $_.AuditFilesCopied -eq 0 }).Count) {
+                Add-LabCheck -name 'CandidateFixtureEvidence' -status Incomplete -detail 'Each selected candidate suite must preserve a fixture and supply audit files; inspect candidate-fixture.json.'
             } else {
-                Add-LabCheck -name 'CandidateFixtureEvidence' -status Incomplete -detail 'Selected candidate tests did not create the expected fixture.'
+                Add-LabCheck -name 'CandidateFixtureEvidence' -status Observed -detail "Preserved both candidate fixtures and copied $($copiedAuditFiles.Count) audit files."
             }
         } catch {
             Add-LabCheck -name 'CandidateFixtureEvidence' -status Failed -detail $_.Exception.Message
@@ -388,7 +429,7 @@ try {
         Limitations = @(
             'No production change authorization or writer qualification.'
             'No effective-access, external-client, OS-crash, power-loss, storage-failure or backend-disconnect tests.'
-            'Fixture Pester tests use synthetic SIDs; the selected candidate fixture is preserved for review.'
+            'Fixture Pester tests use synthetic SIDs; both selected candidate fixtures are preserved for review.'
             'Read-only inventory is scoped, non-atomic and does not prove target authority or physical identity.'
         )
     }
