@@ -51,6 +51,16 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$permissions = switch ($permissions) {
+    'Read' { 'Read' }
+    'ReadAndExecute' { 'ReadAndExecute' }
+    'Modify' { 'Modify' }
+    'FullControl' { 'FullControl' }
+}
+$scope = switch ($scope) {
+    'ThisFolderOnly' { 'ThisFolderOnly' }
+    'ThisFolderSubfoldersAndFiles' { 'ThisFolderSubfoldersAndFiles' }
+}
 if (-not $disposableAcknowledgement) {
     throw 'DisposableAcknowledgement and independent approval for this lab are required.'
 }

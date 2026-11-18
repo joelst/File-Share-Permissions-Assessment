@@ -6,6 +6,40 @@ Safety checks for the disposable candidate validation runner.
 [CmdletBinding()]
 param()
 
+Describe 'Candidate runner parameter normalization' {
+    BeforeAll {
+        $ast = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot 'Invoke-NtfsCandidateLabValidation.ps1'), [ref]$null, [ref]$null)
+        $assignments = @($ast.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $_.Left.Extent.Text -in @('$permissions', '$scope')
+        } | ForEach-Object { $_.Extent.Text })
+        $script:normalizeParameters = [scriptblock]::Create(
+            $ast.ParamBlock.Extent.Text + "`n" + ($assignments -join "`n") +
+            "`n" + '[pscustomobject]@{ Permissions = $permissions; Scope = $scope }')
+        $credential = [pscredential]::new('LAB\Test', [Security.SecureString]::new())
+        $script:normalizationInputs = @{
+            fixtureParent = 'unused-fixture'
+            evidenceRoot = 'unused-evidence'
+            groupName = 'LAB\Readers'
+            allowedCredential = $credential
+            controlCredential = $credential
+            changeTicket = 'DISPOSABLE-TEST'
+        }
+    }
+
+    It 'canonicalizes <InputPermissions> and <InputScope> at parameter binding' -ForEach @(
+        @{ InputPermissions = 'read'; ExpectedPermissions = 'Read'; InputScope = 'thisfolderonly'; ExpectedScope = 'ThisFolderOnly' }
+        @{ InputPermissions = 'rEaDaNdExEcUtE'; ExpectedPermissions = 'ReadAndExecute'; InputScope = 'THISFOLDERONLY'; ExpectedScope = 'ThisFolderOnly' }
+        @{ InputPermissions = 'modify'; ExpectedPermissions = 'Modify'; InputScope = 'thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles' }
+        @{ InputPermissions = 'fUlLcOnTrOl'; ExpectedPermissions = 'FullControl'; InputScope = 'Thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles' }
+    ) {
+        $result = & $script:normalizeParameters @script:normalizationInputs -permissions $InputPermissions -scope $InputScope
+        $result.Permissions | Should -BeExactly $ExpectedPermissions
+        $result.Scope | Should -BeExactly $ExpectedScope
+    }
+}
+
 Describe 'Disposable candidate validation entry point' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     BeforeAll {
         $script:runner = Join-Path $PSScriptRoot 'Invoke-NtfsCandidateLabValidation.ps1'
