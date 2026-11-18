@@ -10,6 +10,11 @@ Windows SMB and local NTFS — without requiring ONTAP CLI or ONTAP API access.
 are independent of assessment, reporting, and validation. No full-server assessment
 or pre-generated plan file is required, and Revert is optional.
 
+**Start here:** the [administrator walkthrough](ADMINISTRATOR-WALKTHROUGH.md)
+covers environment setup, worked PowerShell examples, workflow diagrams,
+assessment/reporting, targeted changes, optional recovery, and disposable labs.
+Choose only the workflows needed for your task.
+
 ## Scripts and their roles
 
 | Script | Purpose | When to run |
