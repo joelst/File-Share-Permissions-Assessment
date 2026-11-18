@@ -11,10 +11,9 @@
 
 <#
 .SYNOPSIS
-Shared permission planning, evidence and guarded recovery helpers.
+Shared permission planning, evidence, and pure-SMB/NTFS execution helpers.
 .NOTES
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
-Live mutation is disabled.
 #>
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'NtfsAssessment.Common.ps1')
@@ -41,6 +40,18 @@ function ConvertTo-NpPath([string]$Path) {
     $prefix = '\\local\volume\'
     $suffix = (ConvertTo-NpUnc ($prefix + $Path.Substring(3))).Substring($prefix.Length)
     return $Path.Substring(0,1).ToUpperInvariant() + ':\' + $suffix
+}
+
+function Get-NpParentPath([string]$Path) {
+    if ($Path.StartsWith('\\')) {
+        $parts = $Path.TrimEnd('\').Substring(2).Split('\')
+        if ($parts.Length -le 2) { return '\\' + $parts[0] + '\' + $parts[1] }
+        return '\\' + ($parts[0..($parts.Length - 2)] -join '\')
+    }
+    $trimmed = $Path.TrimEnd('\')
+    $cut = $trimmed.LastIndexOf('\')
+    if ($cut -le 2) { return $trimmed.Substring(0, 2) + '\' }
+    return $trimmed.Substring(0, $cut)
 }
 
 function Get-NpDriveBinding([ValidatePattern('^[A-Za-z]:$')][string]$Drive) {
@@ -207,10 +218,12 @@ function Get-NpGrants {
         if ($Json -notmatch '^\s*\[\s*(?:\{\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*,\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*\}\s*(?:,\s*\{\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*,\s*"(?:GroupName|Permissions)"\s*:\s*"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt])*"\s*\}\s*)*)?\]\s*$') {
             throw 'Grant JSON must contain objects with exactly GroupName and Permissions string properties (literal property names).'
         }
-        $items = @($Json | ConvertFrom-NpJson)
+        $parsed = $Json | ConvertFrom-NpJson
+        $items = @($parsed)
     }
     if ($items.Count -lt 1 -or $items.Count -gt 128) { throw 'Supply 1 to 128 grants.' }
-    $rights = @{ Read = 131209; ReadAndExecute = 131241; Modify = 197055; FullControl = 2032127 }
+    # Windows allow rules include SYNCHRONIZE, which common file opens require.
+    $rights = @{ Read = 1179785; ReadAndExecute = 1179817; Modify = 1245631; FullControl = 2032127 }
     $seen = @{}
     $result = @()
     foreach ($item in $items) {
@@ -239,7 +252,7 @@ function Get-NpSidSize([string]$SID) {
 
 function Assert-NpNormalizedGrants($Grants) {
     $seen = @{}
-    $masks = @{ Read = 131209; ReadAndExecute = 131241; Modify = 197055; FullControl = 2032127 }
+    $masks = @{ Read = 1179785; ReadAndExecute = 1179817; Modify = 1245631; FullControl = 2032127 }
     if (@($Grants).Count -lt 1 -or @($Grants).Count -gt 128) { throw 'Invalid grants.' }
     foreach ($grant in $Grants) {
         Assert-NpProperties $grant @('GroupName','SID','Permissions','Mask')
@@ -287,7 +300,8 @@ function Get-NpBytesHash([byte[]]$Bytes) {
 }
 
 function Get-NpSourceHash {
-    $parts = foreach ($name in @('Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1')) {
+    $parts = foreach ($name in @('Add-FileSharePermissions.ps1','NtfsPermissions.Common.ps1','NtfsAssessment.Common.ps1',
+        'NtfsPermissions.Local.ps1','NtfsPermissions.Local.cs')) {
         $name + ':' + (Get-NpBytesHash ([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot $name))))
     }
     return Get-NtfsHash ($parts -join "`n")
@@ -306,8 +320,9 @@ function Assert-NpSnapshot($Snapshot) {
     foreach ($ace in @($Snapshot.Aces)) {
         Assert-NpProperties $ace @('SID','Type','Mask','Inherited','ContainerInherit','ObjectInherit','InheritOnly','NoPropagate')
         if ($ace.Type -notin @('Allow','Deny') -or $ace.SID -notmatch '^S-1-\d+(?:-\d+)+$' -or
-            $ace.Mask -isnot [ValueType] -or [long]$ace.Mask -lt 0 -or [long]$ace.Mask -gt 2147483647) {
-            throw 'Unsupported conditional, object, or opaque ACE.'
+            $ace.Mask -isnot [ValueType] -or [long]$ace.Mask -lt 0 -or [long]$ace.Mask -gt 2147483647 -or
+            ([long]$ace.Mask -band 4026531840L) -ne 0) {
+            throw 'Unsupported conditional, object, opaque, or generic-mask ACE.'
         }
         foreach ($flag in @('Inherited','ContainerInherit','ObjectInherit','InheritOnly','NoPropagate')) {
             if ($ace.$flag -isnot [bool]) { throw "Invalid ACE flag: $flag" }
@@ -336,7 +351,8 @@ function New-NpProposal($Before, $Grants, [string]$Scope, [bool]$Root = $true) {
         $covered = 0L
         foreach ($ace in $aces) {
             if ($ace.Type -eq 'Allow' -and $ace.SID -eq $grant.SID -and -not $ace.InheritOnly -and
-                (-not ($inherit -and $Root) -or ($ace.ContainerInherit -and $ace.ObjectInherit -and -not $ace.NoPropagate))) {
+                (-not ($inherit -and $Before.Kind -eq 'Folder') -or
+                    ($ace.ContainerInherit -and $ace.ObjectInherit -and -not $ace.NoPropagate))) {
                 $covered = $covered -bor [long]$ace.Mask
             }
         }
@@ -482,7 +498,7 @@ function New-NpPlan([string]$Target, $Grants, [string]$Scope, $Inventory, [strin
     if ($TargetDescriptor.Addressing -eq 'LocalFixed') {
         $reasons += "Local volume evidence=$($TargetDescriptor.VolumeObservation.Status); host=$($TargetDescriptor.LocalHost). Observations are not stable object identity, freshness or infrastructure trust proof."
     }
-    $reasons += "MutationNotQualified/$($TargetDescriptor.QualificationScope): native writer absent; identity, namespace/backend and propagation are unproven. Windows local, Windows SMB, NetApp SMB and generic SMB require separate qualification."
+    $reasons += "MutationNotQualified/$($TargetDescriptor.QualificationScope): qualified public writer absent; identity, namespace/backend and propagation are unproven in this planning workflow. Windows local, Windows SMB, NetApp SMB and generic SMB require separate qualification."
     return [pscustomobject][ordered]@{
         Schema = 'NtfsPermissionsPlan/2'; Version = $script:NtfsVersions.Permissions
         CreatedUtc = [DateTime]::UtcNow.ToString('o'); SourceHash = $SourceHash
@@ -589,7 +605,7 @@ function New-NpRun([string]$OutputDirectory, [string]$Target = '') {
         $acl.SetAccessRuleProtection($true,$false)
         $acl.SetOwner($sid)
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit, ObjectInherit','None','Allow'))
-        Set-Acl -LiteralPath $run -AclObject $acl -ErrorAction Stop
+        Set-Acl -LiteralPath $run -AclObject $acl -WhatIf:$false -ErrorAction Stop
         $actual = Get-Acl -LiteralPath $run -ErrorAction Stop
         $rules = @($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
         if (-not $actual.AreAccessRulesProtected -or -not $actual.AreAccessRulesCanonical -or

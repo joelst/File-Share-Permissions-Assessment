@@ -16,11 +16,13 @@ BeforeAll {
     function New-TestSnapshot([string]$Path = '\\SERVER1\Share1\Folder', [string]$Kind = 'Folder', [bool]$Protected = $false) {
         [pscustomobject][ordered]@{
             Path=$Path; Kind=$Kind; Identity="fixture-volume:file-id:$Path"
-            Owner='S-1-5-18'; Group='S-1-5-32-544'; Control=32772; Protected=$Protected
+            Owner='S-1-5-18'; Group='S-1-5-32-544'
+            Control=[int]([Security.AccessControl.ControlFlags]::SelfRelative -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent)
+            Protected=$Protected
             DaclPresent=$true; Canonical=$true; Aces=@(); Descriptor="fixture-before:$Path"
         }
     }
-    function New-TestAce([string]$SID='S-1-5-21-1-2-3-1001',[string]$Type='Allow',[long]$Mask=131241) {
+    function New-TestAce([string]$SID='S-1-5-21-1-2-3-1001',[string]$Type='Allow',[long]$Mask=1179817) {
         [pscustomobject][ordered]@{
             SID=$SID; Type=$Type; Mask=$Mask; Inherited=$false
             ContainerInherit=$true; ObjectInherit=$true; InheritOnly=$false; NoPropagate=$false
@@ -108,7 +110,7 @@ Describe 'Strict UNC and grant validation' {
         $grants=@(Get-NpGrants -Json '[{"GroupName":"A","Permissions":"Read"},{"Permissions":"Modify","GroupName":"B"}]' -Resolve $resolve)
         $grants.Count | Should -Be 2
         $calls.Count | Should -Be 2
-        $grants[1].Mask | Should -Be 197055
+        $grants[1].Mask | Should -Be 1245631
     }
     It 'accepts escaped domain names and JSON files' {
         $json='[{"GroupName":"DOMAIN\\Readers","Permissions":"Read"}]'
@@ -345,6 +347,29 @@ Describe 'Read-only abstract ACL proposal safety' {
             (New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles).NoOp | Should -BeFalse
         }
     }
+    It 'requires propagating coverage on recursive descendant folders, but not files' {
+        foreach($condition in @('Noninheritable','NoPropagate')){
+            $before=New-TestSnapshot '\\SERVER1\Share1\Folder\child'
+            $ace=New-TestAce
+            if($condition -eq 'Noninheritable'){
+                $ace.ContainerInherit=$false
+                $ace.ObjectInherit=$false
+            } else { $ace.NoPropagate=$true }
+            $before.Aces=@($ace)
+            $proposal=New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles $false
+            $proposal.NoOp | Should -BeFalse
+            $proposal.Intent.Aces.Count | Should -Be 2
+            $proposal.Intent.Aces[-1].Inherited | Should -BeTrue
+            $proposal.Intent.Aces[-1].ContainerInherit | Should -BeTrue
+            $proposal.Intent.Aces[-1].ObjectInherit | Should -BeTrue
+        }
+        $file=New-TestSnapshot '\\SERVER1\Share1\Folder\child\file.txt' File
+        $ace=New-TestAce
+        $ace.ContainerInherit=$false
+        $ace.ObjectInherit=$false
+        $file.Aces=@($ace)
+        (New-NpProposal $file (New-TestGrants) ThisFolderSubfoldersAndFiles $false).NoOp | Should -BeTrue
+    }
     It 'rejects absent/null DACL and noncanonical ACL' {
         foreach($flag in @('DaclPresent','Canonical')){
             $before=New-TestSnapshot
@@ -365,6 +390,23 @@ Describe 'Read-only abstract ACL proposal safety' {
             $ace.InheritOnly=$inheritOnly
             $before.Aces=@($ace)
             { New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles } | Should -Throw '*deny*'
+        }
+    }
+    It 'rejects <Right> before generic allow coverage or inheritable deny overlap checks' -ForEach @(
+        @{ Right = 'GENERIC_ALL'; Mask = 268435456L }
+        @{ Right = 'GENERIC_EXECUTE'; Mask = 536870912L }
+        @{ Right = 'GENERIC_WRITE'; Mask = 1073741824L }
+        @{ Right = 'GENERIC_READ'; Mask = 2147483648L }
+        @{ Right = 'signed GENERIC_READ'; Mask = -2147483648L }
+        @{ Right = 'mixed generic and concrete rights'; Mask = 268435457L }
+    ) {
+        foreach ($type in @('Allow','Deny')) {
+            $before = New-TestSnapshot
+            $ace = New-TestAce -Type $type -Mask $Mask
+            $ace.InheritOnly = $type -eq 'Deny'
+            $before.Aces = @($ace)
+            { New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles } |
+                Should -Throw '*generic-mask ACE*'
         }
     }
     It 'enforces aggregate ACL bounds' {
@@ -748,11 +790,15 @@ Describe 'Public qualification gate' {
                 $LASTEXITCODE | Should -Be 2
                 $read=Read-NpJournal (Join-Path $result.RunDirectory 'events.jsonl')
                 $read.Events.Result | Should -Contain 'Blocked/NotQualified'
-                $console=$completionMessages.MessageData -join "`n"
+                $console=($completionMessages.MessageData -join "`n") -replace '\s+', ' '
                 $console | Should -Match 'Permission planning: Blocked\.'
                 $console | Should -Match ([regex]::Escape((Join-Path $result.RunDirectory 'events.jsonl')))
-                $console | Should -Match 'Live Apply/Revert are disabled'
-                $console | Should -Not -Match '(?s)Next:.*-Mode (Apply|Revert)'
+                $result.Reason | Should -Match 'review-only plans cannot be executed'
+                $console | Should -Match 'review-only plans cannot be executed'
+                $console | Should -Match 'direct .*?-Mode Apply -TargetPath with -WhatIf first'
+                $console | Should -Match 'receipt-bound -Mode Revert'
+                $console | Should -Match 'never promote -PlanPath into execution'
+                $console | Should -Not -Match 'Live Apply/Revert are disabled|No next executable change script'
             }
         }
     }
@@ -816,5 +862,66 @@ Describe 'Public qualification gate' {
             $command.Parameters.ContainsKey($name) | Should -BeFalse
         }
         $command.Parameters['TargetPath'].Aliases | Should -Contain ShareName
+    }
+}
+
+Describe 'Public writer parameter casing' {
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '../NtfsPermissions.Local.ps1')
+    }
+
+    It 'canonicalizes <InputMode>/<InputScope>/<InputPlatform> before dispatch with DisposableLocalLab=<Lab>' -ForEach @(
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'thisfolderonly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'nEtApP'; ExpectedPlatform = 'NetApp'; Lab = $false }
+        @{ InputMode = 'aPpLy'; ExpectedMode = 'Apply'; InputScope = 'thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles'; InputPlatform = 'windows'; ExpectedPlatform = 'Windows'; Lab = $true }
+        @{ InputMode = 'revert'; ExpectedMode = 'Revert'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'nas'; ExpectedPlatform = 'Nas'; Lab = $false }
+        @{ InputMode = 'rEvErT'; ExpectedMode = 'Revert'; InputScope = 'THISFOLDERONLY'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'auto'; ExpectedPlatform = 'Auto'; Lab = $true }
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'wInDoWs'; ExpectedPlatform = 'Windows'; Lab = $false }
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'aUtO'; ExpectedPlatform = 'Auto'; Lab = $true }
+    ) {
+        Mock Invoke-NpDisposableLab {
+            param($Mode, $Scope, $TargetPlatform)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope; TargetPlatform = $TargetPlatform }
+        }
+        Mock Invoke-NpPermissionWrite {
+            param($Mode, $Scope, $TargetPlatform)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope; TargetPlatform = $TargetPlatform }
+        }
+        $result = & (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') `
+            -Mode $InputMode -Scope $InputScope -TargetPlatform $InputPlatform `
+            -DisposableLocalLab:$Lab -OutputDirectory $script:work -WhatIf
+        $result.Mode | Should -BeExactly $ExpectedMode
+        $result.Scope | Should -BeExactly $ExpectedScope
+        $result.TargetPlatform | Should -BeExactly $ExpectedPlatform
+        if ($Lab) {
+            Should -Invoke Invoke-NpDisposableLab -Times 1 -Exactly
+            Should -Invoke Invoke-NpPermissionWrite -Times 0 -Exactly
+        } else {
+            Should -Invoke Invoke-NpPermissionWrite -Times 1 -Exactly
+            Should -Invoke Invoke-NpDisposableLab -Times 0 -Exactly
+        }
+    }
+}
+
+Describe 'Windows public gate audit ACL' -Skip:([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+    It 'creates restricted audit evidence for <Mode> WhatIf without writing the target' -ForEach @(
+        @{ Mode = 'Apply' }
+        @{ Mode = 'Revert' }
+    ) {
+        $saved = Save-TestPlan (New-TestPlan)
+        $result = & (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') -Mode $Mode `
+            -PlanPath $saved.Path -PlanSHA256 $saved.Hash -ChangeTicket CHG123 `
+            -OutputDirectory $script:work -WhatIf
+        $LASTEXITCODE | Should -Be 2
+        $result.Status | Should -Be Blocked
+        $result.TargetWrites | Should -Be 0
+        $acl = Get-Acl -LiteralPath $result.RunDirectory
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value | Should -Be $sid.Value
+        $rules.Count | Should -Be 1
+        $rules[0].IdentityReference.Value | Should -Be $sid.Value
+        (Read-NpJournal (Join-Path $result.RunDirectory 'events.jsonl')).Events.Result |
+            Should -Contain 'Blocked/NotQualified'
     }
 }

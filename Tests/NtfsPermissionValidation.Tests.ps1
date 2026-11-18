@@ -16,7 +16,9 @@ BeforeAll {
     function New-VSnapshot([string]$Path='\\server\lab\case', [string]$Kind='Folder', [bool]$Protected=$false) {
         [pscustomobject][ordered]@{
             Path=$Path; Kind=$Kind; Identity="UNQUALIFIED:fixture:$Path"
-            Owner='S-1-5-18'; Group='S-1-5-32-544'; Control=32772; Protected=$Protected
+            Owner='S-1-5-18'; Group='S-1-5-32-544'
+            Control=[int]([Security.AccessControl.ControlFlags]::SelfRelative -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent)
+            Protected=$Protected
             DaclPresent=$true; Canonical=$true; Aces=@(); Descriptor="fixture-original:$Path"
         }
     }
@@ -94,7 +96,7 @@ Describe 'Read-only validation evidence workflow' {
     It 'records an already covered no-op without calling it a successful change' {
         $s=New-VSnapshot
         $s.Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         $script:fixture=New-VInventory @($s)
@@ -531,12 +533,41 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after.Snapshots[1].Descriptor='unexpected-descendant-change'
         (Compare-NvCapture $before $after $binding Apply).Status | Should -Be Failed
     }
+    It 'rejects auto-inheritance control-flag propagation into unaffected descendants' {
+        $binding=New-VBinding -Scope ThisFolderOnly
+        $root=New-VSnapshot
+        $file=New-VSnapshot '\\server\lab\case\f.txt' File
+        $root.Descriptor='O:SYG:SYD:(A;ID;FA;;;WD)'
+        $file.Descriptor='O:SYG:SYD:(A;ID;FA;;;WD)'
+        $before=Get-VObserved @($root,$file)
+        $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
+        $after.Snapshots[0].Descriptor='O:SYG:SYD:AI(A;;FR;;;S-1-5-21-1-2-3-1001)(A;ID;FA;;;WD)'
+        $after.Snapshots[0].Control=[int]([Security.AccessControl.ControlFlags]$root.Control -bor
+            [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)
+        $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
+            ContainerInherit=$false;ObjectInherit=$false;InheritOnly=$false;NoPropagate=$false
+        })
+        $after.Snapshots[1].Descriptor='O:SYG:SYD:AI(A;ID;FA;;;WD)'
+        $after.Snapshots[1].Control=[int]([Security.AccessControl.ControlFlags]$file.Control -bor
+            [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited)
+
+        $comparison=Compare-NvCapture $before $after $binding Apply
+        $comparison.Status | Should -Be Failed
+        $comparison.DescriptorResult | Should -Be DriftObserved
+        $comparison.Rows[0].MetadataUnchanged | Should -BeFalse
+        $comparison.Rows[0].ObservedGrant | Should -Be ObservedAllowCoverageOnly
+        $comparison.Rows[0].UnrelatedRawAcl | Should -Be ObservedUnchanged
+        $comparison.Rows[1].DescriptorExactMatch | Should -BeFalse
+        $comparison.Rows[1].MetadataUnchanged | Should -BeFalse
+        $comparison.Rows[1].Status | Should -Be Failed
+    }
     It 'never treats a synthesized abstract intent as an exact expected descriptor' {
         $before=Get-VObserved
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='observed-different'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'NotAssessed' }
@@ -551,7 +582,7 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='grant-plus-unrelated-drift'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'Failed' }
@@ -564,7 +595,7 @@ Describe 'Conservative independent descriptor and namespace comparisons' {
         $after=Get-NpCanonicalJson $before | ConvertFrom-NpJson
         $after.Snapshots[0].Descriptor='root-only-grant'
         $after.Snapshots[0].Aces=@([pscustomobject][ordered]@{
-            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=131209L;Inherited=$false
+            SID='S-1-5-21-1-2-3-1001';Type='Allow';Mask=1179785L;Inherited=$false
             ContainerInherit=$true;ObjectInherit=$true;InheritOnly=$false;NoPropagate=$false
         })
         Mock Get-NvUnrelatedAcl { 'ObservedUnchanged' }

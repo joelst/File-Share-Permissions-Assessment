@@ -65,6 +65,12 @@ function Get-Value($Object,[string]$Name,[string]$Default='') {
 function Get-PathKey([string]$Path) {
     return Get-NtfsPathKey $Path
 }
+function Get-StagingIoPath([string]$Path) {
+    if([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or $Path.StartsWith('\\?\')){return $Path}
+    if($Path.StartsWith('\\')){return '\\?\UNC\'+$Path.Substring(2)}
+    if($Path -match '^[A-Za-z]:\\'){return '\\?\'+$Path}
+    return $Path
+}
 function Get-ShareKey([string]$Server,[string]$Share) {
     if([string]::IsNullOrWhiteSpace($Server) -or [string]::IsNullOrWhiteSpace($Share)){throw 'Blank server/share in assessment data.'}
     return ConvertTo-NtfsCsvRecord @($Server.ToLowerInvariant(),$Share.ToLowerInvariant())
@@ -240,7 +246,7 @@ function Stage-Run($Run,[string]$Side) {
                 $writerKey="$dataset|$key"
                 if(-not $writers.ContainsKey($writerKey)){
                     $path=Join-Path $TempDir ($Side+'_'+(Get-NtfsHash $key)+"_$dataset.tmp")
-                    $writers[$writerKey]=[IO.StreamWriter]::new($path,$false,[Text.UTF8Encoding]::new($false))
+                    $writers[$writerKey]=[IO.StreamWriter]::new((Get-StagingIoPath $path),$false,[Text.UTF8Encoding]::new($false))
                     $writers[$writerKey].WriteLine((ConvertTo-NtfsCsvRecord $script:Columns[$dataset]))
                     $spool[$dataset]=$path
                 }
@@ -255,7 +261,7 @@ function Stage-Run($Run,[string]$Side) {
 }
 function Read-Staged($Run,[string]$Key,[string]$Dataset) {
     if($Run.Spools.ContainsKey($Key) -and $Run.Spools[$Key].ContainsKey($Dataset)){
-        Read-NtfsCsvFile $Run.Spools[$Key][$Dataset]
+        Read-NtfsCsvFile (Get-StagingIoPath $Run.Spools[$Key][$Dataset])
     }
 }
 function Get-FolderIndex($Run,[string]$Key) {
@@ -573,7 +579,7 @@ try{
     $cleanupErrors=@(Invoke-NtfsCleanup @(
         {if($null -ne $script:Changes){$script:Changes.Dispose()}},
         {if($null -ne $scopeWriter){$scopeWriter.Dispose()}},
-        {if($null -ne $TempDir -and (Test-Path -LiteralPath $TempDir)){Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction Stop}}
+        {if($null -ne $TempDir -and (Test-Path -LiteralPath $TempDir)){Remove-Item -LiteralPath (Get-StagingIoPath $TempDir) -Recurse -Force -ErrorAction Stop}}
     ))
     foreach($errorMessage in $cleanupErrors){Add-Limitation $errorMessage}
     if($cleanupErrors.Count -gt 0){

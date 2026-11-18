@@ -11,17 +11,30 @@
 # This script is not an official Microsoft product or supported Microsoft service.
 <#
 .SYNOPSIS
-Read-only NTFS permission planning with audited, DISABLED live Apply/Revert.
+Pure Windows SMB and local NTFS permission planning, handle-pinned Apply, and optional Revert.
 .DESCRIPTION
 Release version: NtfsAssessment.Common.ps1, Permissions entry in NtfsVersions.
 
-Matches the shared permissions engine and evidence version.
-Plan validates all security groups and snapshots a local fixed Windows NTFS
-directory, verified mapped drive (converted to UNC), or deep direct UNC and affected
-folders AND files. Default scope is ThisFolderSubfoldersAndFiles through existing
-inheritance only. Protected descendant boundaries are recorded, not traversed.
-No SMB share ACLs, inheritance toggles, or recursive explicit grants are written.
-Plans are review-only/Blocked, not executable. Native mutation is absent.
+Executes read-only permission planning (-Mode Plan) as well as handle-pinned
+permission changes (-Mode Apply) and optional evidence-bound rollback (-Mode Revert)
+across direct local fixed Windows NTFS, Windows SMB shares, NetApp ONTAP SMB shares,
+generic NAS SMB shares, and mapped drives (frozen once into canonical UNC) without
+requiring ONTAP CLI, ONTAP REST APIs, or a prior full-server assessment.
+
+Supported operations in -Mode Apply:
+- Add (default): Adds explicit allow ACEs for one or more AD security groups/SIDs.
+- Remove: Removes matching allow ACEs for -RemovePrincipal (Everyone, SID, or AD group)
+  within the selected unprotected scope while preserving unrelated ACEs and protected branches.
+- Replace: Removes matching allow ACEs for -RemovePrincipal and inserts replacement allow
+  ACEs preserving each removed ACE's inheritance flags.
+
+Standard Apply creates a fresh handle-pinned preimage plan in the same invocation,
+pins every in-scope handle with zero share access, writes exact self-relative DACL
+control flags via ntdll!NtSetSecurityObject (preventing SE_DACL_AUTO_INHERITED drift
+on NetApp WAFL SMB), verifies every path's descriptor and file identifier before and
+after writes, and emits receipt.json, events.jsonl, and permissions-before-after.csv.
+Use -WhatIf on -Mode Apply to preview without mutating target ACLs.
+Review-only plans created by -Mode Plan (-PlanPath) remain non-executable snapshots.
 
 Requires Windows, RSAT ActiveDirectory group reads and sufficient read access.
 SMB plans read Windows-style filesystem ACLs on Windows, NetApp or generic NAS;
@@ -43,37 +56,39 @@ Machine/SVM-local groups are unsupported; unknown authority fails closed.
 NoOp means unconditional matching-SID ACL coverage, not effective-access proof.
 Proposals are abstract intent models, NOT computed post-propagation descriptors.
 
-Apply/Revert require a reviewed SHA256 and ticket but always emit Blocked /
-NotQualified before any target write, including with WhatIf/Confirm. WhatIf never
-changes target permissions; local audit/evidence is still written. Approvals are not
-identity authorization; SHA256 and a local hash chain are not tamper-proof.
-Archive plans, manifests, source hashes and journals externally under enterprise
-access control. Audit/run locks are local only, not distributed locks. Output
-must be on a trusted local volume which is not the share's backing directory.
-Known same-named local SMB backing paths are checked and mapped output drives
-are rejected. The caller must independently validate remaining physical mappings
-(aliases, subst/8.3/DFS); this tool cannot prove them.
-Named target mutexes coordinate this host only (not aliases or other hosts).
-Reports use the toolkit's 100,000,000-byte CSV part cap.
-Revert can additionally review RecoveryManifestPath, RecoveryJournalPath and
-RecoveryJournalSHA256 together. This verifies source/evidence bindings only;
-it never authorizes or executes restoration.
+Review-only plans created by -Mode Plan (-PlanPath / -PlanSHA256) are abstract intent
+snapshots without pinned physical file IDs or computed post-propagation descriptors, so
+invoking -Mode Apply or -Mode Revert with -PlanPath always emits Blocked / NotQualified
+without target writes. Instead, invoke -Mode Apply directly with -TargetPath (building a
+fresh handle-pinned plan in the same run) and invoke -Mode Revert with -ReceiptPath,
+-ReceiptSHA256, and -ReviewedApplyJournalSHA256. WhatIf never changes target permissions;
+local audit/evidence is still written. Approvals are not identity authorization; SHA256
+and a local hash chain are not tamper-proof. Archive receipts, plans, manifests, source
+hashes and journals externally under enterprise access control. Audit/run locks are local
+only, not distributed locks. Output must be on a trusted local volume which is not the
+share's backing directory. Known same-named local SMB backing paths are checked and mapped
+output drives are rejected. The caller must independently validate remaining physical
+mappings (aliases, subst/8.3/DFS); this tool cannot prove them. Named target mutexes
+coordinate this host only (not aliases or other hosts). Toolkit assessment reports use
+the 100,000,000-byte CSV part cap; the verified before/after audit is a single streamed CSV.
 
-PlanningSupported does not mean writable support. MutationNotQualified applies
-independently to LocalWindows, WindowsSMB, NetAppSMB and GenericSMB; Windows tests
-cannot qualify NetApp/NAS. Apply/Revert exit nonzero after recording Blocked.
-Old plans without addressing/platform/recovery bindings require replanning.
-Qualification still required on disposable Windows NTFS and each isolated SMB backend:
-identity-bound handles and stable volume/file IDs; direct backend/DFS rejection;
-controlled propagation for both scopes; exclusive handle availability (fail if
-unavailable), consequences for SMB clients, and SetSecurityInfo inheritance vs
-exclusive-handle propagation suppression; concurrent administrator drift; exact
-DACL/owner/group/control and identity verification on every affected path; guarded
-per-path rollback under propagation, protected boundaries and crashes/timeouts.
-SetKernelObjectSecurity is unsupported for files and is never used.
-No Force/experimental bypass exists. Offline mocks do NOT qualify this release.
-Failures stop, preserve evidence and require explicit recovery review; never retry
-or auto-rollback. Torn journal tails are Indeterminate and retained unchanged.
+Each Apply creates a fresh plan in that same invocation; it cannot consume a previous
+plan or WhatIf preview. It persists exact native preimages and desired states before
+writes, then returns a receipt and Apply journal hashes. Retain the receipt hash
+independently and review the source-bound journal before Revert; hashes are not
+authentication. Revert requires the same source, the saved record, the receipt, its
+retained hash and the reviewed Apply journal hash. Recovery evidence does not expire
+after 24 hours. Partial Apply recovery additionally requires -ReviewedPartialApplyRecovery.
+Separate fresh audit directories are created; no automatic rollback or overwrite is
+performed. Failures stop, preserve evidence and require explicit recovery review; never
+retry or auto-rollback. Torn journal tails are Indeterminate and retained unchanged.
+For local Windows NTFS and Windows SMB targets, all inventoried paths outside protected
+branches must carry the DACL auto-inherited control flag before a write; NetApp ONTAP SMB
+and generic NAS SMB shares routinely omit that flag on WAFL/NAS descriptors and are
+written via ntdll!NtSetSecurityObject so exact DACL control flags are preserved without
+introducing SE_DACL_AUTO_INHERITED drift. Legacy -DisposableLocalLab +
+-DisposableAcknowledgement remains backward-compatible and restricted to direct local
+fixed Windows NTFS.
 .EXAMPLE
 .\Add-FileSharePermissions.ps1 -Mode Plan -TargetPath 'Z:\share\folder' -TargetPlatform Windows -GroupName 'DOMAIN\Readers' -Permissions ReadAndExecute -OutputDirectory C:\NtfsAudit
 Z: must be verified as fixed NTFS or an available mapped UNC in this logon context.
@@ -87,6 +102,24 @@ Read-only Windows-style filesystem ACL plan, not share permissions or ONTAP writ
 .EXAMPLE
 .\Add-FileSharePermissions.ps1 -Mode Apply -PlanPath C:\NtfsAudit\Permissions_RUN\plan.json -PlanSHA256 REVIEWED_SHA256 -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit
 This records Blocked/NotQualified; no target ACL write is possible.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -TargetPath C:\DisposableLab\Fixture -GroupName 'DOMAIN\LabReaders' -Permissions Read -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence -WhatIf
+Preview only. Remove -WhatIf only in an independently approved disposable lab.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Revert -DisposableLocalLab -DisposableAcknowledgement -ReceiptPath C:\LabEvidence\Permissions_RUN\receipt.json -ReceiptSHA256 RETAINED_RECEIPT_SHA256 -ReviewedApplyJournalSHA256 REVIEWED_APPLY_JOURNAL_SHA256 -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence
+Review and retain the Apply evidence and hashes independently before Revert.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -DisposableLocalLab -DisposableAcknowledgement -Operation Replace -RemovePrincipal Everyone -TargetPath C:\DisposableLab\Fixture -GroupName 'DOMAIN\LabReaders' -Permissions ReadAndExecute -Scope ThisFolderSubfoldersAndFiles -ChangeTicket LAB123 -OutputDirectory C:\LabEvidence -WhatIf
+Preview replacing explicit Everyone allow entries with the selected group.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath '\\FILER1\Assessment\Finance' -TargetPlatform NetApp -Operation Replace -RemovePrincipal Everyone -GroupName 'DOMAIN\Finance-Modify' -Permissions Modify -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit -WhatIf
+Preview replacing Everyone allow ACEs over standard Windows SMB on NetApp (no ONTAP CLI/API required).
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Apply -TargetPath '\\FILER1\Assessment\Finance' -TargetPlatform NetApp -Operation Replace -RemovePrincipal Everyone -GroupName 'DOMAIN\Finance-Modify' -Permissions Modify -ChangeTicket CHG123 -OutputDirectory C:\NtfsAudit -Confirm:$false
+Execute handle-pinned Replace over SMB and write receipt.json, events.jsonl, and permissions-before-after.csv.
+.EXAMPLE
+.\Add-FileSharePermissions.ps1 -Mode Revert -ReceiptPath C:\NtfsAudit\Permissions_RUN\receipt.json -ReceiptSHA256 RETAINED_RECEIPT_SHA256 -ReviewedApplyJournalSHA256 REVIEWED_APPLY_JOURNAL_SHA256 -ChangeTicket CHG123-REV -OutputDirectory C:\NtfsAudit -Confirm:$false
+Optional rollback using retained Apply receipt and journal SHA256 hashes.
 #>
 [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
 param(
@@ -97,6 +130,8 @@ param(
     [string]$Permissions,
     [string]$GroupPermissionsJson,
     [string]$GroupPermissionsFile,
+    [ValidateSet('Add','Remove','Replace')][string]$Operation = 'Add',
+    [string]$RemovePrincipal,
     [ValidateSet('ThisFolderSubfoldersAndFiles','ThisFolderOnly')][string]$Scope = 'ThisFolderSubfoldersAndFiles',
     [Parameter(Mandatory=$true)][string]$OutputDirectory,
     [string]$PlanPath,
@@ -105,12 +140,83 @@ param(
     [string]$RecoveryManifestPath,
     [string]$RecoveryJournalPath,
     [string]$RecoveryJournalSHA256,
+    [switch]$DisposableLocalLab,
+    [switch]$DisposableAcknowledgement,
+    [string]$ReceiptPath,
+    [string]$ReceiptSHA256,
+    [string]$ReviewedApplyJournalSHA256,
+    [switch]$ReviewedPartialApplyRecovery,
     [ValidateRange(1,100000)][int]$MaxPaths = 10000,
     [ValidateRange(1,24)][int]$MaxPlanAgeHours = 24
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'NtfsPermissions.Common.ps1')
+
+$Mode = switch ($Mode) { 'Plan' { 'Plan' } 'Apply' { 'Apply' } 'Revert' { 'Revert' } }
+$Scope = switch ($Scope) {
+    'ThisFolderSubfoldersAndFiles' { 'ThisFolderSubfoldersAndFiles' }
+    'ThisFolderOnly' { 'ThisFolderOnly' }
+}
+$TargetPlatform = switch ($TargetPlatform) {
+    'Auto' { 'Auto' }
+    'Windows' { 'Windows' }
+    'NetApp' { 'NetApp' }
+    'Nas' { 'Nas' }
+}
+
+if ($DisposableLocalLab) {
+    . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
+    $labArguments = @{
+        Mode=$Mode; TargetPath=$TargetPath; TargetPlatform=$TargetPlatform; GroupName=$GroupName
+        Permissions=$Permissions; GroupPermissionsJson=$GroupPermissionsJson; GroupPermissionsFile=$GroupPermissionsFile
+        Operation=$Operation; RemovePrincipal=$RemovePrincipal
+        Scope=$Scope; OutputDirectory=$OutputDirectory; ChangeTicket=$ChangeTicket; MaxPaths=$MaxPaths
+        DisposableAcknowledgement=$DisposableAcknowledgement; ReceiptPath=$ReceiptPath; ReceiptSHA256=$ReceiptSHA256
+        ReviewedApplyJournalSHA256=$ReviewedApplyJournalSHA256
+        ReviewedPartialApplyRecovery=$ReviewedPartialApplyRecovery; Preview=[bool]$WhatIfPreference
+        CallerConfirmPreference=[string]$ConfirmPreference
+        BoundParameters=$PSBoundParameters
+    }
+    $labResult = Invoke-NpDisposableLab @labArguments
+    $labResult
+    if ($labResult.Status -in @('Blocked','Indeterminate')) { exit 2 }
+    exit 0
+}
+if ($DisposableAcknowledgement) {
+    throw 'DisposableAcknowledgement requires -DisposableLocalLab; omit both for standard Apply or Revert.'
+}
+$hasPreparedPlanArgs = (
+    $PSBoundParameters.ContainsKey('PlanPath') -or
+    $PSBoundParameters.ContainsKey('PlanSHA256') -or
+    $PSBoundParameters.ContainsKey('RecoveryManifestPath') -or
+    $PSBoundParameters.ContainsKey('RecoveryJournalPath') -or
+    $PSBoundParameters.ContainsKey('RecoveryJournalSHA256')
+)
+if ($Mode -in @('Apply','Revert') -and -not $hasPreparedPlanArgs) {
+    . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
+    $writeArguments = @{
+        Mode=$Mode; TargetPath=$TargetPath; TargetPlatform=$TargetPlatform; GroupName=$GroupName
+        Permissions=$Permissions; GroupPermissionsJson=$GroupPermissionsJson; GroupPermissionsFile=$GroupPermissionsFile
+        Operation=$Operation; RemovePrincipal=$RemovePrincipal
+        Scope=$Scope; OutputDirectory=$OutputDirectory; ChangeTicket=$ChangeTicket; MaxPaths=$MaxPaths
+        ReceiptPath=$ReceiptPath; ReceiptSHA256=$ReceiptSHA256
+        ReviewedApplyJournalSHA256=$ReviewedApplyJournalSHA256
+        ReviewedPartialApplyRecovery=$ReviewedPartialApplyRecovery; Preview=[bool]$WhatIfPreference
+        CallerConfirmPreference=[string]$ConfirmPreference
+        BoundParameters=$PSBoundParameters
+    }
+    $writeResult = Invoke-NpPermissionWrite @writeArguments
+    $writeResult
+    if ($writeResult.Status -in @('Blocked','Indeterminate')) { exit 2 }
+    exit 0
+}
+if ($ReceiptPath -or $ReceiptSHA256 -or $ReviewedApplyJournalSHA256 -or $ReviewedPartialApplyRecovery) {
+    throw 'Receipt and partial-Apply recovery options apply only to direct Apply/Revert runs without -PlanPath.'
+}
+if ($Operation -ne 'Add' -or $PSBoundParameters.ContainsKey('RemovePrincipal')) {
+    throw 'Remove and Replace are executed with -Mode Apply (use -WhatIf to preview), not review-only -Mode Plan.'
+}
 
 # Parse/hash a supplied plan only once. Defer errors until safe local audit exists.
 $plan = $null
@@ -158,13 +264,13 @@ try {
             Write-NpEvent $journal 'RecoveryEvidence' $recovery.Status @("ManifestSHA256=$($recovery.ManifestSHA256)")
         }
         $status = 'Blocked'
-        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): live Apply/Revert disabled; no native ACL writer exists. Qualify this exact platform separately; Windows tests never qualify NetApp/NAS."
+        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): review-only plans cannot be executed by Apply or Revert. Direct -Mode Apply -TargetPath and receipt-bound -Mode Revert are separate live-write workflows requiring independent approval; start a direct Apply review with -WhatIf. This prepared-plan invocation performed zero target writes. Windows tests never qualify NetApp/NAS."
         Write-NpEvent $journal 'QualificationGate' 'Blocked/NotQualified' @("QualificationScope=$($targetDescriptor.QualificationScope); MutationNotQualified")
     } else {
         Write-Progress -Activity 'NTFS plan' -Status 'Validate every group before ACL inventory'
         $grants = @(Get-NpGrants $GroupName $Permissions $GroupPermissionsJson $GroupPermissionsFile ${function:Resolve-NpWindowsGroup})
         Write-NpEvent $journal 'ClientADGroupsResolved' 'TargetAuthorityUnverified' @($grants | ForEach-Object { "$($_.SID):$($_.Permissions)" })
-        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows read-only NTFS planning adapter required. No live mutation is available on any platform.' }
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows read-only NTFS planning adapter required. Direct permission writes also require Windows.' }
         $inventory = Get-NpWindowsInventory $target $Scope $MaxPaths
         $plan = New-NpPlan $target $grants $Scope $inventory (Get-NpSourceHash) $targetDescriptor
         $planFile = Join-Path $run 'plan.json'
@@ -200,7 +306,7 @@ try {
     Write-NpEvent $journal 'Complete' $status
 } catch {
     $reason = $_.Exception.Message
-    # Any public failure is pre-mutation: native target setter does not exist.
+    # This review-only path never dispatches the native writer.
     $status = 'Blocked'
     try { Write-NpEvent $journal 'Stopped' 'Blocked/NotQualified' } catch { $reason += '; AUDIT FAILURE: ' + $_.Exception.Message }
 } finally {
@@ -213,12 +319,12 @@ $completion=@{
     summary="Mode=$($Mode); TargetWrites=0; WriterQualification=NotQualified. $($reason)"
     reviewPath=@((Join-Path $run 'events.jsonl'))
     requirements=$(if($status -eq 'Blocked'){
-        'Resolve/review 1 blocked result using the reason below; live mutation has 1 non-bypassable qualification restriction, not a bypassable missing parameter.'
+        'Resolve/review the blocked result below. Review-only plans cannot be executed; direct targeted Apply and receipt-bound Revert require separate approval and evidence review.'
     }else{
         $planningActions=@(
             if($plan.Reasons.Count -gt 0){"Review $($plan.Reasons.Count) planning/qualification warnings."}
             if($plan.Boundaries.Count -gt 0){"Review $($plan.Boundaries.Count) protected boundaries."}
-            'Live mutation has 1 non-bypassable qualification blocker.'
+            'Review-only plans are non-executable; they do not authorize a separate direct targeted Apply or receipt-bound Revert.'
         )
         $planningActions -join ' '
     })
@@ -228,9 +334,9 @@ $completion=@{
         }elseif($reason){[pscustomobject]@{Count=1;Reason=$reason}}
     )
     nextStep=$(if($status -eq 'Blocked'){
-        'Preserve the journal. If planning inputs/coverage were invalid, next script: Add-FileSharePermissions.ps1 -Mode Plan after resolving them. Live Apply/Revert are disabled; no next script in this toolkit can perform the change.'
+        'Preserve the journal and resolve the reported input/coverage or evidence blockers. Review-only plans cannot be executed. Only after independent approval, use direct Add-FileSharePermissions.ps1 -Mode Apply -TargetPath with -WhatIf first, or receipt-bound -Mode Revert with the original receipt and reviewed hashes; never promote -PlanPath into execution.'
     }else{
-        'No next executable change script is available. Review plan.json and before-and-intent.csv. Invoke-NtfsPermissionValidation.ps1 is only for a separately approved disposable-lab evidence workflow, not production Apply/Revert.'
+        'Review plan.json and before-and-intent.csv; review-only plans cannot be executed. For a separately approved change, use direct Add-FileSharePermissions.ps1 -Mode Apply -TargetPath with -WhatIf first, not -PlanPath. Optional receipt-bound -Mode Revert requires the original Apply evidence and reviewed hashes. Invoke-NtfsPermissionValidation.ps1 remains an optional disposable-lab observation workflow, not a writer.'
     })
 }
 if($Mode -eq 'Plan' -and $status -ne 'Blocked'){$completion.reviewPath+=@((Join-Path $run 'plan.json'),(Join-Path $run 'before-and-intent.csv'))}
