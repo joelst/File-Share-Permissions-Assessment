@@ -320,8 +320,9 @@ function Assert-NpSnapshot($Snapshot) {
     foreach ($ace in @($Snapshot.Aces)) {
         Assert-NpProperties $ace @('SID','Type','Mask','Inherited','ContainerInherit','ObjectInherit','InheritOnly','NoPropagate')
         if ($ace.Type -notin @('Allow','Deny') -or $ace.SID -notmatch '^S-1-\d+(?:-\d+)+$' -or
-            $ace.Mask -isnot [ValueType] -or [long]$ace.Mask -lt 0 -or [long]$ace.Mask -gt 2147483647) {
-            throw 'Unsupported conditional, object, or opaque ACE.'
+            $ace.Mask -isnot [ValueType] -or [long]$ace.Mask -lt 0 -or [long]$ace.Mask -gt 2147483647 -or
+            ([long]$ace.Mask -band 4026531840L) -ne 0) {
+            throw 'Unsupported conditional, object, opaque, or generic-mask ACE.'
         }
         foreach ($flag in @('Inherited','ContainerInherit','ObjectInherit','InheritOnly','NoPropagate')) {
             if ($ace.$flag -isnot [bool]) { throw "Invalid ACE flag: $flag" }

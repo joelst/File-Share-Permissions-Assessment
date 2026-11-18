@@ -248,6 +248,30 @@ Describe 'Disposable AGDLP lab provisioner' -Skip:([Environment]::OSVersion.Plat
         Test-Path -LiteralPath $parameters.evidencePath | Should -BeFalse
     }
 
+    It 'uses the resolved parent OU spelling for every planned DN and collision search' {
+        $parameters.parentOu = 'OU=Lab\2C Resources,DC=example,DC=test'
+        $parameters.employeeCount = 17
+        Mock Get-ADOrganizationalUnit {
+            [pscustomobject]@{ DistinguishedName = 'OU=Lab\, Resources,DC=example,DC=test' }
+        }
+        $result = & $script:provisioner @parameters -WhatIf
+        $result.Status | Should -Be 'PreviewOrDeclined'
+        $expectedLabOu = 'OU=' + $result.Plan.ShareName + ',OU=Lab\, Resources,DC=example,DC=test'
+        $result.Plan.LabOu | Should -BeExactly $expectedLabOu
+        foreach ($user in $result.Plan.Users) {
+            $user.DistinguishedName | Should -BeExactly ('CN=' + $user.SamAccountName + ',OU=Users,' + $expectedLabOu)
+        }
+        Should -Invoke Get-ADOrganizationalUnit -Times 1 -Exactly -ParameterFilter {
+            $Identity -ceq 'OU=Lab\2C Resources,DC=example,DC=test'
+        }
+        Should -Invoke Get-ADObject -Times 1 -Exactly -ParameterFilter {
+            $SearchBase -ceq 'OU=Lab\, Resources,DC=example,DC=test' -and $SearchScope -eq 'OneLevel'
+        }
+        Should -Invoke New-ADOrganizationalUnit -Times 0
+        Should -Invoke New-ADUser -Times 0
+        Should -Invoke New-SmbShare -Times 0
+    }
+
     It 'requires acknowledgement and explicit secure-password opt-in before changes' {
         $parameters.disposableAcknowledgement = $false
         { & $script:provisioner @parameters } | Should -Throw '*DisposableAcknowledgement*'

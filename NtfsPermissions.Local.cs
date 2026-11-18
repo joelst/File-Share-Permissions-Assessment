@@ -288,8 +288,8 @@ namespace NtfsPermissions.LocalCandidate
                 CommonAce common = ace as CommonAce;
                 if (common == null || common.IsCallback || common.OpaqueLength != 0 ||
                     (common.AceQualifier != AceQualifier.AccessAllowed && common.AceQualifier != AceQualifier.AccessDenied) ||
-                    common.AccessMask < 0)
-                    throw new InvalidOperationException("Conditional, object, opaque or unsupported ACE.");
+                    (unchecked((uint)common.AccessMask) & 0xF0000000u) != 0)
+                    throw new InvalidOperationException("Conditional, object, opaque or generic-mask ACE.");
             }
             if (!new CommonSecurityDescriptor(false, false, raw).IsDiscretionaryAclCanonical)
                 throw new InvalidOperationException("Noncanonical DACL.");

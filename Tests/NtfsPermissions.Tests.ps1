@@ -392,6 +392,23 @@ Describe 'Read-only abstract ACL proposal safety' {
             { New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles } | Should -Throw '*deny*'
         }
     }
+    It 'rejects <Right> before generic allow coverage or inheritable deny overlap checks' -ForEach @(
+        @{ Right = 'GENERIC_ALL'; Mask = 268435456L }
+        @{ Right = 'GENERIC_EXECUTE'; Mask = 536870912L }
+        @{ Right = 'GENERIC_WRITE'; Mask = 1073741824L }
+        @{ Right = 'GENERIC_READ'; Mask = 2147483648L }
+        @{ Right = 'signed GENERIC_READ'; Mask = -2147483648L }
+        @{ Right = 'mixed generic and concrete rights'; Mask = 268435457L }
+    ) {
+        foreach ($type in @('Allow','Deny')) {
+            $before = New-TestSnapshot
+            $ace = New-TestAce -Type $type -Mask $Mask
+            $ace.InheritOnly = $type -eq 'Deny'
+            $before.Aces = @($ace)
+            { New-NpProposal $before (New-TestGrants) ThisFolderSubfoldersAndFiles } |
+                Should -Throw '*generic-mask ACE*'
+        }
+    }
     It 'enforces aggregate ACL bounds' {
         $before=New-TestSnapshot
         $before.Aces=@(1..1500 | ForEach-Object { New-TestAce -SID 'S-1-1-0' -Mask 1 })
@@ -773,11 +790,15 @@ Describe 'Public qualification gate' {
                 $LASTEXITCODE | Should -Be 2
                 $read=Read-NpJournal (Join-Path $result.RunDirectory 'events.jsonl')
                 $read.Events.Result | Should -Contain 'Blocked/NotQualified'
-                $console=$completionMessages.MessageData -join "`n"
+                $console=($completionMessages.MessageData -join "`n") -replace '\s+', ' '
                 $console | Should -Match 'Permission planning: Blocked\.'
                 $console | Should -Match ([regex]::Escape((Join-Path $result.RunDirectory 'events.jsonl')))
-                $console | Should -Match 'Live Apply/Revert are disabled'
-                $console | Should -Not -Match '(?s)Next:.*-Mode (Apply|Revert)'
+                $result.Reason | Should -Match 'review-only plans cannot be executed'
+                $console | Should -Match 'review-only plans cannot be executed'
+                $console | Should -Match 'direct .*?-Mode Apply -TargetPath with -WhatIf first'
+                $console | Should -Match 'receipt-bound -Mode Revert'
+                $console | Should -Match 'never promote -PlanPath into execution'
+                $console | Should -Not -Match 'Live Apply/Revert are disabled|No next executable change script'
             }
         }
     }
@@ -849,24 +870,28 @@ Describe 'Public writer parameter casing' {
         . (Join-Path $PSScriptRoot '../NtfsPermissions.Local.ps1')
     }
 
-    It 'canonicalizes <InputMode>/<InputScope> before dispatch with DisposableLocalLab=<Lab>' -ForEach @(
-        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'thisfolderonly'; ExpectedScope = 'ThisFolderOnly'; Lab = $false }
-        @{ InputMode = 'aPpLy'; ExpectedMode = 'Apply'; InputScope = 'thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles'; Lab = $true }
-        @{ InputMode = 'revert'; ExpectedMode = 'Revert'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; Lab = $false }
-        @{ InputMode = 'rEvErT'; ExpectedMode = 'Revert'; InputScope = 'THISFOLDERONLY'; ExpectedScope = 'ThisFolderOnly'; Lab = $true }
+    It 'canonicalizes <InputMode>/<InputScope>/<InputPlatform> before dispatch with DisposableLocalLab=<Lab>' -ForEach @(
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'thisfolderonly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'nEtApP'; ExpectedPlatform = 'NetApp'; Lab = $false }
+        @{ InputMode = 'aPpLy'; ExpectedMode = 'Apply'; InputScope = 'thisfoldersubfoldersandfiles'; ExpectedScope = 'ThisFolderSubfoldersAndFiles'; InputPlatform = 'windows'; ExpectedPlatform = 'Windows'; Lab = $true }
+        @{ InputMode = 'revert'; ExpectedMode = 'Revert'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'nas'; ExpectedPlatform = 'Nas'; Lab = $false }
+        @{ InputMode = 'rEvErT'; ExpectedMode = 'Revert'; InputScope = 'THISFOLDERONLY'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'auto'; ExpectedPlatform = 'Auto'; Lab = $true }
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'wInDoWs'; ExpectedPlatform = 'Windows'; Lab = $false }
+        @{ InputMode = 'apply'; ExpectedMode = 'Apply'; InputScope = 'ThisFolderOnly'; ExpectedScope = 'ThisFolderOnly'; InputPlatform = 'aUtO'; ExpectedPlatform = 'Auto'; Lab = $true }
     ) {
         Mock Invoke-NpDisposableLab {
-            param($Mode, $Scope)
-            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope }
+            param($Mode, $Scope, $TargetPlatform)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope; TargetPlatform = $TargetPlatform }
         }
         Mock Invoke-NpPermissionWrite {
-            param($Mode, $Scope)
-            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope }
+            param($Mode, $Scope, $TargetPlatform)
+            [pscustomobject]@{ Status = 'Preview'; Mode = $Mode; Scope = $Scope; TargetPlatform = $TargetPlatform }
         }
         $result = & (Join-Path $PSScriptRoot '../Add-FileSharePermissions.ps1') `
-            -Mode $InputMode -Scope $InputScope -DisposableLocalLab:$Lab -OutputDirectory $script:work -WhatIf
+            -Mode $InputMode -Scope $InputScope -TargetPlatform $InputPlatform `
+            -DisposableLocalLab:$Lab -OutputDirectory $script:work -WhatIf
         $result.Mode | Should -BeExactly $ExpectedMode
         $result.Scope | Should -BeExactly $ExpectedScope
+        $result.TargetPlatform | Should -BeExactly $ExpectedPlatform
         if ($Lab) {
             Should -Invoke Invoke-NpDisposableLab -Times 1 -Exactly
             Should -Invoke Invoke-NpPermissionWrite -Times 0 -Exactly

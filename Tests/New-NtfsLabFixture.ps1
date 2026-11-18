@@ -204,7 +204,7 @@ $domain = Get-ADDomain -Server $domainController
 if ($domain.DNSRoot -ine $computer.Domain) {
     throw 'The domain controller must belong to the file server domain for Domain Local permission groups.'
 }
-$null = Get-ADOrganizationalUnit -Identity $parentOu -Server $domainController
+$parentOu = (Get-ADOrganizationalUnit -Identity $parentOu -Server $domainController).DistinguishedName
 foreach ($share in @(Get-SmbShare)) {
     if (-not $share.Special -and $share.Path) {
         $backingPath = [IO.Path]::GetFullPath($share.Path)

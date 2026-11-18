@@ -158,6 +158,12 @@ $Scope = switch ($Scope) {
     'ThisFolderSubfoldersAndFiles' { 'ThisFolderSubfoldersAndFiles' }
     'ThisFolderOnly' { 'ThisFolderOnly' }
 }
+$TargetPlatform = switch ($TargetPlatform) {
+    'Auto' { 'Auto' }
+    'Windows' { 'Windows' }
+    'NetApp' { 'NetApp' }
+    'Nas' { 'Nas' }
+}
 
 if ($DisposableLocalLab) {
     . (Join-Path $PSScriptRoot 'NtfsPermissions.Local.ps1')
@@ -258,13 +264,13 @@ try {
             Write-NpEvent $journal 'RecoveryEvidence' $recovery.Status @("ManifestSHA256=$($recovery.ManifestSHA256)")
         }
         $status = 'Blocked'
-        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): live Apply/Revert disabled; no qualified native ACL writer is connected to this entry point. Qualify this exact platform separately; Windows tests never qualify NetApp/NAS."
+        $reason = "MutationNotQualified/$($targetDescriptor.QualificationScope): review-only plans cannot be executed by Apply or Revert. Direct -Mode Apply -TargetPath and receipt-bound -Mode Revert are separate live-write workflows requiring independent approval; start a direct Apply review with -WhatIf. This prepared-plan invocation performed zero target writes. Windows tests never qualify NetApp/NAS."
         Write-NpEvent $journal 'QualificationGate' 'Blocked/NotQualified' @("QualificationScope=$($targetDescriptor.QualificationScope); MutationNotQualified")
     } else {
         Write-Progress -Activity 'NTFS plan' -Status 'Validate every group before ACL inventory'
         $grants = @(Get-NpGrants $GroupName $Permissions $GroupPermissionsJson $GroupPermissionsFile ${function:Resolve-NpWindowsGroup})
         Write-NpEvent $journal 'ClientADGroupsResolved' 'TargetAuthorityUnverified' @($grants | ForEach-Object { "$($_.SID):$($_.Permissions)" })
-        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows read-only NTFS planning adapter required. No live mutation is available on any platform.' }
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows read-only NTFS planning adapter required. Direct permission writes also require Windows.' }
         $inventory = Get-NpWindowsInventory $target $Scope $MaxPaths
         $plan = New-NpPlan $target $grants $Scope $inventory (Get-NpSourceHash) $targetDescriptor
         $planFile = Join-Path $run 'plan.json'
@@ -300,7 +306,7 @@ try {
     Write-NpEvent $journal 'Complete' $status
 } catch {
     $reason = $_.Exception.Message
-    # Any public failure is pre-mutation: native target setter does not exist.
+    # This review-only path never dispatches the native writer.
     $status = 'Blocked'
     try { Write-NpEvent $journal 'Stopped' 'Blocked/NotQualified' } catch { $reason += '; AUDIT FAILURE: ' + $_.Exception.Message }
 } finally {
@@ -313,12 +319,12 @@ $completion=@{
     summary="Mode=$($Mode); TargetWrites=0; WriterQualification=NotQualified. $($reason)"
     reviewPath=@((Join-Path $run 'events.jsonl'))
     requirements=$(if($status -eq 'Blocked'){
-        'Resolve/review 1 blocked result using the reason below; live mutation has 1 non-bypassable qualification restriction, not a bypassable missing parameter.'
+        'Resolve/review the blocked result below. Review-only plans cannot be executed; direct targeted Apply and receipt-bound Revert require separate approval and evidence review.'
     }else{
         $planningActions=@(
             if($plan.Reasons.Count -gt 0){"Review $($plan.Reasons.Count) planning/qualification warnings."}
             if($plan.Boundaries.Count -gt 0){"Review $($plan.Boundaries.Count) protected boundaries."}
-            'Live mutation has 1 non-bypassable qualification blocker.'
+            'Review-only plans are non-executable; they do not authorize a separate direct targeted Apply or receipt-bound Revert.'
         )
         $planningActions -join ' '
     })
@@ -328,9 +334,9 @@ $completion=@{
         }elseif($reason){[pscustomobject]@{Count=1;Reason=$reason}}
     )
     nextStep=$(if($status -eq 'Blocked'){
-        'Preserve the journal. If planning inputs/coverage were invalid, next script: Add-FileSharePermissions.ps1 -Mode Plan after resolving them. Live Apply/Revert are disabled; no next script in this toolkit can perform the change.'
+        'Preserve the journal and resolve the reported input/coverage or evidence blockers. Review-only plans cannot be executed. Only after independent approval, use direct Add-FileSharePermissions.ps1 -Mode Apply -TargetPath with -WhatIf first, or receipt-bound -Mode Revert with the original receipt and reviewed hashes; never promote -PlanPath into execution.'
     }else{
-        'No next executable change script is available. Review plan.json and before-and-intent.csv. Invoke-NtfsPermissionValidation.ps1 is only for a separately approved disposable-lab evidence workflow, not production Apply/Revert.'
+        'Review plan.json and before-and-intent.csv; review-only plans cannot be executed. For a separately approved change, use direct Add-FileSharePermissions.ps1 -Mode Apply -TargetPath with -WhatIf first, not -PlanPath. Optional receipt-bound -Mode Revert requires the original Apply evidence and reviewed hashes. Invoke-NtfsPermissionValidation.ps1 remains an optional disposable-lab observation workflow, not a writer.'
     })
 }
 if($Mode -eq 'Plan' -and $status -ne 'Blocked'){$completion.reviewPath+=@((Join-Path $run 'plan.json'),(Join-Path $run 'before-and-intent.csv'))}

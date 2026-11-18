@@ -723,6 +723,30 @@ throw 'Apply returned before the interruption boundary.'
         }
     }
 
+    It 'rejects native <Right> allow and inheritable deny ACEs before planning' -ForEach @(
+        @{ Right = 'GENERIC_ALL'; Mask = 268435456 }
+        @{ Right = 'GENERIC_EXECUTE'; Mask = 536870912 }
+        @{ Right = 'GENERIC_WRITE'; Mask = 1073741824 }
+        @{ Right = 'GENERIC_READ'; Mask = [int]::MinValue }
+        @{ Right = 'mixed generic and concrete rights'; Mask = 268435457 }
+    ) {
+        $sid = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+        $validator = ([NtfsPermissions.LocalCandidate.Lease]).GetMethod(
+            'ValidateDescriptor', [Reflection.BindingFlags]'NonPublic,Static')
+        foreach ($qualifier in @(
+            [Security.AccessControl.AceQualifier]::AccessAllowed,
+            [Security.AccessControl.AceQualifier]::AccessDenied
+        )) {
+            $acl = [Security.AccessControl.RawAcl]::new(2, 1)
+            $acl.InsertAce(0, [Security.AccessControl.CommonAce]::new(
+                [Security.AccessControl.AceFlags]'ContainerInherit,ObjectInherit,InheritOnly',
+                $qualifier, $Mask, $sid, $false, $null))
+            $raw = [Security.AccessControl.RawSecurityDescriptor]::new(
+                [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent, $sid, $sid, $null, $acl)
+            { $validator.Invoke($null, @($raw)) } | Should -Throw '*generic-mask ACE*'
+        }
+    }
+
     It 'refuses a descriptor that loses <Detail> when serialized for a change' -ForEach @(
         @{ Detail = 'ACE flags'; AceFlags = 64; Revision = 2; Control = 4 }
         @{ Detail = 'ACL revision'; AceFlags = 0; Revision = 4; Control = 4 }

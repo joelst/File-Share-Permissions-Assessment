@@ -560,9 +560,9 @@ Remove/Replace.
 
 **Never promote `plan.json` into an execution input.** `Apply` or `Revert` with
 `-PlanPath` remains blocked. Ordinary direct targeted writes are enabled and
-create a fresh plan in that same invocation. Some legacy planning/validation
-console hints still describe mutation as disabled; those statements apply to
-the review-only path, not to the separate direct writer.
+create a fresh plan in that same invocation. The review-only gate does not
+disable the separate direct writer. Validation remains observational and
+never runs Apply/Revert itself.
 
 ### 6.3 Preview Replace Everyone with a group
 
