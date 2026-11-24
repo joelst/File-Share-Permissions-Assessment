@@ -18,6 +18,7 @@ $script:NtfsVersions = @{
     Comparison = '1.0.4'
     Merge = '2.8.6'
     BestPractices = '1.1.2'
+    ExcelReview = '1.0.0'
     Permissions = '1.0.0'
     PermissionValidation = '1.0.0'
     LabFixture = '1.0.0'

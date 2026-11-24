@@ -21,6 +21,7 @@ Choose only the workflows needed for your task.
 |---|---|---|
 | `Invoke-NtfsAssessment.ps1` | Collects Windows server/share metadata, available SMB share permissions, and NTFS **directory** ACLs. Optional identity/group expansion and best-practices evidence. | First, to create each assessment snapshot. |
 | `Merge-NtfsAssessment.ps1` | Reads collected runs and produces consolidated findings, folder/share risk indicators, group reports, coverage reports, and executive summaries. | After collection; does not collect live data. |
+| `New-NtfsExcelReview.ps1` | Validates a completed merge report and creates an optional, read-only Excel review workbook without an Excel or `ImportExcel` dependency. | After merge when an administrator wants a workbook; raw evidence CSVs remain authoritative. |
 | `New-NtfsBestPracticesReport.ps1` | Generates a best-practices report from one verified assessment run, optionally against a JSON policy. | After collection; independent of merge. |
 | `Compare-NtfsAssessment.ps1` | Compares two original assessment snapshots for directory ACL, owner/inheritance, share metadata, and share ACL differences. | After two snapshots exist; merge is not a prerequisite. |
 | `Add-FileSharePermissions.ps1` | Creates read-only permission plans (`-Mode Plan`) and executes handle-pinned `Add`, `Remove`, and `Replace` changes (`-Mode Apply`, `-WhatIf`, and optional `-Mode Revert`) across local NTFS, Windows SMB, NetApp SMB, generic NAS SMB, and mapped drives without ONTAP CLI/API. | Independent planning or targeted permission-change workflow. Never an automatic next step from findings. |
@@ -169,6 +170,23 @@ Read `merge-state.json`, `merge-stage.log`, `MergeSourceRuns.csv`,
 Risk indicators and recommendations require contextual review. They are not
 effective-access calculations or approved remediation instructions. Incomplete
 folder ACLs have no risk score and are excluded from risk averages.
+
+If Excel cannot open or fully display the CSV reports, use the
+[Power Query workaround](ADMINISTRATOR-WALKTHROUGH.md#43-review-report-data-in-excel)
+or create an optional workbook outside the source report:
+
+```powershell
+.\New-NtfsExcelReview.ps1 `
+    -InputReportFolder D:\AssessmentReports\Baseline `
+    -OutputPath D:\AssessmentExports\Baseline-Review.xlsx
+```
+
+The exporter checks the selected CSV parts against `NTFS_QA.json`, preserves
+identifiers and formula-like values as text, explicitly types safe counts and
+flags, keeps raw ACL/folder datasets out by default, and splits oversized
+datasets instead of truncating them. Use `-IncludeRawData` to add raw folder/ACE
+reports or `-Dataset` to select an explicit CSV dataset set. The workbook is a
+convenience copy; retain the original merge report.
 
 Each entry script finishes with its status, actual output location, reports or
 logs to review, and a specific next script/stage or an explicit statement that
@@ -667,6 +685,7 @@ Archive evidence and each reported commit hash externally.
 |---|---|
 | Assessment | `0`: completed within the declared directory scope; `1`: partial collection; `2`: fatal failure. Inspect coverage and manifest details. |
 | Merge and comparison | `0`: completed; `1`: completed with warnings/limitations; `2`: invalid input or failure. Inspect the state JSON before consuming reports. Differences alone do not make comparison fail. |
+| Excel review | `0`: workbook created; `2`: invalid/failed source, integrity mismatch, Excel limit, or output failure. A partial pending file is not published. |
 | Best-practices report | `0`: report generated; `2`: failure. A generated report can still contain `NotAssessed` evidence. |
 | Permission planner | `0`: planning path completed; `2`: blocked. Review-only plans can still be marked blocked; `-PlanPath` never enables mutation. |
 | Targeted permission change (`Apply` / `Revert`) | `Verified` or `NoOp`: review `permissions-before-after.csv` and `ExcludedPathCount`. `WhatIfOrDeclined`: no target writes. `Blocked` or `Indeterminate`: preserve and review evidence. |

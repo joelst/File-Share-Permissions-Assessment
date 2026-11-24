@@ -131,6 +131,12 @@ function Invoke-Merge($InputPath,$OutputName,[int]$Throttle=1,[string]$Selection
 function Rows([string]$Directory,[string]$Name) {
     foreach($part in @(Get-NtfsCsvFiles $Directory $Name)){Read-NtfsCsvFile $part.FullName}
 }
+function Read-ZipEntryText($Archive,[string]$Name) {
+    $entry=$Archive.GetEntry($Name)
+    if($null -eq $entry){throw "ZIP entry unavailable: $Name"}
+    $reader=[IO.StreamReader]::new($entry.Open(),[Text.Encoding]::UTF8,$true)
+    try{return $reader.ReadToEnd()}finally{$reader.Dispose()}
+}
 function Invoke-Comparison([string]$OutputName,[int]$ExpectedExit,[string[]]$Arguments) {
     $output=Join-Path $testRoot $OutputName
     $state=Join-Path $output 'comparison-state.json'
@@ -309,6 +315,153 @@ try {
     $emptyOut=Invoke-Merge $historyRoot 'newempty-out' 1 'LatestSuccessful' 1
     Assert (@(Rows $emptyOut 'NTFS_AllAces.csv').Count -eq 0) 'Newest empty partial scan never backfills old grants'
     Assert (@(Rows $emptyOut 'NTFS_RiskByFolder.csv').Count -eq 1) 'Zero-ACE scope still processed'
+
+    $script:TestArea='Excel review export'
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    $excelSource=Join-Path $testRoot 'excel-report'
+    [void](New-Item -ItemType Directory -Path $excelSource)
+    Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $out -Force|ForEach-Object FullName) -Destination $excelSource -Recurse
+    $excelRows=@(
+        [pscustomobject]@{Value='=HYPERLINK("x","y")';Code='00123';Count='1';Resolved='True';MaxRiskScore='25';AverageRiskScore='12.34';UnknownDirectoryCoverage='True'},
+        [pscustomobject]@{Value="Quoted,`"value`"`r`nline";Code='00007';Count='2';Resolved='False';MaxRiskScore='30';AverageRiskScore='20.5';UnknownDirectoryCoverage='False'},
+        [pscustomobject]@{Value='Third';Code='12345678901234567890';Count='3';Resolved='True';MaxRiskScore='45';AverageRiskScore='31.25';UnknownDirectoryCoverage='True'},
+        [pscustomobject]@{Value='Fourth';Code='0042';Count='4';Resolved='False';MaxRiskScore='50';AverageRiskScore='40';UnknownDirectoryCoverage='False'},
+        [pscustomobject]@{Value='Fifth';Code='0';Count='1234567890123456';Resolved='True';MaxRiskScore='70';AverageRiskScore='12345678901234.56';UnknownDirectoryCoverage='True'}
+    )
+    Export-NtfsCsvData $excelRows (Join-Path $excelSource 'ExcelParts.csv') 220
+    $longRows=@([pscustomobject]@{Value=('x'*32768);Code='long';Count='1';Resolved='True'})
+    Export-NtfsCsvData $longRows (Join-Path $excelSource 'TooLong.csv')
+    Export-NtfsCsvData @([pscustomobject]@{Value='apostrophe name'}) (Join-Path $excelSource "'Odd.csv")
+    Remove-Item -LiteralPath (Join-Path $excelSource 'NTFS_FindingsSummary.csv') -Force -ErrorAction Stop
+    Export-NtfsCsvData @() (Join-Path $excelSource 'NTFS_FindingsSummary.csv')
+    $excelQaPath=Join-Path $excelSource 'NTFS_QA.json'
+    $excelQa=Get-Content -LiteralPath $excelQaPath -Raw|ConvertFrom-Json
+    $excelQa.Datasets=@(Get-NtfsDatasetInventory $excelSource)
+    $excelQa|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $excelQaPath -Encoding UTF8
+    $excelPartFiles=@(Get-NtfsCsvFiles $excelSource 'ExcelParts.csv')
+    Assert ($excelPartFiles.Count -gt 1) 'Excel test fixture contains multiple QA-bound CSV parts'
+    $excelSourceHashes=@($excelPartFiles|ForEach-Object{
+        [pscustomobject]@{Name=$_.Name;SHA256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash}
+    })
+
+    $excelOutput=Join-Path $testRoot 'excel-output.xlsx'
+    $excelLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $excelOutput -Dataset excelparts.csv -MaxRowsPerSheet 2 2>&1 })
+    $excelExit=$LASTEXITCODE
+    Assert ($excelExit -eq 0 -and (Test-Path -LiteralPath $excelOutput -PathType Leaf)) "Excel review succeeds: $($excelLog -join "`n")"
+    Assert ((Get-Item -LiteralPath $excelOutput).Length -gt 0) 'Excel review creates a nonempty workbook'
+    foreach($hash in $excelSourceHashes){
+        Assert ((Get-FileHash -LiteralPath (Join-Path $excelSource $hash.Name) -Algorithm SHA256).Hash -ceq $hash.SHA256) "Excel review leaves $($hash.Name) unchanged"
+    }
+    $excelStream=[IO.File]::Open($excelOutput,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $excelArchive=$null
+    try{
+        $excelArchive=[IO.Compression.ZipArchive]::new($excelStream,[IO.Compression.ZipArchiveMode]::Read,$false)
+        foreach($part in @('[Content_Types].xml','_rels/.rels','xl/workbook.xml','xl/_rels/workbook.xml.rels','xl/styles.xml')){
+            Assert ($null -ne $excelArchive.GetEntry($part)) "Excel package contains $part"
+        }
+        $workbookText=Read-ZipEntryText $excelArchive 'xl/workbook.xml'
+        $workbookXml=[xml]$workbookText
+        $sheetNames=@($workbookXml.workbook.sheets.sheet|ForEach-Object{$_.name})
+        Assert ($sheetNames -contains 'Overview' -and $sheetNames -contains 'Excel Parts' -and $sheetNames -contains 'Excel Parts (2)' -and $sheetNames -contains 'Excel Parts (3)') 'Excel workbook splits rows with usable continuation names'
+        $sheetEntries=@($excelArchive.Entries|Where-Object{$_.FullName -match '^xl/worksheets/sheet\d+\.xml$'})
+        Assert ($sheetEntries.Count -eq 4) 'Excel workbook contains Overview and every split data sheet'
+        $sheetXml=($sheetEntries|ForEach-Object{Read-ZipEntryText $excelArchive $_.FullName}) -join "`n"
+        Assert ($sheetXml.Contains('=HYPERLINK') -and $sheetXml -notmatch '<f(?:\s|>)') 'Formula-like assessment values remain inline text'
+        Assert ($sheetXml.Contains('00123') -and $sheetXml.Contains('12345678901234567890')) 'Numeric-looking identifiers retain their text representation'
+        Assert ($sheetXml -match '<c r="E2"><v>25</v></c>' -and $sheetXml -match '<c r="F2"><v>12\.34</v></c>') 'Risk scores use sortable numeric Excel cells'
+        Assert ($sheetXml -match '<c r="G2" t="b"><v>1</v></c>') 'Coverage indicators use boolean Excel cells'
+        Assert ($sheetXml -match '<c r="C2" t="inlineStr"><is><t>1234567890123456</t></is></c>') 'Integers beyond Excel precision remain text'
+        Assert ($sheetXml -match '<c r="F2" t="inlineStr"><is><t>12345678901234\.56</t></is></c>') 'Decimals beyond Excel precision remain text'
+        foreach($entry in $sheetEntries){
+            $xmlReader=[Xml.XmlReader]::Create([IO.StringReader]::new((Read-ZipEntryText $excelArchive $entry.FullName)))
+            try{while($xmlReader.Read()){}}finally{$xmlReader.Dispose()}
+        }
+    }finally{
+        if($null -ne $excelArchive){$excelArchive.Dispose()}
+        $excelStream.Dispose()
+    }
+
+    $excelQa=Get-Content -LiteralPath $excelQaPath -Raw|ConvertFrom-Json
+    $emptySummary=@($excelQa.Datasets|Where-Object Name -eq 'NTFS_FindingsSummary.csv')
+    Assert ($emptySummary.Count -eq 1 -and $emptySummary[0].Rows -eq 0) 'Empty merge summary is present in the QA inventory'
+    $emptySummary[0].Columns=$null
+    $excelQa.Warnings=$null
+    $excelQa|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $excelQaPath -Encoding UTF8
+
+    $defaultExcel=Join-Path $testRoot 'excel-default.xlsx'
+    $defaultLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $defaultExcel 2>&1 })
+    Assert ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $defaultExcel -PathType Leaf)) "Default Excel review succeeds: $($defaultLog -join "`n")"
+    Assert (($defaultLog -join "`n") -match 'Excel review: Completed\.' -and ($defaultLog -join "`n") -notmatch 'CompletedWithWarnings') 'Null QA warnings remain an empty collection'
+    $defaultStream=[IO.File]::Open($defaultExcel,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $defaultArchive=$null
+    try{
+        $defaultArchive=[IO.Compression.ZipArchive]::new($defaultStream,[IO.Compression.ZipArchiveMode]::Read,$false)
+        $defaultWorkbook=[xml](Read-ZipEntryText $defaultArchive 'xl/workbook.xml')
+        $defaultSheets=@($defaultWorkbook.workbook.sheets.sheet|ForEach-Object{$_.name})
+        Assert ($defaultSheets -contains 'Findings' -and $defaultSheets -notcontains 'All ACEs' -and $defaultSheets -notcontains 'Folders') 'Default Excel review excludes raw ACE and folder datasets'
+    }finally{
+        if($null -ne $defaultArchive){$defaultArchive.Dispose()}
+        $defaultStream.Dispose()
+    }
+
+    $emptyExcel=Join-Path $testRoot 'excel-empty.xlsx'
+    $emptyLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $emptyExcel -Dataset NTFS_FindingsSummary.csv 2>&1 })
+    Assert ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $emptyExcel -PathType Leaf)) "Empty summary export succeeds: $($emptyLog -join "`n")"
+
+    $longOutput=Join-Path $testRoot 'excel-too-long.xlsx'
+    $longLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $longOutput -Dataset TooLong.csv 2>&1 })
+    Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $longOutput -PathType Leaf)) 'Excel cell-limit failure does not publish a partial workbook'
+    Assert (($longLog -join "`n") -match '32,767-character') 'Excel cell-limit failure identifies the unsupported value'
+    Assert (@(Get-ChildItem -LiteralPath $testRoot -File -Force -Filter '.excel-too-long.xlsx.*.pending').Count -eq 0) 'Cell-limit failure removes its pending workbook'
+
+    $apostropheExcel=Join-Path $testRoot 'excel-apostrophe.xlsx'
+    $apostropheLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $apostropheExcel -Dataset "'Odd.csv" 2>&1 })
+    Assert ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $apostropheExcel -PathType Leaf)) "Apostrophe-bound dataset name exports safely: $($apostropheLog -join "`n")"
+    $apostropheStream=[IO.File]::Open($apostropheExcel,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $apostropheArchive=$null
+    try{
+        $apostropheArchive=[IO.Compression.ZipArchive]::new($apostropheStream,[IO.Compression.ZipArchiveMode]::Read,$false)
+        $apostropheWorkbook=[xml](Read-ZipEntryText $apostropheArchive 'xl/workbook.xml')
+        $apostropheNames=@($apostropheWorkbook.workbook.sheets.sheet|ForEach-Object{$_.name})
+        Assert ($apostropheNames -contains 'Odd' -and $apostropheNames -notcontains "'Odd") 'Apostrophe-bound dataset name becomes a legal worksheet name'
+    }finally{
+        if($null -ne $apostropheArchive){$apostropheArchive.Dispose()}
+        $apostropheStream.Dispose()
+    }
+
+    $excelInputLink=Join-Path $testRoot 'excel-report-link'
+    $linkCreated=$false
+    try{
+        [void](New-Item -ItemType SymbolicLink -Path $excelInputLink -Target $excelSource -ErrorAction Stop)
+        $linkCreated=$true
+    }catch{
+        try{
+            [void](New-Item -ItemType Junction -Path $excelInputLink -Target $excelSource -ErrorAction Stop)
+            $linkCreated=$true
+        }catch{}
+    }
+    if($linkCreated){
+        $linkedOutput=Join-Path $excelSource 'excel-linked-input.xlsx'
+        $linkedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+            -InputReportFolder $excelInputLink -OutputPath $linkedOutput -Dataset ExcelParts.csv 2>&1 })
+        Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $linkedOutput -PathType Leaf)) 'A linked input report cannot bypass source containment'
+        Assert (($linkedLog -join "`n") -match 'reparse point') 'Linked input failure identifies the reparse point'
+    }
+
+    Add-Content -LiteralPath $excelPartFiles[0].FullName -Value 'tampered' -Encoding UTF8
+    $tamperOutput=Join-Path $testRoot 'excel-tampered.xlsx'
+    $tamperLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $tamperOutput -Dataset ExcelParts.csv 2>&1 })
+    Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $tamperOutput -PathType Leaf)) 'QA hash or size mismatch blocks workbook publication'
+    Assert (@(Get-ChildItem -LiteralPath $testRoot -File -Force -Filter '.excel-tampered.xlsx.*.pending').Count -eq 0) 'Failed Excel export removes pending artifacts'
+    Assert (($tamperLog -join "`n") -match 'changed|mismatch') 'Excel tamper failure explains the source integrity mismatch'
+    $script:TestArea='Merger'
+
     $manifest=Get-Content -LiteralPath (Join-Path $emptyRun 'manifest.json') -Raw|ConvertFrom-Json
     $manifest.FatalError='Synthetic failure';$manifest|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $emptyRun 'manifest.json')
     [void](Invoke-Merge $historyRoot 'fatal-out' 1 'LatestSuccessful' 2)
