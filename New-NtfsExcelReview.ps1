@@ -77,6 +77,7 @@ namespace NtfsAssessment {
         internal const uint GenericWrite = 0x40000000;
         internal const uint Delete = 0x00010000;
         internal const uint ReadAttributes = 0x00000080;
+        internal const uint Traverse = 0x00000020;
         internal const uint FileShareRead = 0x00000001;
         internal const uint FileShareWrite = 0x00000002;
         internal const uint CreateNew = 1;
@@ -245,7 +246,7 @@ namespace NtfsAssessment {
         private bool disposed;
 
         private ExcelReviewDirectoryLease(string requestedPath, bool nativeLease) {
-            path = System.IO.Path.GetFullPath(requestedPath);
+            path = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(requestedPath));
             native = nativeLease;
             if (!native) return;
             if (!ExcelReviewNative.IsDirectDrivePath(path))
@@ -269,7 +270,8 @@ namespace NtfsAssessment {
                 foreach (string component in components) {
                     SafeFileHandle handle = ExcelReviewNative.OpenFile(
                         component,
-                        ExcelReviewNative.ReadAttributes,
+                        // Attribute-only opens do not participate in share-access tracking.
+                        ExcelReviewNative.ReadAttributes | ExcelReviewNative.Traverse,
                         ExcelReviewNative.FileShareRead | ExcelReviewNative.FileShareWrite,
                         ExcelReviewNative.OpenExisting,
                         ExcelReviewNative.FileFlagBackupSemantics | ExcelReviewNative.FileFlagOpenReparsePoint);
@@ -296,7 +298,7 @@ namespace NtfsAssessment {
             if (String.IsNullOrWhiteSpace(path)) throw new ArgumentException("path");
             if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
             if (!ExcelReviewNative.IsWindows) {
-                string current = System.IO.Path.GetFullPath(path);
+                    string current = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(path));
                 while (!String.IsNullOrEmpty(current)) {
                     if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
                         throw new InvalidOperationException("Reparse point in Excel review path: " + current);
@@ -310,7 +312,7 @@ namespace NtfsAssessment {
 
         public static ExcelReviewDirectoryLease CreateOutside(string path, ExcelReviewDirectoryLease source) {
             if (source == null) throw new ArgumentNullException("source");
-            string current = System.IO.Path.GetFullPath(path);
+            string current = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(path));
             Stack<string> missing = new Stack<string>();
             while (!Directory.Exists(current)) {
                 missing.Push(current);
@@ -572,7 +574,7 @@ namespace NtfsAssessment {
             "UniqueACEs", "UnreportedAclFailures", "UnresolvedAceCount", "UnresolvedIdentities"
         };
         private static readonly string[] BooleanColumns = new string[] {
-            "InheritanceProtected", "IsInherited", "MemberEnabled", "Remediable", "Resolved",
+            "InheritanceProtected", "Inherited", "IsInherited", "MemberEnabled", "Remediable", "Resolved",
             "UnknownDirectoryCoverage"
         };
 
@@ -743,11 +745,12 @@ namespace NtfsAssessment {
                     CultureInfo.InvariantCulture,
                     "Cell {0}{1} exceeds Excel's 32,767-character text limit.",
                     GetColumnName(column), rowNumber));
-            try { XmlConvert.VerifyXmlChars(text); }
+            string encodedText = EscapeXstring(text);
+            try { XmlConvert.VerifyXmlChars(encodedText); }
             catch (XmlException ex) {
                 throw new InvalidDataException(String.Format(
                     CultureInfo.InvariantCulture,
-                    "Cell {0}{1} contains a character that XML 1.0 and Excel cannot represent.",
+                    "Cell {0}{1} could not be encoded as XML-safe OOXML text.",
                     GetColumnName(column), rowNumber), ex);
             }
 
@@ -796,7 +799,7 @@ namespace NtfsAssessment {
             writer.WriteStartElement("t", SpreadsheetNamespace);
             if (text.Length > 0 && (Char.IsWhiteSpace(text[0]) || Char.IsWhiteSpace(text[text.Length - 1])))
                 writer.WriteAttributeString("xml", "space", "http://www.w3.org/XML/1998/namespace", "preserve");
-            writer.WriteString(EscapeXstring(text));
+            writer.WriteString(encodedText);
             writer.WriteEndElement();
             writer.WriteEndElement();
             writer.WriteEndElement();
@@ -810,26 +813,33 @@ namespace NtfsAssessment {
         }
 
         private static string EscapeXstring(string text) {
-            if (String.IsNullOrEmpty(text) || text.Length < 7) return text;
+            if (String.IsNullOrEmpty(text)) return text;
             StringBuilder escaped = null;
             int unchanged = 0;
-            for (int i = 0; i <= text.Length - 7; i++) {
-                if (text[i] != '_' || (text[i + 1] != 'x' && text[i + 1] != 'X') || text[i + 6] != '_')
+            for (int i = 0; i < text.Length; i++) {
+                if (Char.IsHighSurrogate(text[i]) && i + 1 < text.Length && Char.IsLowSurrogate(text[i + 1])) {
+                    i++;
                     continue;
-                bool hexadecimal = true;
-                for (int digit = i + 2; digit <= i + 5; digit++) {
-                    char value = text[digit];
-                    if (!((value >= '0' && value <= '9') ||
-                        (value >= 'A' && value <= 'F') ||
-                        (value >= 'a' && value <= 'f'))) {
-                        hexadecimal = false;
-                        break;
+                }
+                bool literalEscape = i + 6 < text.Length && text[i] == '_' &&
+                    (text[i + 1] == 'x' || text[i + 1] == 'X') && text[i + 6] == '_';
+                if (literalEscape) {
+                    for (int digit = i + 2; digit <= i + 5; digit++) {
+                        char value = text[digit];
+                        if (!((value >= '0' && value <= '9') ||
+                            (value >= 'A' && value <= 'F') ||
+                            (value >= 'a' && value <= 'f'))) {
+                            literalEscape = false;
+                            break;
+                        }
                     }
                 }
-                if (!hexadecimal) continue;
+                if (!literalEscape && XmlConvert.IsXmlChar(text[i])) continue;
                 if (escaped == null) escaped = new StringBuilder(text.Length + 10);
                 escaped.Append(text, unchanged, i - unchanged);
-                escaped.Append("_x005F_");
+                escaped.Append("_x");
+                escaped.Append(((int)text[i]).ToString("X4", CultureInfo.InvariantCulture));
+                escaped.Append('_');
                 // The trailing underscore may also start the next escape token.
                 unchanged = i + 1;
             }

@@ -29,9 +29,12 @@ function Assert($Condition,[string]$Message) {
     [void]$script:CheckResults.Add([pscustomobject]@{Id=$script:checks;Area=$script:TestArea;Message=$Message;Passed=[bool]$Condition})
     if(-not $Condition){throw "FAILED: $Message"}
 }
-function Assert-Throws([scriptblock]$Action,[string]$Message,[string]$ExpectedPattern='') {
+function Assert-Throws([scriptblock]$Action,[string]$Message,[string]$ExpectedPattern='',[int]$ExpectedNativeCode=0) {
     $threw=$false
-    try{& $Action}catch{$threw=-not $ExpectedPattern -or $_.Exception.Message -match $ExpectedPattern}
+    try{& $Action}catch{
+        $threw=(-not $ExpectedPattern -or $_.Exception.Message -match $ExpectedPattern) -and
+            ($ExpectedNativeCode -eq 0 -or ($_.Exception.GetBaseException().HResult -band 0xffff) -eq $ExpectedNativeCode)
+    }
     Assert $threw $Message
 }
 function Import-Functions([string]$Path,[string[]]$Names) {
@@ -350,6 +353,21 @@ try {
     Export-NtfsCsvData $longRows (Join-Path $excelSource 'TooLong.csv')
     Export-NtfsCsvData @([pscustomobject]@{Value='apostrophe name'}) (Join-Path $excelSource "'Odd.csv")
     Export-NtfsCsvData @([pscustomobject]@{Value='linked source'}) (Join-Path $excelSource 'Linked.csv')
+    $xmlHeader='Header'+[char]0xFFFE+'_x000D_x000A_'
+    $xmlValues=@(
+        [string][char]0xFFFE
+        [string][char]0xFFFF
+        "control$([char]0)$([char]1)$([char]0xB)$([char]0xC)$([char]0x1F)end"
+        "literal _xFFFE_ and _x005F_ actual$([char]0xFFFE)"
+        "allowed`twhitespace`r`nand $([char]::ConvertFromUtf32(0x1F600))"
+    )
+    $xmlRows=@(for($index=0;$index -lt $xmlValues.Count;$index++){
+        [pscustomobject][ordered]@{
+            Inherited=[string]($index%2 -eq 0);IsInherited=[string]($index%2 -ne 0)
+            $xmlHeader=$xmlValues[$index]
+        }
+    })
+    Export-NtfsCsvData $xmlRows (Join-Path $excelSource 'XmlStrings.csv')
     $outsideSource=Join-Path $testRoot 'excel-outside-source'
     [void](New-Item -ItemType Directory -Path $outsideSource)
     Copy-Item -LiteralPath (Join-Path $excelSource 'Linked.csv') -Destination (Join-Path $outsideSource 'Linked.csv')
@@ -367,7 +385,7 @@ try {
 
     $excelOutput=Join-Path $testRoot 'excel-output.xlsx'
     $excelLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
-        -InputReportFolder $excelSource -OutputPath $excelOutput -Dataset excelparts.csv -MaxRowsPerSheet 2 2>&1 })
+        -InputReportFolder ($excelSource+[IO.Path]::DirectorySeparatorChar) -OutputPath $excelOutput -Dataset excelparts.csv -MaxRowsPerSheet 2 2>&1 })
     $excelExit=$LASTEXITCODE
     Assert ($excelExit -eq 0 -and (Test-Path -LiteralPath $excelOutput -PathType Leaf)) "Excel review succeeds: $($excelLog -join "`n")"
     Assert ((Get-Item -LiteralPath $excelOutput).Length -gt 0) 'Excel review creates a nonempty workbook'
@@ -422,16 +440,28 @@ try {
         $node.Extent.Text.StartsWith("if (`$null -eq ('NtfsAssessment.ExcelReviewWorkbook'")
     },$true)
     . ([scriptblock]::Create($excelTypes.Extent.Text))
-    $sourceLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($excelSource)
+    $sourceLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($excelSource+[IO.Path]::DirectorySeparatorChar)
     $directoryLease=$null
     $collisionFile=$null
     try{
         $nestedOutput=Join-Path (Join-Path $testRoot 'excel-new-parent') 'child'
-        $directoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($nestedOutput,$sourceLease)
+        $directoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($nestedOutput+[IO.Path]::DirectorySeparatorChar,$sourceLease)
         Assert ((Test-Path -LiteralPath $nestedOutput -PathType Container) -and -not $directoryLease.RoutesThrough($sourceLease)) 'Missing output-directory components are created and leased outside the source report'
         $forbiddenChild=Join-Path $excelSource 'must-not-create'
         Assert-Throws { [void][NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($forbiddenChild,$sourceLease) } 'Source containment is checked before creating missing output directories' 'within or aliased'
         Assert (-not(Test-Path -LiteralPath $forbiddenChild)) 'Rejected output containment creates no source-report directories'
+
+        if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+            Assert-Throws { [IO.Directory]::Move($nestedOutput,$nestedOutput+'-renamed') } 'Pinned output directory cannot be renamed before workbook creation' -ExpectedNativeCode 32
+            $nestedAncestor=Split-Path $nestedOutput -Parent
+            Assert-Throws { [IO.Directory]::Move($nestedAncestor,$nestedAncestor+'-renamed') } 'Pinned output ancestors cannot be replaced before workbook creation' -ExpectedNativeCode 32
+            Assert-Throws { [IO.Directory]::Move($excelSource,$excelSource+'-renamed') } 'Pinned source directory cannot be replaced during export' -ExpectedNativeCode 32
+            $driveRoot=[IO.Path]::GetPathRoot($excelSource)
+            $rootLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($driveRoot)
+            try{
+                Assert ($rootLease.Path -ceq $driveRoot) 'Trailing separator normalization preserves a native drive root'
+            }finally{$rootLease.Dispose()}
+        }
 
         $collisionPending=Join-Path $nestedOutput 'collision.pending'
         $collisionFinal=Join-Path $nestedOutput 'collision.xlsx'
@@ -442,19 +472,15 @@ try {
         Assert ([IO.File]::ReadAllText($collisionFinal) -ceq 'concurrent output') 'Publication never replaces a concurrently created output'
 
         if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
-            Assert-Throws { [IO.Directory]::Move($nestedOutput,$nestedOutput+'-renamed') } 'Pinned output directory cannot be renamed during export'
-            $nestedAncestor=Split-Path $nestedOutput -Parent
-            Assert-Throws { [IO.Directory]::Move($nestedAncestor,$nestedAncestor+'-renamed') } 'Pinned output ancestors cannot be replaced during export'
-            Assert-Throws { [IO.Directory]::Move($excelSource,$excelSource+'-renamed') } 'Pinned source directory cannot be replaced during export'
-            Assert-Throws { [IO.File]::Move($collisionPending,$collisionPending+'-renamed') } 'Pending workbook cannot be replaced before handle-based publication'
+            Assert-Throws { [IO.File]::Move($collisionPending,$collisionPending+'-renamed') } 'Pending workbook cannot be replaced before handle-based publication' -ExpectedNativeCode 32
             $pinnedCsv=$null
             try{
                 $pinnedCsv=[NtfsAssessment.ExcelReviewPinnedFile]::Open($excelPartFiles[0].FullName)
-                Assert-Throws { [IO.File]::Move($excelPartFiles[0].FullName,$excelPartFiles[0].FullName+'.moved') } 'Pinned CSV cannot be swapped between parsing and hash validation'
+                Assert-Throws { [IO.File]::Move($excelPartFiles[0].FullName,$excelPartFiles[0].FullName+'.moved') } 'Pinned CSV cannot be swapped between parsing and hash validation' -ExpectedNativeCode 32
                 Assert-Throws {
                     $writeProbe=[IO.File]::Open($excelPartFiles[0].FullName,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
                     $writeProbe.Dispose()
-                } 'Pinned CSV rejects concurrent writers'
+                } 'Pinned CSV rejects concurrent writers' -ExpectedNativeCode 32
             }finally{
                 if($null -ne $pinnedCsv){$pinnedCsv.Dispose()}
             }
@@ -465,6 +491,29 @@ try {
         if($null -ne $collisionFile){$collisionFile.Dispose()}
         if($null -ne $directoryLease){$directoryLease.Dispose()}
         $sourceLease.Dispose()
+    }
+
+    $typedExcel=Join-Path $testRoot 'excel-types-and-xml.xlsx'
+    $typedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $typedExcel -Dataset XmlStrings.csv 2>&1 })
+    Assert ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $typedExcel -PathType Leaf)) "Boolean and XML-forbidden text export succeeds: $($typedLog -join "`n")"
+    $typedStream=[IO.File]::OpenRead($typedExcel)
+    $typedArchive=$null
+    try{
+        $typedArchive=[IO.Compression.ZipArchive]::new($typedStream,[IO.Compression.ZipArchiveMode]::Read,$false)
+        $booleanXml=Read-ZipEntryText $typedArchive 'xl/worksheets/sheet2.xml'
+        Assert ($booleanXml -match '<c r="A2" t="b"><v>1</v></c>' -and $booleanXml -match '<c r="A3" t="b"><v>0</v></c>') 'Findings Inherited values are true Boolean cells'
+        Assert ($booleanXml -match '<c r="B2" t="b"><v>0</v></c>' -and $booleanXml -match '<c r="B3" t="b"><v>1</v></c>') 'ACE IsInherited values retain matching Boolean typing'
+        $xmlSheet=[xml]$booleanXml
+        $xmlCells=@($xmlSheet.SelectNodes("//*[local-name()='c' and starts-with(@r,'C')]/*[local-name()='is']/*[local-name()='t']"))
+        Assert ($xmlCells.Count -eq $xmlValues.Count+1) 'XML-safe OOXML worksheet contains every original header and value'
+        Assert ((ConvertFrom-NtfsExcelXstring $xmlCells[0].InnerText) -ceq $xmlHeader) 'XML-forbidden header and overlapping literal tokens round-trip losslessly'
+        for($index=0;$index -lt $xmlValues.Count;$index++){
+            Assert ((ConvertFrom-NtfsExcelXstring $xmlCells[$index+1].InnerText) -ceq $xmlValues[$index]) "XML-forbidden text and valid Unicode round-trip losslessly for row $index"
+        }
+    }finally{
+        if($null -ne $typedArchive){$typedArchive.Dispose()}
+        $typedStream.Dispose()
     }
 
     $excelQa=Get-Content -LiteralPath $excelQaPath -Raw|ConvertFrom-Json
@@ -567,7 +616,14 @@ try {
     Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $excelSource -Force|ForEach-Object FullName) -Destination $metadataLinkedReport -Recurse
     $metadataQaLink=Join-Path $metadataLinkedReport 'NTFS_QA.json'
     Remove-Item -LiteralPath $metadataQaLink -Force -ErrorAction Stop
-    $metadataLinkCreated=New-NtfsTestFileLink $metadataQaLink $excelQaPath
+    $disposableQa=Join-Path $outsideSource 'metadata-copy.json'
+    Copy-Item -LiteralPath $excelQaPath -Destination $disposableQa
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+        [void](New-Item -ItemType HardLink -Path $metadataQaLink -Target $disposableQa -ErrorAction Stop)
+        $metadataLinkCreated=$true
+    }else{
+        $metadataLinkCreated=New-NtfsTestFileLink $metadataQaLink $disposableQa
+    }
     if($metadataLinkCreated){
         $metadataOutput=Join-Path $testRoot 'excel-linked-metadata.xlsx'
         $metadataLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
@@ -575,6 +631,10 @@ try {
         Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $metadataOutput -PathType Leaf)) 'Linked JSON metadata is refused before workbook publication'
         Assert (($metadataLog -join "`n") -match 'Reparse-point|Hard-linked') 'Linked JSON failure identifies the unsafe leaf file'
     }
+    $originalQa=[NtfsAssessment.ExcelReviewPinnedFile]::Open($excelQaPath)
+    try{
+        Assert ($originalQa.Length -gt 0) 'Linked metadata fixture leaves the original QA file independently readable'
+    }finally{$originalQa.Dispose()}
 
     $linkedCsv=Join-Path $excelSource 'Linked.csv'
     Remove-Item -LiteralPath $linkedCsv -Force -ErrorAction Stop

@@ -434,8 +434,9 @@ As an immediate workaround, use Power Query:
 4. Use **Combine Files**, select **UTF-8 65001**, a **comma** delimiter, and
    **first row as headers**. Do not disable quoted multiline fields.
 5. Remove an automatic **Changed Type** step or replace it with deliberate types.
-   Keep SIDs, paths, identities, hashes, and run IDs as **Text**; use whole
-   numbers only for counts and numeric risk columns.
+   Keep SIDs, paths, identities, hashes, and run IDs as **Text**. Use **Whole
+   Number** for counts and integral risk scores (`RiskScore`, `MaxRiskScore`),
+   and **Decimal Number** for `AverageRiskScore` to preserve fractional averages.
 6. For more than one worksheet's worth of data, use **Close & Load To > Only
    Create Connection** and enable **Add this data to the Data Model**. Use a
    PivotTable or filtered query from the model instead of loading every row to a
