@@ -41,6 +41,8 @@
   mapped-drive, device-prefix, short-name, and reparse-point aliases are refused.
   The PowerShell 7 path on non-Windows remains a synthetic/offline test surface;
   native Windows share-mode and handle-publication guarantees are unavailable there.
+  Unpublished pending files are preserved on that offline surface rather than
+  risking deletion of a replacement file by pathname.
 #>
 [CmdletBinding()]
 param(
@@ -88,6 +90,7 @@ namespace NtfsAssessment {
         internal const uint FileAttributeReparsePoint = 0x00000400;
         internal const uint FileAttributeDirectory = 0x00000010;
         internal const int FileRenameInfo = 3;
+        internal const int FileDispositionInfo = 4;
         internal const int FileIdInfo = 18;
         internal const uint DriveFixed = 3;
 
@@ -202,6 +205,17 @@ namespace NtfsAssessment {
                     ThrowLastError("Publish workbook by handle");
             } finally {
                 Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        public static void DeleteOwnedFile(SafeFileHandle file) {
+            IntPtr disposition = Marshal.AllocHGlobal(1);
+            try {
+                Marshal.WriteByte(disposition, 0, 1);
+                if (!SetFileInformationByHandle(file, FileDispositionInfo, disposition, 1))
+                    ThrowLastError("Delete unpublished workbook by handle");
+            } finally {
+                Marshal.FreeHGlobal(disposition);
             }
         }
 
@@ -522,7 +536,8 @@ namespace NtfsAssessment {
                     FileStream stream = new FileStream(handle, FileAccess.ReadWrite);
                     return new ExcelReviewOutputFile(pending, final, handle, stream);
                 } catch {
-                    handle.Dispose();
+                    try { ExcelReviewNative.DeleteOwnedFile(handle); }
+                    finally { handle.Dispose(); }
                     throw;
                 }
             }
@@ -534,6 +549,7 @@ namespace NtfsAssessment {
         public FileStream Stream { get { return stream; } }
         public string PendingPath { get { return pendingPath; } }
         public bool Published { get { return published; } }
+        public bool IsNative { get { return handle != null; } }
 
         public void Publish(ExcelReviewDirectoryLease directory) {
             if (disposed || published) throw new ObjectDisposedException("ExcelReviewOutputFile");
@@ -557,8 +573,12 @@ namespace NtfsAssessment {
         public void Dispose() {
             if (disposed) return;
             disposed = true;
-            stream.Dispose();
-            if (handle != null) handle.Dispose();
+            try {
+                if (!published && handle != null) ExcelReviewNative.DeleteOwnedFile(handle);
+            } finally {
+                try { stream.Dispose(); }
+                finally { if (handle != null) handle.Dispose(); }
+            }
         }
     }
 
@@ -823,8 +843,8 @@ namespace NtfsAssessment {
                     i++;
                     continue;
                 }
-                bool literalEscape = i + 6 < text.Length && text[i] == '_' &&
-                    (text[i + 1] == 'x' || text[i + 1] == 'X') && text[i + 6] == '_';
+                bool literalEscape = i + 5 < text.Length && text[i] == '_' &&
+                    (text[i + 1] == 'x' || text[i + 1] == 'X');
                 if (literalEscape) {
                     for (int digit = i + 2; digit <= i + 5; digit++) {
                         char value = text[digit];
@@ -1321,7 +1341,6 @@ $workbook=$null
 $outputFile=$null
 $sourceDirectoryLease=$null
 $outputDirectoryLease=$null
-$completedOutput=$false
 try{
     $reportFolder=(Resolve-Path -LiteralPath $InputReportFolder -ErrorAction Stop).ProviderPath
     if(-not(Test-Path -LiteralPath $reportFolder -PathType Container)){
@@ -1353,6 +1372,10 @@ try{
     if($sourceStatus -notin @('Completed','CompletedWithWarnings')){
         throw "Merge report status is '$sourceStatus'. Export requires Completed or CompletedWithWarnings."
     }
+    $qaWarnings=@(Get-NtfsExcelCollection $qa 'Warnings')
+    $qaErrors=[long](Get-NtfsExcelProperty $qa 'Errors' 0)
+    if($qaErrors -lt 0){throw 'NTFS_QA.json contains a negative source error count.'}
+    $scanErrorsPath=Join-Path $reportFolder 'NTFS_ScanErrors.csv'
     $datasetMap=Get-NtfsExcelDatasetMap $qa
 
     $defaultDatasets=@(
@@ -1412,8 +1435,12 @@ try{
     foreach($row in $overview){[void]$overviewRows.Add($row)}
     foreach($property in @($executive.PSObject.Properties)){
         if($property.Name -in @('Limitations','Warnings','Version')){continue}
+        $value=$property.Value
+        if($value -is [datetime] -or $value -is [datetimeoffset]){
+            $value=$value.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+        }
         [void]$overviewRows.Add([pscustomobject]@{
-            Section='Executive summary';Item=$property.Name;Value=[string]$property.Value
+            Section='Executive summary';Item=$property.Name;Value=[string]$value
         })
     }
     foreach($path in @(Get-NtfsExcelCollection $qa 'SelectedRunFolders')){
@@ -1422,8 +1449,14 @@ try{
     foreach($limitation in @(Get-NtfsExcelCollection $qa 'Limitations')){
         [void]$overviewRows.Add([pscustomobject]@{Section='Limitation';Item='Interpretation';Value=[string]$limitation})
     }
-    foreach($warning in @(Get-NtfsExcelCollection $qa 'Warnings')){
+    foreach($warning in $qaWarnings){
         [void]$overviewRows.Add([pscustomobject]@{Section='Warning';Item='Source report';Value=[string]$warning})
+    }
+    if($qaErrors -gt 0){
+        [void]$overviewRows.Add([pscustomobject]@{
+            Section='Warning';Item='Source merge errors'
+            Value="$qaErrors source merge error(s). Review the original $scanErrorsPath before interpreting the workbook."
+        })
     }
     foreach($verifiedDataset in @($verifiedDatasets)){
         [void]$overviewRows.Add([pscustomobject]@{
@@ -1432,7 +1465,7 @@ try{
         })
     }
 
-    $pendingPath=Join-Path $resolvedOutputParent ('.'+[IO.Path]::GetFileName($resolvedOutput)+'.'+[guid]::NewGuid().ToString('N')+'.pending')
+    $pendingPath=Join-Path $resolvedOutputParent ('.ntfs-excel-'+[guid]::NewGuid().ToString('N')+'.pending')
     $outputFile=[NtfsAssessment.ExcelReviewOutputFile]::Create($pendingPath,$resolvedOutput)
     $workbook=[NtfsAssessment.ExcelReviewWorkbook]::new($outputFile.Stream,[string]$script:NtfsVersions.ExcelReview)
     $usedSheetNames=@{}
@@ -1498,38 +1531,30 @@ try{
     $outputFile.Dispose()
     $outputFile=$null
     $pendingPath=$null
-    $completedOutput=$true
 
-    $qaWarnings=@(Get-NtfsExcelCollection $qa 'Warnings')
+    $requirements=@()
+    $reviewPaths=@($resolvedOutput)
+    $reasons=@($qaWarnings|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+    if($qaWarnings.Count -gt 0){
+        $requirements+="Review $($qaWarnings.Count) source merge warning(s) before interpreting the workbook."
+    }
+    if($qaErrors -gt 0){
+        $requirements+="Review $qaErrors source merge error(s) in the original NTFS_ScanErrors.csv."
+        $reviewPaths+=$scanErrorsPath
+        $reasons+=[pscustomobject]@{Count=$qaErrors;Reason='Source merge errors; review the original NTFS_ScanErrors.csv.'}
+    }
     $completion=@{
-        component='Excel review';status=$(if($sourceStatus -eq 'CompletedWithWarnings' -or $qaWarnings.Count -gt 0){'CompletedWithWarnings'}else{'Completed'})
+        component='Excel review';status=$(if($sourceStatus -eq 'CompletedWithWarnings' -or $qaWarnings.Count -gt 0 -or $qaErrors -gt 0){'CompletedWithWarnings'}else{'Completed'})
         summary="Datasets=$($verifiedDatasets.Count); Rows=$totalDataRows; Sheets=$($usedSheetNames.Count); Continuations=$continuationSheets."
         outputPath=$resolvedOutput
-        reviewPath=@($resolvedOutput)
-        requirements=$(if($qaWarnings.Count -gt 0){"Review $($qaWarnings.Count) source merge warning(s) before interpreting the workbook."}else{''})
-        reasonSummary=@($qaWarnings|Group-Object|ForEach-Object{[pscustomobject]@{Count=$_.Count;Reason=$_.Name}})
+        reviewPath=$reviewPaths
+        requirements=($requirements -join ' ')
+        reasonSummary=$reasons
         nextStep='Open the Overview worksheet first, then filter the report-specific sheets. The workbook is a convenience copy; retain and validate the original merge report for review or handoff.'
     }
     Write-NtfsCompletion @completion
     exit 0
 }catch{
-    if($null -ne $workbook){
-        try{$workbook.Dispose()}catch{
-            Write-Warning "Excel review workbook cleanup failed: $($_.Exception.Message)"
-        }
-        $workbook=$null
-    }
-    if($null -ne $outputFile){
-        try{$outputFile.Dispose()}catch{
-            Write-Warning "Excel review output-handle cleanup failed: $($_.Exception.Message)"
-        }
-        $outputFile=$null
-    }
-    if($pendingPath -and (Test-Path -LiteralPath $pendingPath -PathType Leaf)){
-        try{Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop}catch{
-            Write-Warning "Excel review pending-file cleanup failed for ${pendingPath}: $($_.Exception.Message)"
-        }
-    }
     Write-Error -ErrorRecord $_ -ErrorAction Continue
     Write-Verbose $_.ScriptStackTrace
     Write-Verbose $_.InvocationInfo.PositionMessage
@@ -1542,16 +1567,26 @@ try{
     Write-NtfsCompletion @completion
     exit 2
 }finally{
-    if(-not $completedOutput -and $pendingPath -and (Test-Path -LiteralPath $pendingPath -PathType Leaf)){
-        try{Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop}catch{
-            Write-Warning "Excel review pending-file cleanup failed for ${pendingPath}: $($_.Exception.Message)"
+    $cleanupWarnings=[Collections.Generic.List[string]]::new()
+    if($null -ne $workbook){
+        try{$workbook.Dispose()}catch{
+            $cleanupWarnings.Add("Excel review workbook cleanup failed: $($_.Exception.Message)")
+        }
+    }
+    if($null -ne $outputFile){
+        try{$outputFile.Dispose()}catch{
+            $cleanupWarnings.Add("Excel review output-handle cleanup failed: $($_.Exception.Message)")
+        }
+        if(-not $outputFile.Published -and -not $outputFile.IsNative){
+            $cleanupWarnings.Add("Offline test pending workbook preserved without pathname deletion: $($outputFile.PendingPath)")
         }
     }
     foreach($lease in @($outputDirectoryLease,$sourceDirectoryLease)){
         if($null -ne $lease){
             try{$lease.Dispose()}catch{
-                Write-Warning "Excel review directory-lease cleanup failed: $($_.Exception.Message)"
+                $cleanupWarnings.Add("Excel review directory-lease cleanup failed: $($_.Exception.Message)")
             }
         }
     }
+    foreach($message in $cleanupWarnings){Write-Warning $message}
 }

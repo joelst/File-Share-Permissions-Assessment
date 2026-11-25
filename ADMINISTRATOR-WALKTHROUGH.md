@@ -492,6 +492,9 @@ prove effective access, or authorize remediation. Selected JSON and CSV inputs
 are opened through pinned handles and the workbook uses the exact CSV bytes
 that were hashed. On Windows, directory routes and the pending workbook remain
 pinned through publication; path checks are not a substitute for those handles.
+Failed or cancelled Windows exports delete unpublished workbooks through their
+owned handles. Non-Windows synthetic/offline tests instead preserve pending files;
+they never delete a potentially replaced pathname.
 If a source cell exceeds Excel's 32,767-character text limit, the exporter fails
 instead of truncating it; use Power Query's connection/Data Model workflow or a
 filtered source export for that field.

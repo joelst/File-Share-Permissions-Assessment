@@ -190,7 +190,9 @@ convenience copy; retain the original merge report. On Windows, report and outpu
 paths must use direct fixed drive-letter paths; ambiguous UNC, mapped-drive,
 device-prefix, short-name, and reparse aliases are rejected. The selected source
 files and pending workbook are pinned, and CSV hashes cover exactly the bytes
-parsed into the workbook.
+parsed into the workbook. Failed or cancelled Windows exports delete only their
+owned pending file through its handle. The non-Windows synthetic/offline path
+preserves unpublished pending files rather than deleting by an untrusted pathname.
 
 Each entry script finishes with its status, actual output location, reports or
 logs to review, and a specific next script/stage or an explicit statement that
