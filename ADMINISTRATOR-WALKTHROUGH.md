@@ -495,6 +495,11 @@ pinned through publication; path checks are not a substitute for those handles.
 Failed or cancelled Windows exports delete unpublished workbooks through their
 owned handles. Non-Windows synthetic/offline tests instead preserve pending files;
 they never delete a potentially replaced pathname.
+Windows leases reject junction-capable writers, and child creation/publication
+is relative to retained directory handles. Export waits for the merger's
+post-cleanup `Finalized` signal; regenerate older reports with the current merger
+if that signal is missing. Choose a Windows output path of at most 218 characters
+including the filename. Cells may contain at most 253 line feeds.
 If a source cell exceeds Excel's 32,767-character text limit, the exporter fails
 instead of truncating it; use Power Query's connection/Data Model workflow or a
 filtered source export for that field.

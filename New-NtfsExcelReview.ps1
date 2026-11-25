@@ -80,6 +80,7 @@ namespace NtfsAssessment {
         internal const uint Delete = 0x00010000;
         internal const uint ReadAttributes = 0x00000080;
         internal const uint Traverse = 0x00000020;
+        internal const uint Synchronize = 0x00100000;
         internal const uint FileShareRead = 0x00000001;
         internal const uint FileShareWrite = 0x00000002;
         internal const uint CreateNew = 1;
@@ -138,6 +139,56 @@ namespace NtfsAssessment {
             return handle;
         }
 
+        private static void CheckNtStatus(int status, string operation) {
+            if (status >= 0) return;
+            int error = (int)RtlNtStatusToDosError(unchecked((uint)status));
+            throw new Win32Exception(error, operation + ": " + new Win32Exception(error).Message);
+        }
+
+        private static void ValidateChildName(string name) {
+            if (String.IsNullOrWhiteSpace(name) || name == "." || name == ".." ||
+                name.IndexOfAny(new char[] { '\\', '/', ':', '\0' }) >= 0)
+                throw new ArgumentException("A direct child name is required.", "name");
+        }
+
+        public static SafeFileHandle CreateChild(SafeFileHandle directory, string name, bool isDirectory) {
+            ValidateChildName(name);
+            bool retained = false;
+            IntPtr text = Marshal.StringToHGlobalUni(name);
+            IntPtr unicode = IntPtr.Zero;
+            try {
+                directory.DangerousAddRef(ref retained);
+                UnicodeString value = new UnicodeString();
+                value.Length = checked((ushort)(name.Length * 2));
+                value.MaximumLength = checked((ushort)(value.Length + 2));
+                value.Buffer = text;
+                unicode = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+                Marshal.StructureToPtr(value, unicode, false);
+                ObjectAttributes attributes = new ObjectAttributes();
+                attributes.Length = Marshal.SizeOf(typeof(ObjectAttributes));
+                attributes.RootDirectory = directory.DangerousGetHandle();
+                attributes.ObjectName = unicode;
+                attributes.Attributes = 0x40 | 0x1000; // Case-insensitive, never traverse a reparse.
+                IoStatusBlock io;
+                SafeFileHandle created;
+                int status = NtCreateFile(out created,
+                    Synchronize | (isDirectory ? ReadAttributes | Traverse : GenericRead | GenericWrite | Delete),
+                    ref attributes, out io, IntPtr.Zero, 0,
+                    FileShareRead, isDirectory ? 3u : 2u,
+                    0x20u | 0x00200000u | (isDirectory ? 1u : 0x40u | 2u),
+                    IntPtr.Zero, 0);
+                if (status < 0) {
+                    if (created != null) created.Dispose();
+                    CheckNtStatus(status, "Create direct child " + name);
+                }
+                return created;
+            } finally {
+                if (unicode != IntPtr.Zero) Marshal.FreeHGlobal(unicode);
+                Marshal.FreeHGlobal(text);
+                if (retained) directory.DangerousRelease();
+            }
+        }
+
         public static FileInformation GetInformation(SafeFileHandle handle, string path) {
             FileInformation information;
             if (!GetFileInformationByHandle(handle, out information))
@@ -187,24 +238,26 @@ namespace NtfsAssessment {
         public static void RenameFile(SafeFileHandle file, SafeFileHandle directory, string relativeName) {
             if (file == null || file.IsInvalid) throw new ArgumentException("file");
             if (directory == null || directory.IsInvalid) throw new ArgumentException("directory");
-            if (String.IsNullOrWhiteSpace(relativeName) ||
-                relativeName.IndexOfAny(new char[] { '\\', '/', '\0' }) >= 0)
-                throw new ArgumentException("The output name must be a direct child name.", "relativeName");
+            ValidateChildName(relativeName);
 
-            // The Win32 wrapper expands relative names; use the pinned directory's full path.
-            byte[] name = Encoding.Unicode.GetBytes(System.IO.Path.Combine(GetFinalPath(directory), relativeName));
+            byte[] name = Encoding.Unicode.GetBytes(relativeName);
             int headerSize = IntPtr.Size == 8 ? 20 : 12;
             int bufferSize = (IntPtr.Size == 8 ? 24 : 16) + name.Length;
             IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
+            bool retained = false;
             try {
+                directory.DangerousAddRef(ref retained);
                 for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
+                Marshal.WriteIntPtr(buffer, IntPtr.Size == 8 ? 8 : 4, directory.DangerousGetHandle());
                 int lengthOffset = IntPtr.Size == 8 ? 16 : 8;
                 Marshal.WriteInt32(buffer, lengthOffset, name.Length);
                 Marshal.Copy(name, 0, IntPtr.Add(buffer, headerSize), name.Length);
-                if (!SetFileInformationByHandle(file, FileRenameInfo, buffer, (uint)bufferSize))
-                    ThrowLastError("Publish workbook by handle");
+                IoStatusBlock io;
+                CheckNtStatus(NtSetInformationFile(file, out io, buffer, (uint)bufferSize, 10),
+                    "Publish workbook relative to its directory handle");
             } finally {
                 Marshal.FreeHGlobal(buffer);
+                if (retained) directory.DangerousRelease();
             }
         }
 
@@ -218,6 +271,36 @@ namespace NtfsAssessment {
                 Marshal.FreeHGlobal(disposition);
             }
         }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UnicodeString {
+            public ushort Length;
+            public ushort MaximumLength;
+            public IntPtr Buffer;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ObjectAttributes {
+            public int Length;
+            public IntPtr RootDirectory;
+            public IntPtr ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor;
+            public IntPtr SecurityQualityOfService;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoStatusBlock {
+            public IntPtr Status;
+            public UIntPtr Information;
+        }
+        [DllImport("ntdll.dll")]
+        private static extern int NtCreateFile(out SafeFileHandle file, uint access,
+            ref ObjectAttributes attributes, out IoStatusBlock io, IntPtr allocationSize,
+            uint fileAttributes, uint sharing, uint disposition, uint options, IntPtr ea, uint eaLength);
+        [DllImport("ntdll.dll")]
+        private static extern int NtSetInformationFile(SafeFileHandle file, out IoStatusBlock io,
+            IntPtr information, uint length, int informationClass);
+        [DllImport("ntdll.dll")]
+        private static extern uint RtlNtStatusToDosError(uint status);
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct FileInformation {
@@ -258,7 +341,7 @@ namespace NtfsAssessment {
         private readonly bool native;
         private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
         private readonly List<string> identities = new List<string>();
-        private readonly string path;
+        private string path;
         private bool disposed;
 
         private ExcelReviewDirectoryLease(string requestedPath, bool nativeLease) {
@@ -288,26 +371,28 @@ namespace NtfsAssessment {
                         component,
                         // Attribute-only opens do not participate in share-access tracking.
                         ExcelReviewNative.ReadAttributes | ExcelReviewNative.Traverse,
-                        ExcelReviewNative.FileShareRead | ExcelReviewNative.FileShareWrite,
+                        ExcelReviewNative.FileShareRead,
                         ExcelReviewNative.OpenExisting,
                         ExcelReviewNative.FileFlagBackupSemantics | ExcelReviewNative.FileFlagOpenReparsePoint);
-                    handles.Add(handle);
-                    ExcelReviewNative.FileInformation information = ExcelReviewNative.GetInformation(handle, component);
-                    if ((information.Attributes & ExcelReviewNative.FileAttributeReparsePoint) != 0 ||
-                        (information.Attributes & ExcelReviewNative.FileAttributeDirectory) == 0) {
-                        throw new InvalidOperationException("Reparse point or non-directory component in Excel review path: " + component);
-                    }
-                    string finalPath = ExcelReviewNative.TrimDirectoryPath(ExcelReviewNative.GetFinalPath(handle));
-                    string expectedPath = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(component));
-                    if (!String.Equals(finalPath, expectedPath, StringComparison.OrdinalIgnoreCase)) {
-                        throw new InvalidOperationException("Drive alias, short-name, mapped path, or physical namespace mismatch: " + component);
-                    }
-                    identities.Add(ExcelReviewNative.GetStableIdentity(handle, volume));
+                    AddDirectoryHandle(handle, component, volume);
                 }
             } catch {
                 Dispose();
                 throw;
             }
+        }
+
+        private void AddDirectoryHandle(SafeFileHandle handle, string component, string volume) {
+            handles.Add(handle);
+            ExcelReviewNative.FileInformation information = ExcelReviewNative.GetInformation(handle, component);
+            if ((information.Attributes & ExcelReviewNative.FileAttributeReparsePoint) != 0 ||
+                (information.Attributes & ExcelReviewNative.FileAttributeDirectory) == 0)
+                throw new InvalidOperationException("Reparse point or non-directory component in Excel review path: " + component);
+            string finalPath = ExcelReviewNative.TrimDirectoryPath(ExcelReviewNative.GetFinalPath(handle));
+            if (!String.Equals(finalPath, ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(component)),
+                StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Drive alias, short-name, mapped path, or physical namespace mismatch: " + component);
+            identities.Add(ExcelReviewNative.GetStableIdentity(handle, volume));
         }
 
         public static ExcelReviewDirectoryLease Open(string path) {
@@ -344,11 +429,18 @@ namespace NtfsAssessment {
                         throw new InvalidOperationException("OutputPath is within or aliased to InputReportFolder so source report evidence remains unchanged.");
                     if (missing.Count == 0) return lease;
                     string child = missing.Pop();
-                    // Pin each new component before creating anything below it.
-                    Directory.CreateDirectory(child);
-                    ExcelReviewDirectoryLease next = Open(child);
-                    lease.Dispose();
-                    lease = next;
+                    if (lease.native) {
+                        SafeFileHandle handle = ExcelReviewNative.CreateChild(lease.TargetHandle,
+                            System.IO.Path.GetFileName(child), true);
+                        lease.AddDirectoryHandle(handle, child,
+                            ExcelReviewNative.GetVolumeName(System.IO.Path.GetPathRoot(child)));
+                        lease.path = child;
+                    } else {
+                        Directory.CreateDirectory(child);
+                        ExcelReviewDirectoryLease next = Open(child);
+                        lease.Dispose();
+                        lease = next;
+                    }
                 }
             } catch {
                 lease.Dispose();
@@ -523,15 +615,17 @@ namespace NtfsAssessment {
             stream = openedStream;
         }
 
-        public static ExcelReviewOutputFile Create(string pending, string final) {
+        public static ExcelReviewOutputFile Create(string pending, string final, ExcelReviewDirectoryLease directory) {
             if (File.Exists(final)) throw new IOException("OutputPath already exists and will not be overwritten: " + final);
             if (ExcelReviewNative.IsWindows) {
-                SafeFileHandle handle = ExcelReviewNative.OpenFile(
-                    pending,
-                    ExcelReviewNative.GenericRead | ExcelReviewNative.GenericWrite | ExcelReviewNative.Delete,
-                    ExcelReviewNative.FileShareRead,
-                    ExcelReviewNative.CreateNew,
-                    ExcelReviewNative.FileFlagWriteThrough);
+                if (directory == null || !directory.IsNative ||
+                    !String.Equals(ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetDirectoryName(pending)),
+                        directory.Path, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetDirectoryName(final)),
+                        directory.Path, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Output paths must be direct children of their native directory lease.");
+                SafeFileHandle handle = ExcelReviewNative.CreateChild(directory.TargetHandle,
+                    System.IO.Path.GetFileName(pending), false);
                 try {
                     FileStream stream = new FileStream(handle, FileAccess.ReadWrite);
                     return new ExcelReviewOutputFile(pending, final, handle, stream);
@@ -767,6 +861,12 @@ namespace NtfsAssessment {
                     CultureInfo.InvariantCulture,
                     "Cell {0}{1} exceeds Excel's 32,767-character text limit.",
                     GetColumnName(column), rowNumber));
+            int lineFeeds = 0;
+            foreach (char character in text) {
+                if (character == '\n' && ++lineFeeds > 253)
+                    throw new InvalidDataException(String.Format(CultureInfo.InvariantCulture,
+                        "Cell {0}{1} exceeds Excel's 253-line-feed limit.", GetColumnName(column), rowNumber));
+            }
             string encodedText = EscapeXstring(text);
             try { XmlConvert.VerifyXmlChars(encodedText); }
             catch (XmlException ex) {
@@ -1352,6 +1452,9 @@ try{
         throw 'OutputPath cannot contain an alternate-data-stream separator.'
     }
     if([IO.Path]::GetExtension($resolvedOutput) -ine '.xlsx'){throw 'OutputPath must use the .xlsx extension.'}
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $resolvedOutput.Length -gt 218){
+        throw "OutputPath exceeds Excel for Windows' 218-character full-path limit. Choose a shorter output directory or filename."
+    }
     if(Test-Path -LiteralPath $resolvedOutput){throw "OutputPath already exists and will not be overwritten: $resolvedOutput"}
     $resolvedOutputParent=[IO.Path]::GetDirectoryName($resolvedOutput)
     if([string]::IsNullOrWhiteSpace($resolvedOutputParent)){throw "OutputPath has no parent directory: $resolvedOutput"}
@@ -1371,6 +1474,10 @@ try{
     $sourceStatus=[string](Get-NtfsExcelProperty $state 'Status')
     if($sourceStatus -notin @('Completed','CompletedWithWarnings')){
         throw "Merge report status is '$sourceStatus'. Export requires Completed or CompletedWithWarnings."
+    }
+    $finalized=Get-NtfsExcelProperty $state 'Finalized' $false
+    if($finalized -isnot [bool] -or -not $finalized){
+        throw 'Merge report is not finalized after cleanup. Wait for merge completion, or regenerate older reports with the current Merge-NtfsAssessment.ps1.'
     }
     $qaWarnings=@(Get-NtfsExcelCollection $qa 'Warnings')
     $qaErrors=[long](Get-NtfsExcelProperty $qa 'Errors' 0)
@@ -1466,7 +1573,7 @@ try{
     }
 
     $pendingPath=Join-Path $resolvedOutputParent ('.ntfs-excel-'+[guid]::NewGuid().ToString('N')+'.pending')
-    $outputFile=[NtfsAssessment.ExcelReviewOutputFile]::Create($pendingPath,$resolvedOutput)
+    $outputFile=[NtfsAssessment.ExcelReviewOutputFile]::Create($pendingPath,$resolvedOutput,$outputDirectoryLease)
     $workbook=[NtfsAssessment.ExcelReviewWorkbook]::new($outputFile.Stream,[string]$script:NtfsVersions.ExcelReview)
     $usedSheetNames=@{}
     $workbook.BeginSheet('Overview',[string[]]@('Section','Item','Value'))

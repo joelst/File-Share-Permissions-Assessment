@@ -155,9 +155,9 @@ function Add-SpoolRow($Spool) {
         throw "Run $($Spool.RunId), $($Spool.Server)\$($Spool.Share) exceeds MaxRowsPerShare=$MaxRowsPerShare. Increase that guard only with sufficient memory or collect smaller scopes; parallel workers multiply memory use."
     }
 }
-function Save-State([string]$Status,[string]$Stage,[string]$Message='') {
+function Save-State([string]$Status,[string]$Stage,[string]$Message='',[bool]$Finalized=$false) {
     if (-not $script:OutputReady) { return }
-    [ordered]@{ToolkitVersion=$script:NtfsVersions.Merge;Status=$Status;CurrentStage=$Stage;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
+    [ordered]@{ToolkitVersion=$script:NtfsVersions.Merge;Status=$Status;CurrentStage=$Stage;Finalized=$Finalized;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputFolder 'merge-state.json') -Encoding UTF8
     Write-NtfsLog (Join-Path $OutputFolder 'merge-stage.log') Merge $Status $Stage $Message
 }
@@ -638,7 +638,7 @@ try {
         Counts=$totals;Errors=$errorCount;Warnings=@($script:Warnings);Datasets=$inventory;Limitations=$limitations
     }|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_QA.json') -Encoding UTF8
     $exitCode=if($errorCount -gt 0 -or $script:Warnings.Count -gt 0){1}else{0}
-    Save-State $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete
+    Save-State Running Finalizing
 }catch{
     $message="$($_.Exception.Message) $($_.ScriptStackTrace)"
     Save-State Failed Merge $message
@@ -664,9 +664,12 @@ try {
             $qa=Get-Content -LiteralPath $qaPath -Raw|ConvertFrom-Json
             $qa.Warnings=@($script:Warnings)
             $qa|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $qaPath -Encoding UTF8
-            Save-State CompletedWithWarnings Cleanup
+            Save-State Running Finalizing
         }else{Save-State Failed Cleanup $message}
     }
+}
+if($exitCode -lt 2){
+    Save-State $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete -Finalized $true
 }
 $completion=@{component='Merge';outputPath=$OutputFolder}
 if($exitCode -eq 2){
