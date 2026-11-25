@@ -468,7 +468,7 @@ try {
         $rootLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($filesystemRoot)
         try{
             Assert-Throws {
-                [void][NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside([IO.Path]::GetTempPath(),$rootLease)
+                [void][NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside([IO.Directory]::GetParent($testRoot).FullName,$rootLease)
             } 'Filesystem-root source lease contains every descendant output path'
         }finally{$rootLease.Dispose()}
 
