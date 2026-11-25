@@ -120,7 +120,9 @@ namespace NtfsAssessment {
         }
 
         public static void ThrowLastError(string operation) {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
+            int error = Marshal.GetLastWin32Error();
+            throw new Win32Exception(error, operation + ": " + new Win32Exception(error).Message +
+                " (Win32 " + error.ToString(CultureInfo.InvariantCulture) + ")");
         }
 
         public static SafeFileHandle OpenFile(string path, uint access, uint sharing, uint disposition, uint flags) {
@@ -186,17 +188,17 @@ namespace NtfsAssessment {
                 relativeName.IndexOfAny(new char[] { '\\', '/', '\0' }) >= 0)
                 throw new ArgumentException("The output name must be a direct child name.", "relativeName");
 
-            byte[] name = Encoding.Unicode.GetBytes(relativeName);
+            // The Win32 wrapper expands relative names; use the pinned directory's full path.
+            byte[] name = Encoding.Unicode.GetBytes(System.IO.Path.Combine(GetFinalPath(directory), relativeName));
             int headerSize = IntPtr.Size == 8 ? 20 : 12;
-            IntPtr buffer = Marshal.AllocHGlobal(headerSize + name.Length);
+            int bufferSize = (IntPtr.Size == 8 ? 24 : 16) + name.Length;
+            IntPtr buffer = Marshal.AllocHGlobal(bufferSize);
             try {
-                for (int i = 0; i < headerSize; i++) Marshal.WriteByte(buffer, i, 0);
-                int handleOffset = IntPtr.Size == 8 ? 8 : 4;
+                for (int i = 0; i < bufferSize; i++) Marshal.WriteByte(buffer, i, 0);
                 int lengthOffset = IntPtr.Size == 8 ? 16 : 8;
-                Marshal.WriteIntPtr(buffer, handleOffset, directory.DangerousGetHandle());
                 Marshal.WriteInt32(buffer, lengthOffset, name.Length);
                 Marshal.Copy(name, 0, IntPtr.Add(buffer, headerSize), name.Length);
-                if (!SetFileInformationByHandle(file, FileRenameInfo, buffer, (uint)(headerSize + name.Length)))
+                if (!SetFileInformationByHandle(file, FileRenameInfo, buffer, (uint)bufferSize))
                     ThrowLastError("Publish workbook by handle");
             } finally {
                 Marshal.FreeHGlobal(buffer);
