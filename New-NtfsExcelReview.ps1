@@ -1329,9 +1329,10 @@ try{
     }
     $sourceDirectoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($reportFolder)
     $resolvedOutput=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    if(($resolvedOutput -replace '^[A-Za-z]:','') -match ':'){
+        throw 'OutputPath cannot contain an alternate-data-stream separator.'
+    }
     if([IO.Path]::GetExtension($resolvedOutput) -ine '.xlsx'){throw 'OutputPath must use the .xlsx extension.'}
-    $resolvedOutputLeaf=[IO.Path]::GetFileName($resolvedOutput)
-    if($resolvedOutputLeaf -match ':'){throw 'OutputPath leaf cannot contain an alternate-data-stream separator.'}
     if(Test-Path -LiteralPath $resolvedOutput){throw "OutputPath already exists and will not be overwritten: $resolvedOutput"}
     $resolvedOutputParent=[IO.Path]::GetDirectoryName($resolvedOutput)
     if([string]::IsNullOrWhiteSpace($resolvedOutputParent)){throw "OutputPath has no parent directory: $resolvedOutput"}
