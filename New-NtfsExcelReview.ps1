@@ -145,7 +145,7 @@ namespace NtfsAssessment {
             throw new Win32Exception(error, operation + ": " + new Win32Exception(error).Message);
         }
 
-        private static void ValidateChildName(string name) {
+        internal static void ValidateChildName(string name) {
             if (String.IsNullOrWhiteSpace(name) || name == "." || name == ".." ||
                 name.IndexOfAny(new char[] { '\\', '/', ':', '\0' }) >= 0)
                 throw new ArgumentException("A direct child name is required.", "name");
@@ -153,6 +153,8 @@ namespace NtfsAssessment {
 
         public static SafeFileHandle CreateChild(SafeFileHandle directory, string name, bool isDirectory) {
             ValidateChildName(name);
+            if ((GetInformation(directory, name).Attributes & FileAttributeReparsePoint) != 0)
+                throw new InvalidOperationException("Reparse point inserted into an output directory: " + name);
             bool retained = false;
             IntPtr text = Marshal.StringToHGlobalUni(name);
             IntPtr unicode = IntPtr.Zero;
@@ -174,7 +176,7 @@ namespace NtfsAssessment {
                 int status = NtCreateFile(out created,
                     Synchronize | (isDirectory ? ReadAttributes | Traverse : GenericRead | GenericWrite | Delete),
                     ref attributes, out io, IntPtr.Zero, 0,
-                    FileShareRead, isDirectory ? 3u : 2u,
+                    isDirectory ? FileShareRead | FileShareWrite : FileShareRead, isDirectory ? 3u : 2u,
                     0x20u | 0x00200000u | (isDirectory ? 1u : 0x40u | 2u),
                     IntPtr.Zero, 0);
                 if (status < 0) {
@@ -371,7 +373,7 @@ namespace NtfsAssessment {
                         component,
                         // Attribute-only opens do not participate in share-access tracking.
                         ExcelReviewNative.ReadAttributes | ExcelReviewNative.Traverse,
-                        ExcelReviewNative.FileShareRead,
+                        ExcelReviewNative.FileShareRead | ExcelReviewNative.FileShareWrite,
                         ExcelReviewNative.OpenExisting,
                         ExcelReviewNative.FileFlagBackupSemantics | ExcelReviewNative.FileFlagOpenReparsePoint);
                     AddDirectoryHandle(handle, component, volume);
@@ -430,11 +432,7 @@ namespace NtfsAssessment {
                     if (missing.Count == 0) return lease;
                     string child = missing.Pop();
                     if (lease.native) {
-                        SafeFileHandle handle = ExcelReviewNative.CreateChild(lease.TargetHandle,
-                            System.IO.Path.GetFileName(child), true);
-                        lease.AddDirectoryHandle(handle, child,
-                            ExcelReviewNative.GetVolumeName(System.IO.Path.GetPathRoot(child)));
-                        lease.path = child;
+                        lease.CreateChildDirectory(System.IO.Path.GetFileName(child));
                     } else {
                         Directory.CreateDirectory(child);
                         ExcelReviewDirectoryLease next = Open(child);
@@ -444,6 +442,22 @@ namespace NtfsAssessment {
                 }
             } catch {
                 lease.Dispose();
+                throw;
+            }
+        }
+
+        public void CreateChildDirectory(string name) {
+            if (disposed) throw new ObjectDisposedException("ExcelReviewDirectoryLease");
+            if (!native) throw new PlatformNotSupportedException("Native child-directory creation requires Windows.");
+            ExcelReviewNative.ValidateChildName(name);
+            string child = System.IO.Path.Combine(path, name);
+            SafeFileHandle handle = ExcelReviewNative.CreateChild(TargetHandle, name, true);
+            try {
+                AddDirectoryHandle(handle, child, ExcelReviewNative.GetVolumeName(System.IO.Path.GetPathRoot(child)));
+                path = child;
+            } catch {
+                if (!handles.Contains(handle)) handle.Dispose();
+                Dispose();
                 throw;
             }
         }

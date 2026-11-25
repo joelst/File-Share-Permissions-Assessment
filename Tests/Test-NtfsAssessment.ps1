@@ -562,20 +562,21 @@ public static class NtfsExcelJunctionProbe {
         $junctionProbePath=Join-Path $testRoot 'inplace-junction'
         [void][IO.Directory]::CreateDirectory($junctionProbePath)
         $junctionLease=$null
-        $junctionWriter=$null
         try{
             [NtfsExcelJunctionProbe]::Set($junctionProbePath,$excelSource)
             Assert (([IO.File]::GetAttributes($junctionProbePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'Native probe can insert an in-place junction without renaming the directory'
             [NtfsExcelJunctionProbe]::Clear($junctionProbePath)
             $junctionLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($junctionProbePath)
-            Assert-Throws { [NtfsExcelJunctionProbe]::Set($junctionProbePath,$excelSource) } 'Directory lease blocks FSCTL_SET_REPARSE_POINT writers before pending creation' -ExpectedNativeCode 32
-            Assert (([IO.File]::GetAttributes($junctionProbePath) -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Failed in-place redirection leaves the leased output directory unchanged'
-            $junctionLease.Dispose()
-            $junctionLease=$null
-            $junctionWriter=[NtfsExcelJunctionProbe]::OpenWriter($junctionProbePath)
-            Assert-Throws { [void][NtfsAssessment.ExcelReviewDirectoryLease]::Open($junctionProbePath) } 'Lease acquisition rejects a pre-existing junction-capable writer' -ExpectedNativeCode 32
+            $sourceEntriesBefore=@(Get-ChildItem -LiteralPath $excelSource -Force|Sort-Object Name|ForEach-Object Name) -join "`n"
+            [NtfsExcelJunctionProbe]::Set($junctionProbePath,$excelSource)
+            $redirectPending=Join-Path $junctionProbePath 'redirect.pending'
+            $redirectFinal=Join-Path $junctionProbePath 'redirect.xlsx'
+            Assert-Throws { [void][NtfsAssessment.ExcelReviewOutputFile]::Create($redirectPending,$redirectFinal,$junctionLease) } 'In-place junction insertion is rejected before pending-file creation' 'Reparse point inserted'
+            Assert-Throws { $junctionLease.CreateChildDirectory('redirect-child') } 'In-place junction insertion after lease acquisition cannot redirect missing-child directory creation' 'Reparse point inserted'
+            $sourceEntriesAfter=@(Get-ChildItem -LiteralPath $excelSource -Force|Sort-Object Name|ForEach-Object Name) -join "`n"
+            Assert ($sourceEntriesBefore -ceq $sourceEntriesAfter) 'In-place output redirection creates neither directories nor pending files in the source report'
+            [NtfsExcelJunctionProbe]::Clear($junctionProbePath)
         }finally{
-            if($null -ne $junctionWriter){$junctionWriter.Dispose()}
             if($null -ne $junctionLease){$junctionLease.Dispose()}
             if(([IO.File]::GetAttributes($junctionProbePath) -band [IO.FileAttributes]::ReparsePoint) -ne 0){
                 [NtfsExcelJunctionProbe]::Clear($junctionProbePath)

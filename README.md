@@ -193,8 +193,8 @@ files and pending workbook are pinned, and CSV hashes cover exactly the bytes
 parsed into the workbook. Failed or cancelled Windows exports delete only their
 owned pending file through its handle. The non-Windows synthetic/offline path
 preserves unpublished pending files rather than deleting by an untrusted pathname.
-Windows directory leases also deny concurrent writers, and output children and
-publication use directory-relative native handles to prevent in-place junction
+Windows output children and publication use directory-relative native handles
+and reject reparsed directories to prevent in-place junction
 redirection. Excel exports require the merger's post-cleanup `Finalized` signal;
 regenerate older merged reports with the current merger. Cells exceeding 253 line
 feeds and Windows output paths exceeding Excel's 218-character full-path limit
