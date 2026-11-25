@@ -480,7 +480,9 @@ namespace NtfsAssessment {
             string root = ExcelReviewNative.TrimDirectoryPath(directory.path);
             string current = ExcelReviewNative.TrimDirectoryPath(path);
             if (String.Equals(current, root, StringComparison.Ordinal)) return true;
-            return current.StartsWith(root + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal);
+            string separator = System.IO.Path.DirectorySeparatorChar.ToString();
+            string rootPrefix = root.EndsWith(separator, StringComparison.Ordinal) ? root : root + separator;
+            return current.StartsWith(rootPrefix, StringComparison.Ordinal);
         }
 
         public void Dispose() {
@@ -1263,6 +1265,22 @@ function Read-NtfsExcelJson([string]$Path) {
     return (Read-NtfsExcelPinnedText $Path|ConvertFrom-Json -ErrorAction Stop)
 }
 
+function Read-NtfsExcelCompletionState([string]$Path) {
+    $stream=$null
+    $reader=$null
+    try{
+        $sharing=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,$sharing,4096,[IO.FileOptions]::SequentialScan)
+        $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true,4096,$true)
+        try{return ($reader.ReadToEnd()|ConvertFrom-Json -ErrorAction Stop)}catch{
+            throw "Merge readiness state is being written or is invalid; wait for merge completion and retry. $($_.Exception.Message)"
+        }
+    }finally{
+        if($null -ne $reader){$reader.Dispose()}
+        if($null -ne $stream){$stream.Dispose()}
+    }
+}
+
 function Read-NtfsExcelCsvPart($Part,[string[]]$Columns) {
     $pinned=$null
     $hashing=$null
@@ -1472,8 +1490,6 @@ try{
     if(Test-Path -LiteralPath $resolvedOutput){throw "OutputPath already exists and will not be overwritten: $resolvedOutput"}
     $resolvedOutputParent=[IO.Path]::GetDirectoryName($resolvedOutput)
     if([string]::IsNullOrWhiteSpace($resolvedOutputParent)){throw "OutputPath has no parent directory: $resolvedOutput"}
-    $outputDirectoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($resolvedOutputParent,$sourceDirectoryLease)
-
     $statePath=Join-Path $reportFolder 'merge-state.json'
     $qaPath=Join-Path $reportFolder 'NTFS_QA.json'
     $summaryPath=Join-Path $reportFolder 'NTFS_ExecutiveSummary.json'
@@ -1482,9 +1498,7 @@ try{
             throw "This is not a completed merge report folder; missing $([IO.Path]::GetFileName($required))."
         }
     }
-    $state=Read-NtfsExcelJson $statePath
-    $qa=Read-NtfsExcelJson $qaPath
-    $executive=Read-NtfsExcelJson $summaryPath
+    $state=Read-NtfsExcelCompletionState $statePath
     $sourceStatus=[string](Get-NtfsExcelProperty $state 'Status')
     if($sourceStatus -notin @('Completed','CompletedWithWarnings')){
         throw "Merge report status is '$sourceStatus'. Export requires Completed or CompletedWithWarnings."
@@ -1493,6 +1507,13 @@ try{
     if($finalized -isnot [bool] -or -not $finalized){
         throw 'Merge report is not finalized after cleanup. Wait for merge completion, or regenerate older reports with the current Merge-NtfsAssessment.ps1.'
     }
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
+        $resolvedOutput.IndexOfAny([char[]]@('[',']')) -ge 0){
+        throw 'OutputPath cannot contain square brackets because Excel for Windows cannot reliably open paths containing them.'
+    }
+    $outputDirectoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($resolvedOutputParent,$sourceDirectoryLease)
+    $qa=Read-NtfsExcelJson $qaPath
+    $executive=Read-NtfsExcelJson $summaryPath
     $qaWarnings=@(Get-NtfsExcelCollection $qa 'Warnings')
     $qaErrors=[long](Get-NtfsExcelProperty $qa 'Errors' 0)
     if($qaErrors -lt 0){throw 'NTFS_QA.json contains a negative source error count.'}

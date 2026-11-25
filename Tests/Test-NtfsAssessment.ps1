@@ -403,6 +403,14 @@ try {
     foreach($hash in $excelSourceHashes){
         Assert ((Get-FileHash -LiteralPath (Join-Path $excelSource $hash.Name) -Algorithm SHA256).Hash -ceq $hash.SHA256) "Excel review leaves $($hash.Name) unchanged"
     }
+    Import-Functions (Join-Path $root 'New-NtfsExcelReview.ps1') @('Read-NtfsExcelCompletionState')
+    $readinessPath=Join-Path $excelSource 'merge-state.json'
+    $readinessSharing=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $readinessWriter=[IO.FileStream]::new($readinessPath,[IO.FileMode]::Open,[IO.FileAccess]::Write,$readinessSharing)
+    try{
+        $readinessState=Read-NtfsExcelCompletionState $readinessPath
+        Assert ($readinessState.Finalized -eq $true) 'Shared readiness probe reads finalized state while a concurrent merger write handle remains open'
+    }finally{$readinessWriter.Dispose()}
     $excelStream=[IO.File]::Open($excelOutput,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     $excelArchive=$null
     try{
@@ -456,6 +464,14 @@ try {
     $directoryLease=$null
     $collisionFile=$null
     try{
+        $filesystemRoot=[IO.Path]::GetPathRoot($testRoot)
+        $rootLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($filesystemRoot)
+        try{
+            Assert-Throws {
+                [void][NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside([IO.Path]::GetTempPath(),$rootLease)
+            } 'Filesystem-root source lease contains every descendant output path'
+        }finally{$rootLease.Dispose()}
+
         $nestedOutput=Join-Path (Join-Path $testRoot 'excel-new-parent') 'child'
         $directoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($nestedOutput+[IO.Path]::DirectorySeparatorChar,$sourceLease)
         Assert ((Test-Path -LiteralPath $nestedOutput -PathType Container) -and -not $directoryLease.RoutesThrough($sourceLease)) 'Missing output-directory components are created and leased outside the source report'
@@ -667,6 +683,19 @@ $null=Set-PSBreakpoint -Script $scriptPath -Line $line -Action {
         $node -is [Management.Automation.Language.AssignmentStatementAst] -and
         $node.Left.Extent.Text -eq '$cleanupErrors'
     },$true).Extent.StartLineNumber
+    $finalSaveCommand=$mergeAst.Find({param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Save-State' -and
+        $node.Extent.Text -match '-Finalized\s+\$true'
+    },$true)
+    if($null -eq $finalSaveCommand){throw 'Could not locate final merge state publication for regression injection.'}
+    $finalSaveLine=$finalSaveCommand.Extent.StartLineNumber
+    $finalExitStatement=$mergeAst.Find({param($node)
+        $node -is [Management.Automation.Language.ExitStatementAst] -and
+        $node.Extent.Text -match 'exit\s+\$exitCode'
+    },$true)
+    if($null -eq $finalExitStatement){throw 'Could not locate merge exit statement for failure-code regression.'}
+    $finalExitLine=$finalExitStatement.Extent.StartLineNumber
     $gateReport=Join-Path $testRoot 'merge-finalization-gate'
     $gateWorkbook=Join-Path $testRoot 'gate-review.xlsx'
     $mergeReady=[Threading.ManualResetEventSlim]::new($false)
@@ -727,6 +756,36 @@ $null=Set-PSBreakpoint -Script $scriptPath -Line $line -Action {
         $mergeReady.Dispose()
         $mergeRelease.Dispose()
     }
+
+    $failedFinalizationOutput=Join-Path $testRoot 'merge-final-state-write-failure'
+    $failedFinalizationPs=[powershell]::Create()
+    $failedFinalizationProbe=[pscustomobject]@{ExitCode=$null}
+    try{
+        [void]$failedFinalizationPs.AddScript(@'
+param($scriptPath,$inputRoot,$output,$line,$exitLine,$probe)
+$global:failedFinalizationProbe=$probe
+$null=Set-PSBreakpoint -Script $scriptPath -Line $line -Action {
+    $logPath=Join-Path $OutputFolder 'merge-stage.log'
+    [IO.File]::Delete($logPath)
+    [void][IO.Directory]::CreateDirectory($logPath)
+}
+$null=Set-PSBreakpoint -Script $scriptPath -Line $exitLine -Action {
+    $global:failedFinalizationProbe.ExitCode=$exitCode
+}
+& $scriptPath -InputRoot $inputRoot -OutputFolder $output -ThrottleLimit 1
+'@).AddArgument($mergeScript).AddArgument($inputRoot).AddArgument($failedFinalizationOutput).AddArgument($finalSaveLine).AddArgument($finalExitLine).AddArgument($failedFinalizationProbe)
+        $null=$failedFinalizationPs.Invoke()
+        $failedFinalizationMessages=@(
+            @($failedFinalizationPs.Streams.Error|ForEach-Object{[string]$_})
+            @($failedFinalizationPs.Streams.Information|ForEach-Object{[string]$_.MessageData})
+        )
+        $failedFinalizationState=Get-Content -LiteralPath (Join-Path $failedFinalizationOutput 'merge-state.json') -Raw|ConvertFrom-Json
+        Assert ($failedFinalizationState.Status -eq 'Failed' -and -not $failedFinalizationState.Finalized) 'Failed final-state log append cannot leave a finalized completed state'
+        Assert (($failedFinalizationMessages -join "`n") -match 'Merge: Failed\.' -and
+            ($failedFinalizationMessages -join "`n") -match 'Could not finalize the merge state') 'Final-state persistence failure still emits failure guidance'
+        Assert ($failedFinalizationProbe.ExitCode -eq 2) 'Final-state persistence failure selects documented exit code 2'
+        Assert ($failedFinalizationPs.InvocationStateInfo.State -eq 'Completed') 'Final-state persistence failure is handled without terminating the completion pipeline'
+    }finally{$failedFinalizationPs.Dispose()}
 
     $typedExcel=Join-Path $testRoot 'excel-types-and-xml.xlsx'
     $typedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
@@ -861,6 +920,14 @@ $null=Set-PSBreakpoint -Script $scriptPath -Line $line -Action {
         -InputReportFolder $excelSource -OutputPath $adsOutput -Dataset ExcelParts.csv 2>&1 })
     Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $adsOutput -PathType Leaf)) 'Alternate data stream output names are refused'
     Assert (($adsLog -join "`n") -match 'alternate-data-stream') 'Alternate data stream failure explains the unsafe leaf name'
+    if($nativeExcel){
+        $bracketDirectory=Join-Path $testRoot '[excel-output]'
+        $bracketOutput=Join-Path $bracketDirectory 'review.xlsx'
+        $bracketLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $exportScript `
+            -InputReportFolder $excelSource -OutputPath $bracketOutput -Dataset ExcelParts.csv 2>&1 })
+        Assert ($LASTEXITCODE -eq 2 -and -not [IO.Directory]::Exists($bracketDirectory)) 'Windows output paths with square brackets fail before creating output directories'
+        Assert (($bracketLog -join "`n") -match 'cannot contain square brackets.*Excel for Windows') 'Bracket rejection explains Excel path compatibility'
+    }
 
     $apostropheExcel=Join-Path $testRoot 'excel-apostrophe.xlsx'
     $apostropheLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
