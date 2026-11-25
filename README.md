@@ -186,7 +186,11 @@ identifiers and formula-like values as text, explicitly types safe counts and
 flags, keeps raw ACL/folder datasets out by default, and splits oversized
 datasets instead of truncating them. Use `-IncludeRawData` to add raw folder/ACE
 reports or `-Dataset` to select an explicit CSV dataset set. The workbook is a
-convenience copy; retain the original merge report.
+convenience copy; retain the original merge report. On Windows, report and output
+paths must use direct fixed drive-letter paths; ambiguous UNC, mapped-drive,
+device-prefix, short-name, and reparse aliases are rejected. The selected source
+files and pending workbook are pinned, and CSV hashes cover exactly the bytes
+parsed into the workbook.
 
 Each entry script finishes with its status, actual output location, reports or
 logs to review, and a specific next script/stage or an explicit statement that

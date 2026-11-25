@@ -463,7 +463,12 @@ and `NTFS_Folders.csv` data. It stores identifiers and formula-like source value
 as Excel text, freezes headers, enables filters, and splits large datasets into
 numbered worksheets without silently truncating them. For evidence integrity,
 neither the source report nor the output path can traverse a symlink or other
-reparse point.
+reparse point. On Windows, use direct fixed drive-letter paths such as
+`D:\AssessmentReports\Baseline` and `D:\AssessmentExports`; the exporter refuses
+UNC, mapped-drive, device-prefix, short-name, and mounted-folder aliases because
+those namespaces cannot be proven outside the source report without operator
+mapping evidence. Its PowerShell 7 cross-platform path is for synthetic/offline
+testing, not Windows or SMB production qualification.
 
 ```powershell
 # Add raw folder and ACE inventories to the standard review sheets.
@@ -482,10 +487,13 @@ reparse point.
 Review the workbook's `Overview` sheet first; it carries merge warnings,
 limitations, selected source-run paths, and the integrity-checked datasets.
 The workbook is a convenience copy. It does not replace the original report,
-prove effective access, or authorize remediation. If a source cell exceeds
-Excel's 32,767-character text limit, the exporter fails instead of truncating it;
-use Power Query's connection/Data Model workflow or a filtered source export for
-that field.
+prove effective access, or authorize remediation. Selected JSON and CSV inputs
+are opened through pinned handles and the workbook uses the exact CSV bytes
+that were hashed. On Windows, directory routes and the pending workbook remain
+pinned through publication; path checks are not a substitute for those handles.
+If a source cell exceeds Excel's 32,767-character text limit, the exporter fails
+instead of truncating it; use Power Query's connection/Data Model workflow or a
+filtered source export for that field.
 
 ### 4.4 Generate a best-practices report
 

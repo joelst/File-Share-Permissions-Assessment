@@ -36,7 +36,11 @@
   remediation approval, rollback package, or substitute for the source report.
   -Dataset replaces the curated default set; -IncludeRawData adds raw folder/ACE
   datasets. Dataset names can be supplied with or without the .csv extension.
-  The output must be a new .xlsx file outside InputReportFolder.
+  The output must be a new .xlsx file outside InputReportFolder. On Windows,
+  both report and output paths must use direct fixed drive-letter paths; UNC,
+  mapped-drive, device-prefix, short-name, and reparse-point aliases are refused.
+  The PowerShell 7 path on non-Windows remains a synthetic/offline test surface;
+  native Windows share-mode and handle-publication guarantees are unavailable there.
 #>
 [CmdletBinding()]
 param(
@@ -54,15 +58,506 @@ if ($null -eq ('NtfsAssessment.ExcelReviewWorkbook' -as [type])) {
     $excelWriterSource=@'
 using System;
 using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Xml;
+using Microsoft.Win32.SafeHandles;
 
 namespace NtfsAssessment {
+    internal static class ExcelReviewNative {
+        internal const uint GenericRead = 0x80000000;
+        internal const uint GenericWrite = 0x40000000;
+        internal const uint Delete = 0x00010000;
+        internal const uint ReadAttributes = 0x00000080;
+        internal const uint FileShareRead = 0x00000001;
+        internal const uint FileShareWrite = 0x00000002;
+        internal const uint CreateNew = 1;
+        internal const uint OpenExisting = 3;
+        internal const uint FileFlagBackupSemantics = 0x02000000;
+        internal const uint FileFlagOpenReparsePoint = 0x00200000;
+        internal const uint FileFlagWriteThrough = 0x80000000;
+        internal const uint FileAttributeReparsePoint = 0x00000400;
+        internal const uint FileAttributeDirectory = 0x00000010;
+        internal const int FileRenameInfo = 3;
+        internal const int FileIdInfo = 18;
+        internal const uint DriveFixed = 3;
+
+        public static bool IsWindows {
+            get { return Environment.OSVersion.Platform == PlatformID.Win32NT; }
+        }
+
+        public static string NormalizeFinalPath(string path) {
+            if (String.IsNullOrWhiteSpace(path)) return path;
+            if (path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+                return @"\\" + path.Substring(8);
+            if (path.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+                return path.Substring(4);
+            return path;
+        }
+
+        public static string TrimDirectoryPath(string path) {
+            if (String.IsNullOrEmpty(path)) return path;
+            string root = System.IO.Path.GetPathRoot(path);
+            return String.Equals(path, root, StringComparison.OrdinalIgnoreCase)
+                ? path
+                : path.TrimEnd('\\', '/');
+        }
+
+        public static bool IsDirectDrivePath(string path) {
+            if (!Regex.IsMatch(path, @"^[A-Za-z]:\\(?:[^\\]+(?:\\[^\\]+)*)?$")) return false;
+            string relative = path.Substring(2);
+            return relative.IndexOf(':') < 0 &&
+                !Regex.IsMatch(relative, @"[/\x00-\x1f<>|?*""]");
+        }
+
+        public static void ThrowLastError(string operation) {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), operation);
+        }
+
+        public static SafeFileHandle OpenFile(string path, uint access, uint sharing, uint disposition, uint flags) {
+            SafeFileHandle handle = CreateFileW(path, access, sharing, IntPtr.Zero, disposition, flags, IntPtr.Zero);
+            if (handle.IsInvalid) {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error, "Cannot open handle for " + path);
+            }
+            return handle;
+        }
+
+        public static FileInformation GetInformation(SafeFileHandle handle, string path) {
+            FileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+                ThrowLastError("Read file information for " + path);
+            return information;
+        }
+
+        public static string GetFinalPath(SafeFileHandle handle) {
+            StringBuilder buffer = new StringBuilder(512);
+            while (true) {
+                uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0);
+                if (length == 0) ThrowLastError("Resolve handle path");
+                if (length < buffer.Capacity) break;
+                buffer = new StringBuilder((int)length + 1);
+            }
+            return NormalizeFinalPath(buffer.ToString());
+        }
+
+        public static string GetStableIdentity(SafeFileHandle handle, string volumeName) {
+            byte[] fileId = new byte[24];
+            if (GetFileInformationByHandleEx(handle, FileIdInfo, fileId, (uint)fileId.Length)) {
+                bool nonZero = false;
+                for (int i = 8; i < fileId.Length; i++) {
+                    if (fileId[i] != 0) {
+                        nonZero = true;
+                        break;
+                    }
+                }
+                if (nonZero)
+                    return volumeName.ToUpperInvariant() + "|" + BitConverter.ToString(fileId).Replace("-", "");
+            }
+            FileInformation information = GetInformation(handle, "file identity");
+            ulong index = ((ulong)information.IndexHigh << 32) | information.IndexLow;
+            if (index == 0) throw new InvalidOperationException("The file handle has no stable file identifier.");
+            return volumeName.ToUpperInvariant() + "|" +
+                information.VolumeSerial.ToString("X8", CultureInfo.InvariantCulture) + ":" +
+                index.ToString("X16", CultureInfo.InvariantCulture);
+        }
+
+        public static string GetVolumeName(string driveRoot) {
+            StringBuilder name = new StringBuilder(128);
+            if (!GetVolumeNameForVolumeMountPointW(driveRoot, name, (uint)name.Capacity))
+                ThrowLastError("Resolve drive volume");
+            return name.ToString();
+        }
+
+        public static void RenameFile(SafeFileHandle file, SafeFileHandle directory, string relativeName) {
+            if (file == null || file.IsInvalid) throw new ArgumentException("file");
+            if (directory == null || directory.IsInvalid) throw new ArgumentException("directory");
+            if (String.IsNullOrWhiteSpace(relativeName) ||
+                relativeName.IndexOfAny(new char[] { '\\', '/', '\0' }) >= 0)
+                throw new ArgumentException("The output name must be a direct child name.", "relativeName");
+
+            byte[] name = Encoding.Unicode.GetBytes(relativeName);
+            int headerSize = IntPtr.Size == 8 ? 20 : 12;
+            IntPtr buffer = Marshal.AllocHGlobal(headerSize + name.Length);
+            try {
+                for (int i = 0; i < headerSize; i++) Marshal.WriteByte(buffer, i, 0);
+                int handleOffset = IntPtr.Size == 8 ? 8 : 4;
+                int lengthOffset = IntPtr.Size == 8 ? 16 : 8;
+                Marshal.WriteIntPtr(buffer, handleOffset, directory.DangerousGetHandle());
+                Marshal.WriteInt32(buffer, lengthOffset, name.Length);
+                Marshal.Copy(name, 0, IntPtr.Add(buffer, headerSize), name.Length);
+                if (!SetFileInformationByHandle(file, FileRenameInfo, buffer, (uint)(headerSize + name.Length)))
+                    ThrowLastError("Publish workbook by handle");
+            } finally {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct FileInformation {
+            public uint Attributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME AccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME WriteTime;
+            public uint VolumeSerial;
+            public uint SizeHigh;
+            public uint SizeLow;
+            public uint NumberOfLinks;
+            public uint IndexHigh;
+            public uint IndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security,
+            uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool GetFileInformationByHandle(SafeFileHandle file, out FileInformation information);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GetFileInformationByHandleEx(SafeFileHandle file, int informationClass,
+            [Out] byte[] information, uint size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder name, uint size, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern bool GetVolumeNameForVolumeMountPointW(string mountPoint, StringBuilder name, uint size);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        internal static extern uint GetDriveTypeW(string root);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetFileInformationByHandle(SafeFileHandle file, int informationClass,
+            IntPtr information, uint size);
+    }
+
+    public sealed class ExcelReviewDirectoryLease : IDisposable {
+        private readonly bool native;
+        private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+        private readonly List<string> identities = new List<string>();
+        private readonly string path;
+        private bool disposed;
+
+        private ExcelReviewDirectoryLease(string requestedPath, bool nativeLease) {
+            path = System.IO.Path.GetFullPath(requestedPath);
+            native = nativeLease;
+            if (!native) return;
+            if (!ExcelReviewNative.IsDirectDrivePath(path))
+                throw new ArgumentException("Windows Excel review paths must use direct drive-letter paths, not UNC, mapped-drive, or device aliases: " + requestedPath);
+            string root = System.IO.Path.GetPathRoot(path);
+            string volume = ExcelReviewNative.GetVolumeName(root);
+            if (ExcelReviewNative.GetDriveTypeW(volume) != ExcelReviewNative.DriveFixed)
+                throw new InvalidOperationException("Windows Excel review paths must be on a fixed local volume: " + requestedPath);
+            string relative = path.Length == root.Length ? String.Empty : path.Substring(root.Length);
+            List<string> components = new List<string>();
+            components.Add(root);
+            if (!String.IsNullOrEmpty(relative)) {
+                string current = root;
+                string[] names = relative.Split(new char[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < names.Length; i++) {
+                    current = System.IO.Path.Combine(current, names[i]);
+                    components.Add(current);
+                }
+            }
+            try {
+                foreach (string component in components) {
+                    SafeFileHandle handle = ExcelReviewNative.OpenFile(
+                        component,
+                        ExcelReviewNative.ReadAttributes,
+                        ExcelReviewNative.FileShareRead | ExcelReviewNative.FileShareWrite,
+                        ExcelReviewNative.OpenExisting,
+                        ExcelReviewNative.FileFlagBackupSemantics | ExcelReviewNative.FileFlagOpenReparsePoint);
+                    handles.Add(handle);
+                    ExcelReviewNative.FileInformation information = ExcelReviewNative.GetInformation(handle, component);
+                    if ((information.Attributes & ExcelReviewNative.FileAttributeReparsePoint) != 0 ||
+                        (information.Attributes & ExcelReviewNative.FileAttributeDirectory) == 0) {
+                        throw new InvalidOperationException("Reparse point or non-directory component in Excel review path: " + component);
+                    }
+                    string finalPath = ExcelReviewNative.TrimDirectoryPath(ExcelReviewNative.GetFinalPath(handle));
+                    string expectedPath = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(component));
+                    if (!String.Equals(finalPath, expectedPath, StringComparison.OrdinalIgnoreCase)) {
+                        throw new InvalidOperationException("Drive alias, short-name, mapped path, or physical namespace mismatch: " + component);
+                    }
+                    identities.Add(ExcelReviewNative.GetStableIdentity(handle, volume));
+                }
+            } catch {
+                Dispose();
+                throw;
+            }
+        }
+
+        public static ExcelReviewDirectoryLease Open(string path) {
+            if (String.IsNullOrWhiteSpace(path)) throw new ArgumentException("path");
+            if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
+            if (!ExcelReviewNative.IsWindows) {
+                string current = System.IO.Path.GetFullPath(path);
+                while (!String.IsNullOrEmpty(current)) {
+                    if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                        throw new InvalidOperationException("Reparse point in Excel review path: " + current);
+                    string parent = System.IO.Path.GetDirectoryName(current);
+                    if (String.Equals(parent, current, StringComparison.Ordinal)) break;
+                    current = parent;
+                }
+            }
+            return new ExcelReviewDirectoryLease(path, ExcelReviewNative.IsWindows);
+        }
+
+        public static ExcelReviewDirectoryLease CreateOutside(string path, ExcelReviewDirectoryLease source) {
+            if (source == null) throw new ArgumentNullException("source");
+            string current = System.IO.Path.GetFullPath(path);
+            Stack<string> missing = new Stack<string>();
+            while (!Directory.Exists(current)) {
+                missing.Push(current);
+                string parent = System.IO.Path.GetDirectoryName(current);
+                if (String.IsNullOrEmpty(parent) || String.Equals(parent, current, StringComparison.Ordinal))
+                    throw new DirectoryNotFoundException(path);
+                current = parent;
+            }
+            ExcelReviewDirectoryLease lease = Open(current);
+            try {
+                while (true) {
+                    if (lease.RoutesThrough(source))
+                        throw new InvalidOperationException("OutputPath is within or aliased to InputReportFolder so source report evidence remains unchanged.");
+                    if (missing.Count == 0) return lease;
+                    string child = missing.Pop();
+                    // Pin each new component before creating anything below it.
+                    Directory.CreateDirectory(child);
+                    ExcelReviewDirectoryLease next = Open(child);
+                    lease.Dispose();
+                    lease = next;
+                }
+            } catch {
+                lease.Dispose();
+                throw;
+            }
+        }
+
+        public bool IsNative { get { return native; } }
+        public string Path { get { return path; } }
+        public string TargetIdentity { get { return identities.Count == 0 ? path : identities[identities.Count - 1]; } }
+        public SafeFileHandle TargetHandle { get { return handles.Count == 0 ? null : handles[handles.Count - 1]; } }
+
+        public bool RoutesThrough(ExcelReviewDirectoryLease directory) {
+            if (directory == null) throw new ArgumentNullException("directory");
+            if (native != directory.native)
+                throw new InvalidOperationException("Cannot compare mixed native and test path leases.");
+            if (native) {
+                string identity = directory.TargetIdentity;
+                foreach (string routeIdentity in identities)
+                    if (String.Equals(routeIdentity, identity, StringComparison.Ordinal)) return true;
+                return false;
+            }
+            string root = ExcelReviewNative.TrimDirectoryPath(directory.path);
+            string current = ExcelReviewNative.TrimDirectoryPath(path);
+            if (String.Equals(current, root, StringComparison.Ordinal)) return true;
+            return current.StartsWith(root + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal);
+        }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            for (int i = handles.Count - 1; i >= 0; i--) handles[i].Dispose();
+        }
+    }
+
+    public sealed class ExcelReviewPinnedFile : IDisposable {
+        private readonly FileStream stream;
+        private readonly SafeFileHandle handle;
+        private readonly bool native;
+        private readonly string path;
+        private bool disposed;
+
+        private ExcelReviewPinnedFile(string requestedPath, SafeFileHandle nativeHandle, FileStream openedStream, bool nativeFile) {
+            path = requestedPath;
+            handle = nativeHandle;
+            stream = openedStream;
+            native = nativeFile;
+        }
+
+        public static ExcelReviewPinnedFile Open(string requestedPath) {
+            if (String.IsNullOrWhiteSpace(requestedPath)) throw new ArgumentException("requestedPath");
+            string fullPath = System.IO.Path.GetFullPath(requestedPath);
+            if (ExcelReviewNative.IsWindows) {
+                SafeFileHandle handle = ExcelReviewNative.OpenFile(
+                    fullPath,
+                    ExcelReviewNative.GenericRead,
+                    ExcelReviewNative.FileShareRead,
+                    ExcelReviewNative.OpenExisting,
+                    ExcelReviewNative.FileFlagOpenReparsePoint);
+                try {
+                    ExcelReviewNative.FileInformation information = ExcelReviewNative.GetInformation(handle, fullPath);
+                    if ((information.Attributes & ExcelReviewNative.FileAttributeReparsePoint) != 0)
+                        throw new InvalidOperationException("Reparse-point source file is not allowed: " + fullPath);
+                    if ((information.Attributes & ExcelReviewNative.FileAttributeDirectory) != 0)
+                        throw new InvalidOperationException("Source path is not a file: " + fullPath);
+                    if (information.NumberOfLinks != 1)
+                        throw new InvalidOperationException("Hard-linked source file is not allowed: " + fullPath);
+                    string finalPath = ExcelReviewNative.TrimDirectoryPath(ExcelReviewNative.GetFinalPath(handle));
+                    string expectedPath = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(fullPath));
+                    if (!String.Equals(finalPath, expectedPath, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("Aliased source file path is not allowed: " + fullPath);
+                    FileStream stream = new FileStream(handle, FileAccess.Read);
+                    return new ExcelReviewPinnedFile(fullPath, handle, stream, true);
+                } catch {
+                    handle.Dispose();
+                    throw;
+                }
+            }
+
+            if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("Reparse-point source file is not allowed: " + fullPath);
+            FileStream nonNative = new FileStream(
+                fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+            try {
+                if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException("Source file became a reparse point: " + fullPath);
+                return new ExcelReviewPinnedFile(fullPath, null, nonNative, false);
+            } catch {
+                nonNative.Dispose();
+                throw;
+            }
+        }
+
+        public FileStream Stream { get { return stream; } }
+        public long Length { get { return stream.Length; } }
+        public bool IsNative { get { return native; } }
+        public string Path { get { return path; } }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            stream.Dispose();
+            if (handle != null) handle.Dispose();
+        }
+    }
+
+    public sealed class ExcelReviewHashingReadStream : Stream {
+        private readonly Stream source;
+        private readonly SHA256 sha256 = SHA256.Create();
+        private string hash;
+        private bool disposed;
+        private long bytesRead;
+
+        public ExcelReviewHashingReadStream(Stream input) {
+            if (input == null) throw new ArgumentNullException("input");
+            if (!input.CanRead) throw new ArgumentException("input");
+            source = input;
+        }
+
+        public long BytesRead { get { return bytesRead; } }
+        public override bool CanRead { get { return !disposed; } }
+        public override bool CanSeek { get { return false; } }
+        public override bool CanWrite { get { return false; } }
+        public override long Length { get { throw new NotSupportedException(); } }
+        public override long Position {
+            get { throw new NotSupportedException(); }
+            set { throw new NotSupportedException(); }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) {
+            int read = source.Read(buffer, offset, count);
+            if (read > 0) {
+                sha256.TransformBlock(buffer, offset, read, buffer, offset);
+                bytesRead += read;
+            }
+            return read;
+        }
+
+        public string CompleteHash() {
+            if (hash != null) return hash;
+            sha256.TransformFinalBlock(new byte[0], 0, 0);
+            hash = BitConverter.ToString(sha256.Hash).Replace("-", "").ToLowerInvariant();
+            return hash;
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+        public override void SetLength(long value) { throw new NotSupportedException(); }
+        public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+
+        protected override void Dispose(bool disposing) {
+            if (!disposed) {
+                disposed = true;
+                if (disposing) sha256.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    public sealed class ExcelReviewOutputFile : IDisposable {
+        private readonly string pendingPath;
+        private readonly string finalPath;
+        private readonly FileStream stream;
+        private readonly SafeFileHandle handle;
+        private bool published;
+        private bool disposed;
+
+        private ExcelReviewOutputFile(string pending, string final, SafeFileHandle nativeHandle, FileStream openedStream) {
+            pendingPath = pending;
+            finalPath = final;
+            handle = nativeHandle;
+            stream = openedStream;
+        }
+
+        public static ExcelReviewOutputFile Create(string pending, string final) {
+            if (File.Exists(final)) throw new IOException("OutputPath already exists and will not be overwritten: " + final);
+            if (ExcelReviewNative.IsWindows) {
+                SafeFileHandle handle = ExcelReviewNative.OpenFile(
+                    pending,
+                    ExcelReviewNative.GenericRead | ExcelReviewNative.GenericWrite | ExcelReviewNative.Delete,
+                    ExcelReviewNative.FileShareRead,
+                    ExcelReviewNative.CreateNew,
+                    ExcelReviewNative.FileFlagWriteThrough);
+                try {
+                    FileStream stream = new FileStream(handle, FileAccess.ReadWrite);
+                    return new ExcelReviewOutputFile(pending, final, handle, stream);
+                } catch {
+                    handle.Dispose();
+                    throw;
+                }
+            }
+            FileStream file = new FileStream(
+                pending, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read, 65536, FileOptions.WriteThrough);
+            return new ExcelReviewOutputFile(pending, final, null, file);
+        }
+
+        public FileStream Stream { get { return stream; } }
+        public string PendingPath { get { return pendingPath; } }
+        public bool Published { get { return published; } }
+
+        public void Publish(ExcelReviewDirectoryLease directory) {
+            if (disposed || published) throw new ObjectDisposedException("ExcelReviewOutputFile");
+            stream.Flush(true);
+            if (ExcelReviewNative.IsWindows) {
+                if (directory == null || !directory.IsNative)
+                    throw new InvalidOperationException("A native output-directory lease is required for publication.");
+                if (!String.Equals(
+                    ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetDirectoryName(finalPath)),
+                    ExcelReviewNative.TrimDirectoryPath(directory.Path),
+                    StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The workbook output lease does not match the requested directory.");
+                ExcelReviewNative.RenameFile(handle, directory.TargetHandle, System.IO.Path.GetFileName(finalPath));
+            } else {
+                stream.Dispose();
+                File.Move(pendingPath, finalPath);
+            }
+            published = true;
+        }
+
+        public void Dispose() {
+            if (disposed) return;
+            disposed = true;
+            stream.Dispose();
+            if (handle != null) handle.Dispose();
+        }
+    }
+
     public sealed class ExcelReviewWorkbook : IDisposable {
         private const string SpreadsheetNamespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
         private const string RelationshipNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -92,7 +587,7 @@ namespace NtfsAssessment {
             }
         }
 
-        private readonly FileStream file;
+        private readonly Stream file;
         private readonly ZipArchive archive;
         private readonly ArrayList sheets = new ArrayList();
         private readonly ArrayList sheetNames = new ArrayList();
@@ -108,63 +603,13 @@ namespace NtfsAssessment {
         public int SheetCount { get { return sheets.Count; } }
         public bool Completed { get { return completed; } }
 
-        public ExcelReviewWorkbook(string path, string componentVersion) {
-            if (String.IsNullOrWhiteSpace(path)) throw new ArgumentException("path");
+        public ExcelReviewWorkbook(Stream output, string componentVersion) {
+            if (output == null || !output.CanWrite || !output.CanSeek) throw new ArgumentException("A seekable, writable output stream is required.", "output");
             if (String.IsNullOrWhiteSpace(componentVersion)) throw new ArgumentException("componentVersion");
-            file = new FileStream(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
-            archive = new ZipArchive(file, ZipArchiveMode.Create, false);
+            file = output;
+            archive = new ZipArchive(file, ZipArchiveMode.Create, true);
             createdUtc = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
             version = componentVersion;
-        }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern IntPtr CreateFile(
-            string path,
-            uint desiredAccess,
-            uint shareMode,
-            IntPtr securityAttributes,
-            uint creationDisposition,
-            uint flagsAndAttributes,
-            IntPtr templateFile);
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern uint GetFinalPathNameByHandle(
-            IntPtr file,
-            StringBuilder path,
-            uint pathLength,
-            uint flags);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CloseHandle(IntPtr handle);
-
-        public static string GetFinalPath(string path) {
-            if (Environment.OSVersion.Platform != PlatformID.Win32NT)
-                return Path.GetFullPath(path);
-            const uint openExisting = 3;
-            const uint backupSemantics = 0x02000000;
-            const uint shareAll = 0x7;
-            IntPtr invalid = new IntPtr(-1);
-            IntPtr handle = CreateFile(path, 0, shareAll, IntPtr.Zero, openExisting, backupSemantics, IntPtr.Zero);
-            if (handle == invalid)
-                throw new IOException("Could not open a path for final-name resolution: " + path, new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
-            try {
-                StringBuilder buffer = new StringBuilder(512);
-                while (true) {
-                    uint length = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, 0);
-                    if (length == 0)
-                        throw new IOException("Could not resolve the final filesystem path for: " + path, new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()));
-                    if (length < buffer.Capacity) break;
-                    buffer = new StringBuilder((int)length + 1);
-                }
-                string result = buffer.ToString();
-                if (result.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
-                    return @"\\" + result.Substring(8);
-                if (result.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
-                    return result.Substring(4);
-                return result;
-            } finally {
-                CloseHandle(handle);
-            }
         }
 
         private static void ValidateSheetName(string name) {
@@ -306,6 +751,7 @@ namespace NtfsAssessment {
                     GetColumnName(column), rowNumber), ex);
             }
 
+            if (!headerRow && text.Length == 0) return;
             writer.WriteStartElement("c", SpreadsheetNamespace);
             writer.WriteAttributeString("r", GetColumnName(column) + rowNumber.ToString(CultureInfo.InvariantCulture));
             if (headerRow) writer.WriteAttributeString("s", "1");
@@ -350,7 +796,7 @@ namespace NtfsAssessment {
             writer.WriteStartElement("t", SpreadsheetNamespace);
             if (text.Length > 0 && (Char.IsWhiteSpace(text[0]) || Char.IsWhiteSpace(text[text.Length - 1])))
                 writer.WriteAttributeString("xml", "space", "http://www.w3.org/XML/1998/namespace", "preserve");
-            writer.WriteString(text);
+            writer.WriteString(EscapeXstring(text));
             writer.WriteEndElement();
             writer.WriteEndElement();
             writer.WriteEndElement();
@@ -361,6 +807,35 @@ namespace NtfsAssessment {
                 if (String.Equals(columns[i], header, StringComparison.OrdinalIgnoreCase)) return true;
             }
             return false;
+        }
+
+        private static string EscapeXstring(string text) {
+            if (String.IsNullOrEmpty(text) || text.Length < 7) return text;
+            StringBuilder escaped = null;
+            int unchanged = 0;
+            for (int i = 0; i <= text.Length - 7; i++) {
+                if (text[i] != '_' || (text[i + 1] != 'x' && text[i + 1] != 'X') || text[i + 6] != '_')
+                    continue;
+                bool hexadecimal = true;
+                for (int digit = i + 2; digit <= i + 5; digit++) {
+                    char value = text[digit];
+                    if (!((value >= '0' && value <= '9') ||
+                        (value >= 'A' && value <= 'F') ||
+                        (value >= 'a' && value <= 'f'))) {
+                        hexadecimal = false;
+                        break;
+                    }
+                }
+                if (!hexadecimal) continue;
+                if (escaped == null) escaped = new StringBuilder(text.Length + 10);
+                escaped.Append(text, unchanged, i - unchanged);
+                escaped.Append("_x005F_");
+                // The trailing underscore may also start the next escape token.
+                unchanged = i + 1;
+            }
+            if (escaped == null) return text;
+            if (unchanged < text.Length) escaped.Append(text, unchanged, text.Length - unchanged);
+            return escaped.ToString();
         }
 
         private static string GetColumnName(int number) {
@@ -450,7 +925,7 @@ namespace NtfsAssessment {
             for (int i = 0; i < sheets.Count; i++) {
                 SheetInfo sheet = (SheetInfo)sheets[i];
                 xml.Append("<sheet name=\"");
-                xml.Append(Escape(sheet.Name));
+                xml.Append(Escape(EscapeXstring(sheet.Name)));
                 xml.Append("\" sheetId=\"");
                 xml.Append((i + 1).ToString(CultureInfo.InvariantCulture));
                 xml.Append("\" r:id=\"");
@@ -537,7 +1012,7 @@ namespace NtfsAssessment {
             xml.Append("<TitlesOfParts><vt:vector size=\"");
             xml.Append(sheets.Count.ToString(CultureInfo.InvariantCulture));
             xml.Append("\" baseType=\"lpstr\">");
-            foreach (SheetInfo sheet in sheets) xml.Append("<vt:lpstr>" + Escape(sheet.Name) + "</vt:lpstr>");
+            foreach (SheetInfo sheet in sheets) xml.Append("<vt:lpstr>" + Escape(EscapeXstring(sheet.Name)) + "</vt:lpstr>");
             xml.Append("</vt:vector></TitlesOfParts>");
             xml.Append("</Properties>");
             WriteEntry("docProps/app.xml", xml.ToString());
@@ -554,7 +1029,7 @@ namespace NtfsAssessment {
             WriteStyles();
             WriteProperties();
             archive.Dispose();
-            file.Dispose();
+            file.Flush();
             completed = true;
         }
 
@@ -571,7 +1046,6 @@ namespace NtfsAssessment {
             }
             if (!completed) {
                 try { archive.Dispose(); } catch { }
-                try { file.Dispose(); } catch { }
             }
         }
     }
@@ -585,7 +1059,11 @@ namespace NtfsAssessment {
             [object].Assembly.Location,
             [Collections.ArrayList].Assembly.Location,
             [IO.Compression.ZipArchive].Assembly.Location,
-            [Xml.XmlWriter].Assembly.Location
+            [Xml.XmlWriter].Assembly.Location,
+            [Text.RegularExpressions.Regex].Assembly.Location,
+            [ComponentModel.Win32Exception].Assembly.Location,
+            [Microsoft.Win32.SafeHandles.SafeFileHandle].Assembly.Location,
+            [Security.Cryptography.SHA256].Assembly.Location
         )|Where-Object{$_}|Sort-Object -Unique
         Add-Type -TypeDefinition $excelWriterSource `
             -ReferencedAssemblies $excelReferencedAssemblies `
@@ -605,42 +1083,6 @@ function Get-NtfsExcelCollection($Object,[string]$Name) {
     if($null -ne $value){$value}
 }
 
-function Test-NtfsExcelPathWithin([string]$Path,[string]$Root) {
-    $rootPrefix=$Root.TrimEnd('\','/')+[IO.Path]::DirectorySeparatorChar
-    return $Path -eq $Root -or $Path.StartsWith($rootPrefix,[StringComparison]::OrdinalIgnoreCase)
-}
-
-function Get-NtfsExcelReparseAncestor([string]$Path) {
-    $current=[IO.Path]::GetFullPath($Path)
-    while(-not [string]::IsNullOrWhiteSpace($current)){
-        if(Test-Path -LiteralPath $current){
-            $item=Get-Item -LiteralPath $current -Force -ErrorAction Stop
-            if(($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){return $item.FullName}
-        }
-        $parent=[IO.Path]::GetDirectoryName($current)
-        if([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current){break}
-        $current=$parent
-    }
-    return $null
-}
-
-function Resolve-NtfsExcelFinalPath([string]$Path) {
-    $fullPath=[IO.Path]::GetFullPath($Path)
-    $current=$fullPath
-    $relativeParts=[Collections.ArrayList]::new()
-    while(-not(Test-Path -LiteralPath $current)){
-        $leaf=[IO.Path]::GetFileName($current.TrimEnd('\','/'))
-        if([string]::IsNullOrWhiteSpace($leaf)){throw "Cannot find an existing ancestor for path: $Path"}
-        $relativeParts.Insert(0,$leaf)
-        $parent=[IO.Path]::GetDirectoryName($current.TrimEnd('\','/'))
-        if([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current){throw "Cannot find an existing ancestor for path: $Path"}
-        $current=$parent
-    }
-    $resolved=[NtfsAssessment.ExcelReviewWorkbook]::GetFinalPath($current)
-    foreach($part in $relativeParts){$resolved=Join-Path $resolved $part}
-    return [IO.Path]::GetFullPath($resolved)
-}
-
 function Get-NtfsExcelDatasetMap($Qa) {
     $datasets=@(Get-NtfsExcelCollection $Qa 'Datasets')
     if(@($datasets).Count -eq 0){throw 'NTFS_QA.json contains no CSV dataset inventory.'}
@@ -657,14 +1099,75 @@ function Get-NtfsExcelDatasetMap($Qa) {
     return $map
 }
 
-function Assert-NtfsExcelPartHash($Part) {
-    $actualBytes=(Get-Item -LiteralPath $Part.Path -ErrorAction Stop).Length
-    if($actualBytes -ne $Part.Bytes){
-        throw "Source CSV size changed for $($Part.Name): expected $($Part.Bytes), actual $actualBytes."
+function Read-NtfsExcelPinnedText([string]$Path,[long]$MaxBytes=268435456) {
+    $pinned=$null
+    $reader=$null
+    try{
+        $pinned=[NtfsAssessment.ExcelReviewPinnedFile]::Open($Path)
+        if($pinned.Length -gt $MaxBytes){throw "Source text file exceeds the $MaxBytes-byte limit: $Path"}
+        $reader=[IO.StreamReader]::new($pinned.Stream,[Text.Encoding]::UTF8,$true,16384,$true)
+        return $reader.ReadToEnd()
+    }finally{
+        if($null -ne $reader){$reader.Dispose()}
+        if($null -ne $pinned){$pinned.Dispose()}
     }
-    $actualHash=(Get-FileHash -LiteralPath $Part.Path -Algorithm SHA256 -ErrorAction Stop).Hash
-    if($actualHash -ne $Part.SHA256){
-        throw "Source CSV hash mismatch for $($Part.Name). The report may have changed; rerun Merge-NtfsAssessment.ps1."
+}
+
+function Read-NtfsExcelJson([string]$Path) {
+    return (Read-NtfsExcelPinnedText $Path|ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Read-NtfsExcelCsvPart($Part,[string[]]$Columns) {
+    $pinned=$null
+    $hashing=$null
+    $reader=$null
+    try{
+        $pinned=[NtfsAssessment.ExcelReviewPinnedFile]::Open($Part.Path)
+        if($pinned.Length -ne $Part.Bytes){
+            throw "Source CSV size changed for $($Part.Name): expected $($Part.Bytes), actual $($pinned.Length)."
+        }
+        $hashing=[NtfsAssessment.ExcelReviewHashingReadStream]::new($pinned.Stream)
+        $reader=[IO.StreamReader]::new($hashing,[Text.Encoding]::UTF8,$true,16384,$true)
+        $header=[NtfsAssessment.Csv]::ReadRecord($reader)
+        if($Columns.Count -eq 0){
+            if($null -ne $header -or $Part.Bytes -ne 0 -or $Part.Rows -ne 0){
+                throw "QA dataset part $($Part.Name) is marked empty, but it contains a header or records."
+            }
+        }else{
+            if($null -eq $header){throw "Missing CSV header: $($Part.Path)"}
+            $actualColumns=[NtfsAssessment.Csv]::Parse($header)
+            if((ConvertTo-NtfsCsvRecord $actualColumns) -cne (ConvertTo-NtfsCsvRecord $Columns)){
+                throw "CSV header does not match QA column order: $($Part.Path)"
+            }
+        }
+
+        $rows=0L
+        while($null -ne ($record=[NtfsAssessment.Csv]::ReadRecord($reader))){
+            if($record.Length -eq 0){continue}
+            $fields=[NtfsAssessment.Csv]::Parse($record)
+            if($fields.Length -ne $Columns.Length){
+                throw "CSV column count mismatch in $($Part.Path)"
+            }
+            $row=[ordered]@{}
+            for($i=0;$i -lt $Columns.Length;$i++){$row[$Columns[$i]]=$fields[$i]}
+            $rows++
+            [pscustomobject]$row
+        }
+
+        $hash=$hashing.CompleteHash()
+        if($hashing.BytesRead -ne $pinned.Length){
+            throw "CSV parser did not consume every byte in $($Part.Name): expected $($pinned.Length), read $($hashing.BytesRead)."
+        }
+        if($rows -ne $Part.Rows){
+            throw "CSV row-count mismatch for $($Part.Name): expected $($Part.Rows), actual $rows."
+        }
+        if($hash -ne $Part.SHA256){
+            throw "Source CSV hash mismatch for $($Part.Name). The report may have changed; rerun Merge-NtfsAssessment.ps1."
+        }
+    }finally{
+        if($null -ne $reader){$reader.Dispose()}
+        if($null -ne $hashing){$hashing.Dispose()}
+        if($null -ne $pinned){$pinned.Dispose()}
     }
 }
 
@@ -702,25 +1205,11 @@ function Get-NtfsExcelVerifiedDataset([string]$ReportFolder,$Dataset,[string]$Na
         if($bytes -lt 0 -or $partRows -lt 0){throw "Invalid QA size or row count for ${Name}: ${partName}."}
         $path=Join-Path $ReportFolder $partName
         if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw "Missing QA-bound source file: $path"}
+        $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if($item.PSIsContainer){throw "Source CSV path is not a file: $path"}
         $verifiedPart=[pscustomobject]@{
             Name=$partName;Path=$path;Bytes=$bytes;Rows=$partRows;SHA256=$sha256
         }
-        Assert-NtfsExcelPartHash $verifiedPart
-        $reader=[IO.StreamReader]::new($path,[Text.Encoding]::UTF8,$true)
-        try{
-            $header=[NtfsAssessment.Csv]::ReadRecord($reader)
-            if($columns.Count -eq 0){
-                if($null -ne $header -or $bytes -ne 0 -or $partRows -ne 0){
-                    throw "QA dataset $Name is marked empty, but $partName contains a header or records."
-                }
-            }else{
-                if($null -eq $header){throw "Missing CSV header: $path"}
-                $actualColumns=[NtfsAssessment.Csv]::Parse($header)
-                if((ConvertTo-NtfsCsvRecord $actualColumns) -cne (ConvertTo-NtfsCsvRecord $columns)){
-                    throw "CSV header does not match QA column order: $path"
-                }
-            }
-        }finally{$reader.Dispose()}
         $totalRows+=$partRows
         $expectedNames+=$partName
         [void]$verifiedParts.Add($verifiedPart)
@@ -783,11 +1272,12 @@ function Get-NtfsExcelWorksheetName([string]$BaseName,[int]$Part) {
     return $base+$suffix
 }
 
-function Test-NtfsExcelPackage([string]$Path,[int]$ExpectedSheets) {
-    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+function Test-NtfsExcelPackage([IO.Stream]$Stream,[int]$ExpectedSheets) {
+    if(-not $Stream.CanRead -or -not $Stream.CanSeek){throw 'Workbook package validation requires a seekable read stream.'}
+    $Stream.Position=0
     $archive=$null
     try{
-        $archive=[IO.Compression.ZipArchive]::new($stream,[IO.Compression.ZipArchiveMode]::Read,$false)
+        $archive=[IO.Compression.ZipArchive]::new($Stream,[IO.Compression.ZipArchiveMode]::Read,$true)
         foreach($name in @(
             '[Content_Types].xml','_rels/.rels','docProps/app.xml','docProps/core.xml',
             'xl/workbook.xml','xl/_rels/workbook.xml.rels','xl/styles.xml'
@@ -808,7 +1298,7 @@ function Test-NtfsExcelPackage([string]$Path,[int]$ExpectedSheets) {
         }
     }finally{
         if($null -ne $archive){$archive.Dispose()}
-        $stream.Dispose()
+        $Stream.Position=0
     }
 }
 
@@ -816,30 +1306,24 @@ $reportFolder=$null
 $resolvedOutput=$null
 $pendingPath=$null
 $workbook=$null
+$outputFile=$null
+$sourceDirectoryLease=$null
+$outputDirectoryLease=$null
 $completedOutput=$false
 try{
     $reportFolder=(Resolve-Path -LiteralPath $InputReportFolder -ErrorAction Stop).ProviderPath
     if(-not(Test-Path -LiteralPath $reportFolder -PathType Container)){
         throw "InputReportFolder is not a directory: $InputReportFolder"
     }
-    $inputReparseAncestor=Get-NtfsExcelReparseAncestor $reportFolder
-    if($inputReparseAncestor){
-        throw "InputReportFolder traverses a reparse point and will not be used: $inputReparseAncestor"
-    }
+    $sourceDirectoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($reportFolder)
     $resolvedOutput=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
     if([IO.Path]::GetExtension($resolvedOutput) -ine '.xlsx'){throw 'OutputPath must use the .xlsx extension.'}
+    $resolvedOutputLeaf=[IO.Path]::GetFileName($resolvedOutput)
+    if($resolvedOutputLeaf -match ':'){throw 'OutputPath leaf cannot contain an alternate-data-stream separator.'}
     if(Test-Path -LiteralPath $resolvedOutput){throw "OutputPath already exists and will not be overwritten: $resolvedOutput"}
     $resolvedOutputParent=[IO.Path]::GetDirectoryName($resolvedOutput)
     if([string]::IsNullOrWhiteSpace($resolvedOutputParent)){throw "OutputPath has no parent directory: $resolvedOutput"}
-    $outputReparseAncestor=Get-NtfsExcelReparseAncestor $resolvedOutputParent
-    if($outputReparseAncestor){
-        throw "OutputPath traverses a reparse point and will not be used: $outputReparseAncestor"
-    }
-    $finalReportFolder=Resolve-NtfsExcelFinalPath $reportFolder
-    $finalOutputParent=Resolve-NtfsExcelFinalPath $resolvedOutputParent
-    if(Test-NtfsExcelPathWithin (Join-Path $finalOutputParent ([IO.Path]::GetFileName($resolvedOutput))) $finalReportFolder){
-        throw 'OutputPath must be outside InputReportFolder so source report evidence remains unchanged.'
-    }
+    $outputDirectoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($resolvedOutputParent,$sourceDirectoryLease)
 
     $statePath=Join-Path $reportFolder 'merge-state.json'
     $qaPath=Join-Path $reportFolder 'NTFS_QA.json'
@@ -849,9 +1333,9 @@ try{
             throw "This is not a completed merge report folder; missing $([IO.Path]::GetFileName($required))."
         }
     }
-    $state=Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop
-    $qa=Get-Content -LiteralPath $qaPath -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop
-    $executive=Get-Content -LiteralPath $summaryPath -Raw -ErrorAction Stop|ConvertFrom-Json -ErrorAction Stop
+    $state=Read-NtfsExcelJson $statePath
+    $qa=Read-NtfsExcelJson $qaPath
+    $executive=Read-NtfsExcelJson $summaryPath
     $sourceStatus=[string](Get-NtfsExcelProperty $state 'Status')
     if($sourceStatus -notin @('Completed','CompletedWithWarnings')){
         throw "Merge report status is '$sourceStatus'. Export requires Completed or CompletedWithWarnings."
@@ -935,12 +1419,9 @@ try{
         })
     }
 
-    $parent=$resolvedOutputParent
-    if(-not(Test-Path -LiteralPath $parent -PathType Container)){
-        [void](New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop)
-    }
-    $pendingPath=Join-Path $parent ('.'+[IO.Path]::GetFileName($resolvedOutput)+'.'+[guid]::NewGuid().ToString('N')+'.pending')
-    $workbook=[NtfsAssessment.ExcelReviewWorkbook]::new($pendingPath,[string]$script:NtfsVersions.ExcelReview)
+    $pendingPath=Join-Path $resolvedOutputParent ('.'+[IO.Path]::GetFileName($resolvedOutput)+'.'+[guid]::NewGuid().ToString('N')+'.pending')
+    $outputFile=[NtfsAssessment.ExcelReviewOutputFile]::Create($pendingPath,$resolvedOutput)
+    $workbook=[NtfsAssessment.ExcelReviewWorkbook]::new($outputFile.Stream,[string]$script:NtfsVersions.ExcelReview)
     $usedSheetNames=@{}
     $workbook.BeginSheet('Overview',[string[]]@('Section','Item','Value'))
     $usedSheetNames['Overview']=$true
@@ -962,7 +1443,7 @@ try{
         $datasetRows=0L
         foreach($part in @($verifiedDataset.Parts)){
             $partRows=0L
-            Read-NtfsCsvFile $part.Path | ForEach-Object {
+            Read-NtfsExcelCsvPart $part $verifiedDataset.Columns | ForEach-Object {
                 $row=$_
                 if($sheetRows -ge $MaxRowsPerSheet){
                     $workbook.EndSheet()
@@ -989,7 +1470,6 @@ try{
             if($partRows -ne $part.Rows){
                 throw "CSV row-count mismatch while reading $($part.Name): expected $($part.Rows), actual $partRows."
             }
-            Assert-NtfsExcelPartHash $part
         }
         $workbook.EndSheet()
         if($datasetRows -ne $verifiedDataset.Rows){
@@ -1000,8 +1480,10 @@ try{
     $workbook.Complete()
     $workbook.Dispose()
     $workbook=$null
-    Test-NtfsExcelPackage $pendingPath ($usedSheetNames.Count)
-    [IO.File]::Move($pendingPath,$resolvedOutput)
+    Test-NtfsExcelPackage $outputFile.Stream ($usedSheetNames.Count)
+    $outputFile.Publish($outputDirectoryLease)
+    $outputFile.Dispose()
+    $outputFile=$null
     $pendingPath=$null
     $completedOutput=$true
 
@@ -1024,6 +1506,12 @@ try{
         }
         $workbook=$null
     }
+    if($null -ne $outputFile){
+        try{$outputFile.Dispose()}catch{
+            Write-Warning "Excel review output-handle cleanup failed: $($_.Exception.Message)"
+        }
+        $outputFile=$null
+    }
     if($pendingPath -and (Test-Path -LiteralPath $pendingPath -PathType Leaf)){
         try{Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop}catch{
             Write-Warning "Excel review pending-file cleanup failed for ${pendingPath}: $($_.Exception.Message)"
@@ -1044,6 +1532,13 @@ try{
     if(-not $completedOutput -and $pendingPath -and (Test-Path -LiteralPath $pendingPath -PathType Leaf)){
         try{Remove-Item -LiteralPath $pendingPath -Force -ErrorAction Stop}catch{
             Write-Warning "Excel review pending-file cleanup failed for ${pendingPath}: $($_.Exception.Message)"
+        }
+    }
+    foreach($lease in @($outputDirectoryLease,$sourceDirectoryLease)){
+        if($null -ne $lease){
+            try{$lease.Dispose()}catch{
+                Write-Warning "Excel review directory-lease cleanup failed: $($_.Exception.Message)"
+            }
         }
     }
 }

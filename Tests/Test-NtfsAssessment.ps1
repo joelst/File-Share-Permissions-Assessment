@@ -137,6 +137,23 @@ function Read-ZipEntryText($Archive,[string]$Name) {
     $reader=[IO.StreamReader]::new($entry.Open(),[Text.Encoding]::UTF8,$true)
     try{return $reader.ReadToEnd()}finally{$reader.Dispose()}
 }
+function ConvertFrom-NtfsExcelXstring([string]$Text) {
+    return [regex]::Replace($Text,'_x([0-9A-Fa-f]{4})_',{
+        param($match)
+        [char][Convert]::ToInt32($match.Groups[1].Value,16)
+    })
+}
+function New-NtfsTestFileLink([string]$Path,[string]$Target) {
+    try{
+        [void](New-Item -ItemType SymbolicLink -Path $Path -Target $Target -ErrorAction Stop)
+        return $true
+    }catch{
+        try{
+            [void](New-Item -ItemType HardLink -Path $Path -Target $Target -ErrorAction Stop)
+            return $true
+        }catch{return $false}
+    }
+}
 function Invoke-Comparison([string]$OutputName,[int]$ExpectedExit,[string[]]$Arguments) {
     $output=Join-Path $testRoot $OutputName
     $state=Join-Path $output 'comparison-state.json'
@@ -322,16 +339,20 @@ try {
     [void](New-Item -ItemType Directory -Path $excelSource)
     Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $out -Force|ForEach-Object FullName) -Destination $excelSource -Recurse
     $excelRows=@(
-        [pscustomobject]@{Value='=HYPERLINK("x","y")';Code='00123';Count='1';Resolved='True';MaxRiskScore='25';AverageRiskScore='12.34';UnknownDirectoryCoverage='True'},
-        [pscustomobject]@{Value="Quoted,`"value`"`r`nline";Code='00007';Count='2';Resolved='False';MaxRiskScore='30';AverageRiskScore='20.5';UnknownDirectoryCoverage='False'},
-        [pscustomobject]@{Value='Third';Code='12345678901234567890';Count='3';Resolved='True';MaxRiskScore='45';AverageRiskScore='31.25';UnknownDirectoryCoverage='True'},
-        [pscustomobject]@{Value='Fourth';Code='0042';Count='4';Resolved='False';MaxRiskScore='50';AverageRiskScore='40';UnknownDirectoryCoverage='False'},
-        [pscustomobject]@{Value='Fifth';Code='0';Count='1234567890123456';Resolved='True';MaxRiskScore='70';AverageRiskScore='12345678901234.56';UnknownDirectoryCoverage='True'}
+        [pscustomobject][ordered]@{Value='=HYPERLINK("x","y") literal _x000D_ adjacent _x000D__x000A_ overlap _x000D_x000A_x0041_ and _x005F_';Code='00123';Count='1';Resolved='True';MaxRiskScore='25';AverageRiskScore='12.34';RiskScore='';UnknownDirectoryCoverage='True';'_x0041_Header_x000D_x000A_'='header _x000D_'},
+        [pscustomobject][ordered]@{Value="Quoted,`"value`"`r`nline";Code='00007';Count='0';Resolved='False';MaxRiskScore='';AverageRiskScore='';RiskScore='';UnknownDirectoryCoverage='False';'_x0041_Header_x000D_x000A_'='second'},
+        [pscustomobject][ordered]@{Value='Third';Code='12345678901234567890';Count='3';Resolved='True';MaxRiskScore='45';AverageRiskScore='31.25';RiskScore='';UnknownDirectoryCoverage='True';'_x0041_Header_x000D_x000A_'='third'},
+        [pscustomobject][ordered]@{Value='Fourth';Code='0042';Count='4';Resolved='False';MaxRiskScore='50';AverageRiskScore='40';RiskScore='';UnknownDirectoryCoverage='False';'_x0041_Header_x000D_x000A_'='fourth'},
+        [pscustomobject][ordered]@{Value='Fifth';Code='0';Count='1234567890123456';Resolved='True';MaxRiskScore='70';AverageRiskScore='12345678901234.56';RiskScore='';UnknownDirectoryCoverage='True';'_x0041_Header_x000D_x000A_'='fifth'}
     )
-    Export-NtfsCsvData $excelRows (Join-Path $excelSource 'ExcelParts.csv') 220
+    Export-NtfsCsvData $excelRows (Join-Path $excelSource 'ExcelParts.csv') 500
     $longRows=@([pscustomobject]@{Value=('x'*32768);Code='long';Count='1';Resolved='True'})
     Export-NtfsCsvData $longRows (Join-Path $excelSource 'TooLong.csv')
     Export-NtfsCsvData @([pscustomobject]@{Value='apostrophe name'}) (Join-Path $excelSource "'Odd.csv")
+    Export-NtfsCsvData @([pscustomobject]@{Value='linked source'}) (Join-Path $excelSource 'Linked.csv')
+    $outsideSource=Join-Path $testRoot 'excel-outside-source'
+    [void](New-Item -ItemType Directory -Path $outsideSource)
+    Copy-Item -LiteralPath (Join-Path $excelSource 'Linked.csv') -Destination (Join-Path $outsideSource 'Linked.csv')
     Remove-Item -LiteralPath (Join-Path $excelSource 'NTFS_FindingsSummary.csv') -Force -ErrorAction Stop
     Export-NtfsCsvData @() (Join-Path $excelSource 'NTFS_FindingsSummary.csv')
     $excelQaPath=Join-Path $excelSource 'NTFS_QA.json'
@@ -370,9 +391,20 @@ try {
         Assert ($sheetXml.Contains('=HYPERLINK') -and $sheetXml -notmatch '<f(?:\s|>)') 'Formula-like assessment values remain inline text'
         Assert ($sheetXml.Contains('00123') -and $sheetXml.Contains('12345678901234567890')) 'Numeric-looking identifiers retain their text representation'
         Assert ($sheetXml -match '<c r="E2"><v>25</v></c>' -and $sheetXml -match '<c r="F2"><v>12\.34</v></c>') 'Risk scores use sortable numeric Excel cells'
-        Assert ($sheetXml -match '<c r="G2" t="b"><v>1</v></c>') 'Coverage indicators use boolean Excel cells'
+        Assert ($sheetXml -notmatch '<c r="G2"(?:\s|>)') 'Empty data values are omitted rather than serialized as text'
+        Assert ($sheetXml -match '<c r="H2" t="b"><v>1</v></c>') 'Coverage indicators after blank cells use boolean cells at explicit references'
         Assert ($sheetXml -match '<c r="C2" t="inlineStr"><is><t>1234567890123456</t></is></c>') 'Integers beyond Excel precision remain text'
         Assert ($sheetXml -match '<c r="F2" t="inlineStr"><is><t>12345678901234\.56</t></is></c>') 'Decimals beyond Excel precision remain text'
+        $dataSheet=[xml](Read-ZipEntryText $excelArchive 'xl/worksheets/sheet2.xml')
+        Assert ($dataSheet.OuterXml -notmatch '<c r="[EFG]3"(?:\s|>)') 'All three unassessed risk-score columns remain truly blank'
+        Assert ($dataSheet.OuterXml -match '<c r="C3"><v>0</v></c>') 'A numeric zero remains present rather than becoming a blank'
+        $formulaText=$dataSheet.SelectSingleNode("//*[local-name()='c' and @r='A2']/*[local-name()='is']/*[local-name()='t']").InnerText
+        $headerText=$dataSheet.SelectSingleNode("//*[local-name()='c' and @r='I1']/*[local-name()='is']/*[local-name()='t']").InnerText
+        Assert ($formulaText.Contains('_x005F_x000D_') -and $headerText.Contains('_x005F_x0041_')) 'OOXML escape-like source text is escaped in data and headers'
+        Assert ($formulaText.Contains('_x005F_x000D__x005F_x000A_')) 'Adjacent OOXML escape-like source tokens are each escaped'
+        Assert ($formulaText.Contains('_x005F_x000D_x005F_x000A_x005F_x0041_')) 'Overlapping OOXML escape-like tokens each have their leading underscore escaped'
+        Assert ((ConvertFrom-NtfsExcelXstring $formulaText) -ceq $excelRows[0].Value -and
+            (ConvertFrom-NtfsExcelXstring $headerText) -ceq '_x0041_Header_x000D_x000A_') 'Escaped OOXML text decodes losslessly to original data and overlapping headers'
         foreach($entry in $sheetEntries){
             $xmlReader=[Xml.XmlReader]::Create([IO.StringReader]::new((Read-ZipEntryText $excelArchive $entry.FullName)))
             try{while($xmlReader.Read()){}}finally{$xmlReader.Dispose()}
@@ -380,6 +412,59 @@ try {
     }finally{
         if($null -ne $excelArchive){$excelArchive.Dispose()}
         $excelStream.Dispose()
+    }
+
+    $excelTokens=$null;$excelErrors=$null
+    $excelAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'New-NtfsExcelReview.ps1'),[ref]$excelTokens,[ref]$excelErrors)
+    if($excelErrors.Count -gt 0){throw ($excelErrors -join '; ')}
+    $excelTypes=$excelAst.Find({param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Extent.Text.StartsWith("if (`$null -eq ('NtfsAssessment.ExcelReviewWorkbook'")
+    },$true)
+    . ([scriptblock]::Create($excelTypes.Extent.Text))
+    $sourceLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($excelSource)
+    $directoryLease=$null
+    $collisionFile=$null
+    try{
+        $nestedOutput=Join-Path (Join-Path $testRoot 'excel-new-parent') 'child'
+        $directoryLease=[NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($nestedOutput,$sourceLease)
+        Assert ((Test-Path -LiteralPath $nestedOutput -PathType Container) -and -not $directoryLease.RoutesThrough($sourceLease)) 'Missing output-directory components are created and leased outside the source report'
+        $forbiddenChild=Join-Path $excelSource 'must-not-create'
+        Assert-Throws { [void][NtfsAssessment.ExcelReviewDirectoryLease]::CreateOutside($forbiddenChild,$sourceLease) } 'Source containment is checked before creating missing output directories' 'within or aliased'
+        Assert (-not(Test-Path -LiteralPath $forbiddenChild)) 'Rejected output containment creates no source-report directories'
+
+        $collisionPending=Join-Path $nestedOutput 'collision.pending'
+        $collisionFinal=Join-Path $nestedOutput 'collision.xlsx'
+        $collisionFile=[NtfsAssessment.ExcelReviewOutputFile]::Create($collisionPending,$collisionFinal)
+        $collisionFile.Stream.WriteByte(42)
+        [IO.File]::WriteAllText($collisionFinal,'concurrent output')
+        Assert-Throws { $collisionFile.Publish($directoryLease) } 'A final output created during generation blocks publication'
+        Assert ([IO.File]::ReadAllText($collisionFinal) -ceq 'concurrent output') 'Publication never replaces a concurrently created output'
+
+        if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+            Assert-Throws { [IO.Directory]::Move($nestedOutput,$nestedOutput+'-renamed') } 'Pinned output directory cannot be renamed during export'
+            $nestedAncestor=Split-Path $nestedOutput -Parent
+            Assert-Throws { [IO.Directory]::Move($nestedAncestor,$nestedAncestor+'-renamed') } 'Pinned output ancestors cannot be replaced during export'
+            Assert-Throws { [IO.Directory]::Move($excelSource,$excelSource+'-renamed') } 'Pinned source directory cannot be replaced during export'
+            Assert-Throws { [IO.File]::Move($collisionPending,$collisionPending+'-renamed') } 'Pending workbook cannot be replaced before handle-based publication'
+            $pinnedCsv=$null
+            try{
+                $pinnedCsv=[NtfsAssessment.ExcelReviewPinnedFile]::Open($excelPartFiles[0].FullName)
+                Assert-Throws { [IO.File]::Move($excelPartFiles[0].FullName,$excelPartFiles[0].FullName+'.moved') } 'Pinned CSV cannot be swapped between parsing and hash validation'
+                Assert-Throws {
+                    $writeProbe=[IO.File]::Open($excelPartFiles[0].FullName,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
+                    $writeProbe.Dispose()
+                } 'Pinned CSV rejects concurrent writers'
+            }finally{
+                if($null -ne $pinnedCsv){$pinnedCsv.Dispose()}
+            }
+        }else{
+            Write-Information 'Windows-native Excel directory, file-sharing, and publication assertions require a Windows run.' -InformationAction Continue
+        }
+    }finally{
+        if($null -ne $collisionFile){$collisionFile.Dispose()}
+        if($null -ne $directoryLease){$directoryLease.Dispose()}
+        $sourceLease.Dispose()
     }
 
     $excelQa=Get-Content -LiteralPath $excelQaPath -Raw|ConvertFrom-Json
@@ -418,6 +503,12 @@ try {
     Assert (($longLog -join "`n") -match '32,767-character') 'Excel cell-limit failure identifies the unsupported value'
     Assert (@(Get-ChildItem -LiteralPath $testRoot -File -Force -Filter '.excel-too-long.xlsx.*.pending').Count -eq 0) 'Cell-limit failure removes its pending workbook'
 
+    $adsOutput=Join-Path $testRoot 'excel:stream.xlsx'
+    $adsLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+        -InputReportFolder $excelSource -OutputPath $adsOutput -Dataset ExcelParts.csv 2>&1 })
+    Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $adsOutput -PathType Leaf)) 'Alternate data stream output names are refused'
+    Assert (($adsLog -join "`n") -match 'alternate-data-stream') 'Alternate data stream failure explains the unsafe leaf name'
+
     $apostropheExcel=Join-Path $testRoot 'excel-apostrophe.xlsx'
     $apostropheLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
         -InputReportFolder $excelSource -OutputPath $apostropheExcel -Dataset "'Odd.csv" 2>&1 })
@@ -453,13 +544,61 @@ try {
         Assert (($linkedLog -join "`n") -match 'reparse point') 'Linked input failure identifies the reparse point'
     }
 
-    Add-Content -LiteralPath $excelPartFiles[0].FullName -Value 'tampered' -Encoding UTF8
+    $outputLink=Join-Path $testRoot 'excel-output-link'
+    try{
+        [void](New-Item -ItemType SymbolicLink -Path $outputLink -Target $excelSource -ErrorAction Stop)
+        $outputLinkCreated=$true
+    }catch{
+        try{
+            [void](New-Item -ItemType Junction -Path $outputLink -Target $excelSource -ErrorAction Stop)
+            $outputLinkCreated=$true
+        }catch{$outputLinkCreated=$false}
+    }
+    if($outputLinkCreated){
+        $aliasedOutput=Join-Path $outputLink 'excel-aliased-output.xlsx'
+        $aliasedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+            -InputReportFolder $excelSource -OutputPath $aliasedOutput -Dataset ExcelParts.csv 2>&1 })
+        Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath (Join-Path $excelSource 'excel-aliased-output.xlsx') -PathType Leaf)) 'An aliased output directory cannot bypass source containment'
+        Assert (($aliasedLog -join "`n") -match 'reparse point|aliased') 'Aliased output failure identifies the namespace mismatch'
+    }
+
+    $metadataLinkedReport=Join-Path $testRoot 'excel-metadata-link-report'
+    [void](New-Item -ItemType Directory -Path $metadataLinkedReport)
+    Copy-Item -LiteralPath @(Get-ChildItem -LiteralPath $excelSource -Force|ForEach-Object FullName) -Destination $metadataLinkedReport -Recurse
+    $metadataQaLink=Join-Path $metadataLinkedReport 'NTFS_QA.json'
+    Remove-Item -LiteralPath $metadataQaLink -Force -ErrorAction Stop
+    $metadataLinkCreated=New-NtfsTestFileLink $metadataQaLink $excelQaPath
+    if($metadataLinkCreated){
+        $metadataOutput=Join-Path $testRoot 'excel-linked-metadata.xlsx'
+        $metadataLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+            -InputReportFolder $metadataLinkedReport -OutputPath $metadataOutput -Dataset ExcelParts.csv 2>&1 })
+        Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $metadataOutput -PathType Leaf)) 'Linked JSON metadata is refused before workbook publication'
+        Assert (($metadataLog -join "`n") -match 'Reparse-point|Hard-linked') 'Linked JSON failure identifies the unsafe leaf file'
+    }
+
+    $linkedCsv=Join-Path $excelSource 'Linked.csv'
+    Remove-Item -LiteralPath $linkedCsv -Force -ErrorAction Stop
+    $csvLinkCreated=New-NtfsTestFileLink $linkedCsv (Join-Path $outsideSource 'Linked.csv')
+    if($csvLinkCreated){
+        $linkedCsvOutput=Join-Path $testRoot 'excel-linked-csv.xlsx'
+        $linkedCsvLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
+            -InputReportFolder $excelSource -OutputPath $linkedCsvOutput -Dataset Linked.csv 2>&1 })
+        Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $linkedCsvOutput -PathType Leaf)) 'QA-matching linked CSV data is refused'
+        Assert (($linkedCsvLog -join "`n") -match 'Reparse-point|Hard-linked|Linked source CSV') 'Linked CSV failure identifies the unsafe leaf file'
+    }
+
+    $tamperPath=$excelPartFiles[0].FullName
+    $beforeTamperLength=(Get-Item -LiteralPath $tamperPath).Length
+    $tamperText=[IO.File]::ReadAllText($tamperPath)
+    Assert ($tamperText.Contains('=HYPERLINK')) 'Tamper fixture contains the expected same-length marker'
+    [IO.File]::WriteAllText($tamperPath,$tamperText.Replace('=HYPERLINK','=HYPERLJNK'),[Text.UTF8Encoding]::new($true))
+    Assert ((Get-Item -LiteralPath $tamperPath).Length -eq $beforeTamperLength) 'Tamper fixture preserves CSV byte length'
     $tamperOutput=Join-Path $testRoot 'excel-tampered.xlsx'
     $tamperLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
         -InputReportFolder $excelSource -OutputPath $tamperOutput -Dataset ExcelParts.csv 2>&1 })
     Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $tamperOutput -PathType Leaf)) 'QA hash or size mismatch blocks workbook publication'
     Assert (@(Get-ChildItem -LiteralPath $testRoot -File -Force -Filter '.excel-tampered.xlsx.*.pending').Count -eq 0) 'Failed Excel export removes pending artifacts'
-    Assert (($tamperLog -join "`n") -match 'changed|mismatch') 'Excel tamper failure explains the source integrity mismatch'
+    Assert (($tamperLog -join "`n") -match 'hash mismatch') 'Excel tamper failure is detected from the exact parsed stream'
     $script:TestArea='Merger'
 
     $manifest=Get-Content -LiteralPath (Join-Path $emptyRun 'manifest.json') -Raw|ConvertFrom-Json
