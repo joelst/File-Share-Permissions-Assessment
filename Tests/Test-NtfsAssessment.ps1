@@ -442,7 +442,7 @@ try {
         if($readinessLinkCreated){
             try{
                 $reparseReadinessOutput=Join-Path $testRoot 'reparse-readiness-output.xlsx'
-                $reparseReadinessLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $exportScript `
+                $reparseReadinessLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File (Join-Path $root 'New-NtfsExcelReview.ps1') `
                     -InputReportFolder $excelSource -OutputPath $reparseReadinessOutput -Dataset ExcelParts.csv 2>&1 })
                 Assert ($LASTEXITCODE -eq 2 -and -not [IO.File]::Exists($reparseReadinessOutput)) `
                     "Excel export refuses a reparse-point merge state: $($reparseReadinessLog -join "`n")"
