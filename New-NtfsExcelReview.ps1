@@ -83,6 +83,7 @@ namespace NtfsAssessment {
         internal const uint Synchronize = 0x00100000;
         internal const uint FileShareRead = 0x00000001;
         internal const uint FileShareWrite = 0x00000002;
+        internal const uint FileShareDelete = 0x00000004;
         internal const uint CreateNew = 1;
         internal const uint OpenExisting = 3;
         internal const uint FileFlagBackupSemantics = 0x02000000;
@@ -507,13 +508,22 @@ namespace NtfsAssessment {
         }
 
         public static ExcelReviewPinnedFile Open(string requestedPath) {
+            return Open(requestedPath, ExcelReviewNative.FileShareRead);
+        }
+
+        public static ExcelReviewPinnedFile OpenSharedRead(string requestedPath) {
+            return Open(requestedPath, ExcelReviewNative.FileShareRead |
+                ExcelReviewNative.FileShareWrite | ExcelReviewNative.FileShareDelete);
+        }
+
+        private static ExcelReviewPinnedFile Open(string requestedPath, uint sharing) {
             if (String.IsNullOrWhiteSpace(requestedPath)) throw new ArgumentException("requestedPath");
             string fullPath = System.IO.Path.GetFullPath(requestedPath);
             if (ExcelReviewNative.IsWindows) {
                 SafeFileHandle handle = ExcelReviewNative.OpenFile(
                     fullPath,
                     ExcelReviewNative.GenericRead,
-                    ExcelReviewNative.FileShareRead,
+                    sharing,
                     ExcelReviewNative.OpenExisting,
                     ExcelReviewNative.FileFlagOpenReparsePoint);
                 try {
@@ -539,7 +549,7 @@ namespace NtfsAssessment {
             if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
                 throw new InvalidOperationException("Reparse-point source file is not allowed: " + fullPath);
             FileStream nonNative = new FileStream(
-                fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+                fullPath, FileMode.Open, FileAccess.Read, (FileShare)sharing, 65536, FileOptions.SequentialScan);
             try {
                 if ((File.GetAttributes(fullPath) & FileAttributes.ReparsePoint) != 0)
                     throw new InvalidOperationException("Source file became a reparse point: " + fullPath);
@@ -1266,18 +1276,32 @@ function Read-NtfsExcelJson([string]$Path) {
 }
 
 function Read-NtfsExcelCompletionState([string]$Path) {
-    $stream=$null
+    $pinned=$null
     $reader=$null
     try{
-        $sharing=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-        $stream=[IO.FileStream]::new($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,$sharing,4096,[IO.FileOptions]::SequentialScan)
-        $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true,4096,$true)
-        try{return ($reader.ReadToEnd()|ConvertFrom-Json -ErrorAction Stop)}catch{
+        try{$pinned=[NtfsAssessment.ExcelReviewPinnedFile]::OpenSharedRead($Path)}catch{
+            if($_.Exception -is [IO.IOException] -or
+                $_.Exception -is [UnauthorizedAccessException] -or
+                $_.Exception -is [System.ComponentModel.Win32Exception]){
+                throw "Merge readiness state could not be opened; wait for merge completion and retry. $($_.Exception.Message)"
+            }
+            throw
+        }
+        $reader=[IO.StreamReader]::new($pinned.Stream,[Text.Encoding]::UTF8,$true,4096,$true)
+        $text=$reader.ReadToEnd()
+        if([string]::IsNullOrWhiteSpace($text)){
+            throw 'Merge readiness state is empty or being written; wait for merge completion and retry.'
+        }
+        try{$state=$text|ConvertFrom-Json -ErrorAction Stop}catch{
             throw "Merge readiness state is being written or is invalid; wait for merge completion and retry. $($_.Exception.Message)"
         }
+        if($null -eq $state){
+            throw 'Merge readiness state is empty or invalid; wait for merge completion and retry.'
+        }
+        return $state
     }finally{
         if($null -ne $reader){$reader.Dispose()}
-        if($null -ne $stream){$stream.Dispose()}
+        if($null -ne $pinned){$pinned.Dispose()}
     }
 }
 

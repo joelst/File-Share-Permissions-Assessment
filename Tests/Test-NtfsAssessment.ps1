@@ -403,6 +403,14 @@ try {
     foreach($hash in $excelSourceHashes){
         Assert ((Get-FileHash -LiteralPath (Join-Path $excelSource $hash.Name) -Algorithm SHA256).Hash -ceq $hash.SHA256) "Excel review leaves $($hash.Name) unchanged"
     }
+    $excelTokens=$null;$excelErrors=$null
+    $excelAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'New-NtfsExcelReview.ps1'),[ref]$excelTokens,[ref]$excelErrors)
+    if($excelErrors.Count -gt 0){throw ($excelErrors -join '; ')}
+    $excelTypes=$excelAst.Find({param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Extent.Text.StartsWith("if (`$null -eq ('NtfsAssessment.ExcelReviewWorkbook'")
+    },$true)
+    . ([scriptblock]::Create($excelTypes.Extent.Text))
     Import-Functions (Join-Path $root 'New-NtfsExcelReview.ps1') @('Read-NtfsExcelCompletionState')
     $readinessPath=Join-Path $excelSource 'merge-state.json'
     $readinessSharing=[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
@@ -411,6 +419,41 @@ try {
         $readinessState=Read-NtfsExcelCompletionState $readinessPath
         Assert ($readinessState.Finalized -eq $true) 'Shared readiness probe reads finalized state while a concurrent merger write handle remains open'
     }finally{$readinessWriter.Dispose()}
+    $readinessOriginal=[IO.File]::ReadAllBytes($readinessPath)
+    try{
+        [IO.File]::WriteAllText($readinessPath,'')
+        Assert-Throws { Read-NtfsExcelCompletionState $readinessPath } 'Empty merge readiness state fails closed' 'empty or being written'
+        [IO.File]::WriteAllText($readinessPath,'{"Finalized":')
+        Assert-Throws { Read-NtfsExcelCompletionState $readinessPath } 'Truncated merge readiness state fails closed' 'being written or is invalid'
+    }finally{[IO.File]::WriteAllBytes($readinessPath,$readinessOriginal)}
+    if($nativeExcel){
+        $readinessTarget=Join-Path $testRoot 'external-finalized-state.json'
+        [IO.File]::WriteAllText($readinessTarget,'{"Status":"Completed","Finalized":true}')
+        [IO.File]::Delete($readinessPath)
+        $readinessLinkCreated=$false
+        try{
+            [void](New-Item -ItemType SymbolicLink -Path $readinessPath -Target $readinessTarget -ErrorAction Stop)
+            $readinessLinkCreated=$true
+        }catch{
+            if(Test-Path -LiteralPath $readinessPath){Remove-Item -LiteralPath $readinessPath -Force}
+            [IO.File]::WriteAllBytes($readinessPath,$readinessOriginal)
+            Write-Information 'Windows readiness reparse-point regression requires symbolic-link creation privilege; this assertion was skipped.' -InformationAction Continue
+        }
+        if($readinessLinkCreated){
+            try{
+                $reparseReadinessOutput=Join-Path $testRoot 'reparse-readiness-output.xlsx'
+                $reparseReadinessLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $exportScript `
+                    -InputReportFolder $excelSource -OutputPath $reparseReadinessOutput -Dataset ExcelParts.csv 2>&1 })
+                Assert ($LASTEXITCODE -eq 2 -and -not [IO.File]::Exists($reparseReadinessOutput)) `
+                    "Excel export refuses a reparse-point merge state: $($reparseReadinessLog -join "`n")"
+                Assert (($reparseReadinessLog -join "`n") -match 'Reparse-point source file is not allowed') `
+                    'Readiness reparse-point rejection identifies the unsafe state file'
+            }finally{
+                Remove-Item -LiteralPath $readinessPath -Force
+                [IO.File]::WriteAllBytes($readinessPath,$readinessOriginal)
+            }
+        }
+    }
     $excelStream=[IO.File]::Open($excelOutput,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     $excelArchive=$null
     try{
@@ -452,14 +495,6 @@ try {
         $excelStream.Dispose()
     }
 
-    $excelTokens=$null;$excelErrors=$null
-    $excelAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'New-NtfsExcelReview.ps1'),[ref]$excelTokens,[ref]$excelErrors)
-    if($excelErrors.Count -gt 0){throw ($excelErrors -join '; ')}
-    $excelTypes=$excelAst.Find({param($node)
-        $node -is [Management.Automation.Language.IfStatementAst] -and
-        $node.Extent.Text.StartsWith("if (`$null -eq ('NtfsAssessment.ExcelReviewWorkbook'")
-    },$true)
-    . ([scriptblock]::Create($excelTypes.Extent.Text))
     $sourceLease=[NtfsAssessment.ExcelReviewDirectoryLease]::Open($excelSource+[IO.Path]::DirectorySeparatorChar)
     $directoryLease=$null
     $collisionFile=$null
