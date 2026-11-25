@@ -298,7 +298,7 @@ namespace NtfsAssessment {
             if (String.IsNullOrWhiteSpace(path)) throw new ArgumentException("path");
             if (!Directory.Exists(path)) throw new DirectoryNotFoundException(path);
             if (!ExcelReviewNative.IsWindows) {
-                    string current = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(path));
+                string current = ExcelReviewNative.TrimDirectoryPath(System.IO.Path.GetFullPath(path));
                 while (!String.IsNullOrEmpty(current)) {
                     if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
                         throw new InvalidOperationException("Reparse point in Excel review path: " + current);

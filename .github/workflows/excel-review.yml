@@ -25,11 +25,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Run assessment and native Excel regressions
-        shell: ${{ matrix.shell }}
+        shell: pwsh
+        env:
+          TEST_ENGINE: ${{ matrix.shell }}
         run: |
           $ErrorActionPreference = 'Stop'
           $resultsPath = Join-Path $env:RUNNER_TEMP 'assessment-results.json'
-          & .\Tests\Test-NtfsAssessment.ps1 -ResultsPath $resultsPath
+          & $env:TEST_ENGINE -NoLogo -NoProfile -File .\Tests\Test-NtfsAssessment.ps1 -ResultsPath $resultsPath
+          if ($LASTEXITCODE -ne 0) {
+              throw "Assessment regression process exited with $LASTEXITCODE."
+          }
           $result = Get-Content -LiteralPath $resultsPath -Raw | ConvertFrom-Json
           if (-not $result.Completed -or -not $result.CleanupCompleted -or
               @($result.Checks).Count -eq 0 -or
