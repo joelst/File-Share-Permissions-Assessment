@@ -956,6 +956,13 @@ $null=Set-PSBreakpoint -Script $scriptPath -Line $exitLine -Action {
     Assert ($LASTEXITCODE -eq 2 -and -not(Test-Path -LiteralPath $adsOutput -PathType Leaf)) 'Alternate data stream output names are refused'
     Assert (($adsLog -join "`n") -match 'alternate-data-stream') 'Alternate data stream failure explains the unsafe leaf name'
     if($nativeExcel){
+        foreach($reservedName in @('NUL.xlsx','CON.backup.xlsx',('COM'+[char]0x00B9+'.xlsx'))){
+            $reservedOutput=Join-Path $testRoot $reservedName
+            $reservedLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $exportScript `
+                -InputReportFolder $excelSource -OutputPath $reservedOutput -Dataset ExcelParts.csv 2>&1 })
+            Assert ($LASTEXITCODE -eq 2) "Windows reserved-device output name $reservedName is refused: $($reservedLog -join "`n")"
+            Assert (($reservedLog -join "`n") -match 'reserved Windows device name') "Windows reserved-device output name $reservedName gives actionable guidance"
+        }
         $bracketDirectory=Join-Path $testRoot '[excel-output]'
         $bracketOutput=Join-Path $bracketDirectory 'review.xlsx'
         $bracketLog=@(& { $ErrorActionPreference='Continue'; & $engine -NoLogo -NoProfile -File $exportScript `
