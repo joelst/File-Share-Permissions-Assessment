@@ -1508,6 +1508,13 @@ try{
         throw 'OutputPath cannot contain an alternate-data-stream separator.'
     }
     if([IO.Path]::GetExtension($resolvedOutput) -ine '.xlsx'){throw 'OutputPath must use the .xlsx extension.'}
+    if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT){
+        $outputLeaf=[IO.Path]::GetFileName($resolvedOutput)
+        $deviceStem=($outputLeaf -split '\.',2)[0].TrimEnd([char[]]@(' ','.'))
+        if($deviceStem -match '^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3])$'){
+            throw 'OutputPath cannot use a reserved Windows device name.'
+        }
+    }
     if([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $resolvedOutput.Length -gt 218){
         throw "OutputPath exceeds Excel for Windows' 218-character full-path limit. Choose a shorter output directory or filename."
     }
