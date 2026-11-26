@@ -38,6 +38,7 @@ Diagrams use Mermaid and render in the GitHub Markdown view.
 |---|---|---|---|
 | Inventory a server, share, or subtree | `Invoke-NtfsAssessment.ps1` | None | No |
 | Consolidate findings | `Merge-NtfsAssessment.ps1` | Original assessment run(s) | No |
+| Create an Excel review copy | `New-NtfsExcelReview.ps1` | One completed merge report | No |
 | Review settings against a policy | `New-NtfsBestPracticesReport.ps1` | One original assessment run | No |
 | Compare two points in time | `Compare-NtfsAssessment.ps1` | Two original assessment runs | No |
 | Review an Add proposal | `Add-FileSharePermissions.ps1 -Mode Plan` | None | No |
@@ -387,6 +388,7 @@ flowchart LR
     Collect --> Original["Original run: manifest, all CSV parts and logs"]
     Original --> Verify["Offline integrity and coverage checks"]
     Verify --> Findings["Merge findings and risk indicators"]
+    Findings --> Excel["Optional Excel review copy"]
     Verify --> BP["Best-practices report"]
     Original --> Pair["Explicit baseline and later original run"]
     Pair --> Diff["Comparison: changes and coverage limitations"]
@@ -410,7 +412,100 @@ increase `-MaxRowsPerShare` only with sufficient memory. An incomplete folder
 ACL has no risk score and is excluded from risk averages; do not interpret a
 blank score as low risk.
 
-### 4.3 Generate a best-practices report
+### 4.3 Review report data in Excel
+
+Do not double-click a large raw CSV and assume all data loaded. CSV parts are
+split at 100,000,000 bytes, but an individual part can still exceed Excel's
+1,048,576-row worksheet limit. Direct opening can also infer dates and numbers
+from SIDs, run IDs, leading-zero values, paths, or identity fields, and the Excel
+grid cannot display a cell value longer than 32,767 characters.
+
+As an immediate workaround, use Power Query:
+
+1. Start with `NTFS_FindingsSummary.csv`, `NTFS_RiskByShare.csv`, coverage, and
+   error reports. Only continue to `NTFS_Findings.csv`, `NTFS_RiskByFolder.csv`,
+   or raw ACL data when the first reports justify it.
+2. In Excel, select **Data > Get Data > From File > From Folder**, select the
+   completed merge-report directory, and choose **Transform Data**.
+3. Filter to one dataset schema only. For `NTFS_Findings.csv`, keep the exact
+   `NTFS_Findings.csv` file and `NTFS_Findings_*.csv` parts, not
+   `NTFS_FindingsSummary.csv`. Keep parts in numeric part order (`1`, `2`, `10`),
+   not lexical filename order.
+4. Use **Combine Files**, select **UTF-8 65001**, a **comma** delimiter, and
+   **first row as headers**. Do not disable quoted multiline fields.
+5. Remove an automatic **Changed Type** step or replace it with deliberate types.
+   Keep SIDs, paths, identities, hashes, and run IDs as **Text**. Use **Whole
+   Number** for counts and integral risk scores (`RiskScore`, `MaxRiskScore`),
+   and **Decimal Number** for `AverageRiskScore` to preserve fractional averages.
+6. For more than one worksheet's worth of data, use **Close & Load To > Only
+   Create Connection** and enable **Add this data to the Data Model**. Use a
+   PivotTable or filtered query from the model instead of loading every row to a
+   grid. Use a connection-only query when long JSON/text fields are required.
+
+Power Query reads the files; it does not update the source report. Do not save,
+retype, or fill data into the original CSVs. Their `NTFS_QA.json` inventory
+records part sizes, row counts, headers, and SHA-256 hashes.
+
+For a repeatable workbook, generate an optional `.xlsx` from the completed merge
+report:
+
+```powershell
+$reviewWorkbook = 'D:\AssessmentExports\Baseline-CHG-101-Review.xlsx'
+.\New-NtfsExcelReview.ps1 `
+    -InputReportFolder $reportFolder `
+    -OutputPath $reviewWorkbook
+```
+
+The exporter requires a completed or completed-with-warnings merge, validates
+the selected CSV parts against `NTFS_QA.json`, and writes to a new output outside
+the source report. It needs no Excel application or `ImportExcel` module. The
+default workbook includes the review reports but excludes raw `NTFS_AllAces.csv`
+and `NTFS_Folders.csv` data. It stores identifiers and formula-like source values
+as Excel text, freezes headers, enables filters, and splits large datasets into
+numbered worksheets without silently truncating them. For evidence integrity,
+neither the source report nor the output path can traverse a symlink or other
+reparse point. On Windows, use direct fixed drive-letter paths such as
+`D:\AssessmentReports\Baseline` and `D:\AssessmentExports`; the exporter refuses
+UNC, mapped-drive, device-prefix, short-name, and mounted-folder aliases because
+those namespaces cannot be proven outside the source report without operator
+mapping evidence. Its PowerShell 7 cross-platform path is for synthetic/offline
+testing, not Windows or SMB production qualification.
+
+```powershell
+# Add raw folder and ACE inventories to the standard review sheets.
+.\New-NtfsExcelReview.ps1 `
+    -InputReportFolder $reportFolder `
+    -OutputPath D:\AssessmentExports\Baseline-CHG-101-WithRaw.xlsx `
+    -IncludeRawData
+
+# Replace the default dataset set with only the requested reports.
+.\New-NtfsExcelReview.ps1 `
+    -InputReportFolder $reportFolder `
+    -OutputPath D:\AssessmentExports\Baseline-CHG-101-Findings.xlsx `
+    -Dataset NTFS_Findings.csv,NTFS_RiskByShare.csv
+```
+
+Review the workbook's `Overview` sheet first; it carries merge warnings,
+limitations, selected source-run paths, and the integrity-checked datasets.
+The workbook is a convenience copy. It does not replace the original report,
+prove effective access, or authorize remediation. Selected JSON and CSV inputs
+are opened through pinned handles and the workbook uses the exact CSV bytes
+that were hashed. On Windows, directory routes and the pending workbook remain
+pinned through publication; path checks are not a substitute for those handles.
+Failed or cancelled Windows exports delete unpublished workbooks through their
+owned handles. Non-Windows synthetic/offline tests instead preserve pending files;
+they never delete a potentially replaced pathname.
+Windows child creation/publication is relative to retained directory handles
+and rejects reparsed directories. Export waits for the merger's
+post-cleanup `Finalized` signal; regenerate older reports with the current merger
+if that signal is missing. Choose a Windows output path of at most 218 characters
+including the filename and without square brackets. Cells may contain at most
+253 line feeds.
+If a source cell exceeds Excel's 32,767-character text limit, the exporter fails
+instead of truncating it; use Power Query's connection/Data Model workflow or a
+filtered source export for that field.
+
+### 4.4 Generate a best-practices report
 
 If required settings were collected, generate a separate offline report:
 

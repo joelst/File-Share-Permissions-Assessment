@@ -155,11 +155,15 @@ function Add-SpoolRow($Spool) {
         throw "Run $($Spool.RunId), $($Spool.Server)\$($Spool.Share) exceeds MaxRowsPerShare=$MaxRowsPerShare. Increase that guard only with sufficient memory or collect smaller scopes; parallel workers multiply memory use."
     }
 }
-function Save-State([string]$Status,[string]$Stage,[string]$Message='') {
+function Save-State([string]$Status,[string]$Stage,[string]$Message='',[bool]$Finalized=$false) {
     if (-not $script:OutputReady) { return }
-    [ordered]@{ToolkitVersion=$script:NtfsVersions.Merge;Status=$Status;CurrentStage=$Stage;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
-        ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputFolder 'merge-state.json') -Encoding UTF8
-    Write-NtfsLog (Join-Path $OutputFolder 'merge-stage.log') Merge $Status $Stage $Message
+    $statePath=Join-Path $OutputFolder 'merge-state.json'
+    $logPath=Join-Path $OutputFolder 'merge-stage.log'
+    $state=[ordered]@{ToolkitVersion=$script:NtfsVersions.Merge;Status=$Status;CurrentStage=$Stage;Finalized=$Finalized;Error=$Message;Warnings=@($script:Warnings);UpdatedUtc=[datetime]::UtcNow.ToString('o')} |
+        ConvertTo-Json -Depth 6
+    if($Finalized){Write-NtfsLog $logPath Merge $Status $Stage $Message}
+    $state | Set-Content -LiteralPath $statePath -Encoding UTF8
+    if(-not $Finalized){Write-NtfsLog $logPath Merge $Status $Stage $Message}
 }
 
 $script:OutputReady=$false;$TempDir=$null;$pool=$null;$jobs=[Collections.ArrayList]::new()
@@ -638,10 +642,12 @@ try {
         Counts=$totals;Errors=$errorCount;Warnings=@($script:Warnings);Datasets=$inventory;Limitations=$limitations
     }|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_QA.json') -Encoding UTF8
     $exitCode=if($errorCount -gt 0 -or $script:Warnings.Count -gt 0){1}else{0}
-    Save-State $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete
+    Save-State Running Finalizing
 }catch{
     $message="$($_.Exception.Message) $($_.ScriptStackTrace)"
-    Save-State Failed Merge $message
+    try{Save-State Failed Merge $message}catch{
+        $message+=" Failure state/log persistence also failed: $($_.Exception.Message)"
+    }
     Write-Error -ErrorRecord $_ -ErrorAction Continue
     $exitCode=2
 }finally{
@@ -657,15 +663,41 @@ try {
     foreach($errorMessage in $cleanupErrors){Add-MergeWarning $errorMessage}
     if($cleanupErrors.Count -gt 0){
         if($exitCode -lt 2){
-            $exitCode=1
-            $executive.Warnings=@($script:Warnings)
-            $executive|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_ExecutiveSummary.json') -Encoding UTF8
-            $qaPath=Join-Path $OutputFolder 'NTFS_QA.json'
-            $qa=Get-Content -LiteralPath $qaPath -Raw|ConvertFrom-Json
-            $qa.Warnings=@($script:Warnings)
-            $qa|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $qaPath -Encoding UTF8
-            Save-State CompletedWithWarnings Cleanup
-        }else{Save-State Failed Cleanup $message}
+            try{
+                $exitCode=1
+                $executive.Warnings=@($script:Warnings)
+                $executive|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $OutputFolder 'NTFS_ExecutiveSummary.json') -Encoding UTF8
+                $qaPath=Join-Path $OutputFolder 'NTFS_QA.json'
+                $qa=Get-Content -LiteralPath $qaPath -Raw|ConvertFrom-Json
+                $qa.Warnings=@($script:Warnings)
+                $qa|ConvertTo-Json -Depth 10|Set-Content -LiteralPath $qaPath -Encoding UTF8
+                Save-State Running Finalizing
+            }catch{
+                $exitCode=2
+                $message="Failed to reconcile merge cleanup warnings: $($_.Exception.Message)"
+                try{Save-State Failed Cleanup $message}catch{
+                    $message+=" Failure-state/log persistence also failed: $($_.Exception.Message)"
+                }
+                Write-Error -Message $message -ErrorAction Continue
+            }
+        }else{
+            try{Save-State Failed Cleanup $message}catch{
+                $message+=" Failure-state/log persistence also failed during cleanup: $($_.Exception.Message)"
+                Write-Error -Message $message -ErrorAction Continue
+            }
+        }
+    }
+}
+if($exitCode -lt 2){
+    try{
+        Save-State $(if($exitCode -eq 0){'Completed'}else{'CompletedWithWarnings'}) Complete -Finalized $true
+    }catch{
+        $message="Could not finalize the merge state after cleanup: $($_.Exception.Message)"
+        $exitCode=2
+        try{Save-State Failed Finalize $message}catch{
+            $message+=" Failure-state/log persistence also failed: $($_.Exception.Message)"
+        }
+        Write-Error -Message $message -ErrorAction Continue
     }
 }
 $completion=@{component='Merge';outputPath=$OutputFolder}
